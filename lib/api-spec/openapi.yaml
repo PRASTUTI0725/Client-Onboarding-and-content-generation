@@ -1,22 +1,21 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Strategy Engine API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
-    description: Health operations
+  - name: clients
+  - name: strategies
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,13 +23,233 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /clients:
+    get:
+      operationId: listClients
+      tags: [clients]
+      summary: List all clients with their latest strategy info
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ClientSummary"
+    post:
+      operationId: createClient
+      tags: [clients]
+      summary: Create a new client from minimal onboarding input
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateClientInput"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Client"
+
+  /clients/{clientId}:
+    parameters:
+      - in: path
+        name: clientId
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getClient
+      tags: [clients]
+      summary: Get a client with onboarding profile and latest strategy
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDetail"
+    delete:
+      operationId: deleteClient
+      tags: [clients]
+      summary: Delete a client
+      responses:
+        "204":
+          description: Deleted
+
+  /clients/{clientId}/strategy/generate:
+    parameters:
+      - in: path
+        name: clientId
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: generateStrategy
+      tags: [strategies]
+      summary: Run enrichment + strategy generation pipeline
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateStrategyInput"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Strategy"
+
+  /clients/{clientId}/strategy:
+    parameters:
+      - in: path
+        name: clientId
+        required: true
+        schema:
+          type: string
+    patch:
+      operationId: updateStrategy
+      tags: [strategies]
+      summary: Update strategy document and/or structured strategy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateStrategyInput"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Strategy"
+
 components:
   schemas:
     HealthStatus:
       type: object
       properties:
+        status: { type: string }
+      required: [status]
+
+    CreateClientInput:
+      type: object
+      required: [name, websiteUrl, instagramHandle, oneLineDescription]
+      properties:
+        name: { type: string }
+        websiteUrl: { type: string }
+        instagramHandle: { type: string }
+        oneLineDescription: { type: string }
+
+    GenerateStrategyInput:
+      type: object
+      properties:
+        templateType:
+          type: string
+          enum: [performance_marketing, brand_building, personal_brand, d2c_growth, auto]
+
+    UpdateStrategyInput:
+      type: object
+      properties:
+        strategyDocument:
+          type: string
+        structuredStrategy:
+          type: object
+          additionalProperties: true
         status:
           type: string
-      required:
-        - status
+          enum: [draft, approved]
 
+    Client:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        website: { type: string, nullable: true }
+        instagramHandle: { type: string, nullable: true }
+        oneLineDescription: { type: string, nullable: true }
+        createdAt: { type: string }
+
+    ClientSummary:
+      allOf:
+        - $ref: "#/components/schemas/Client"
+        - type: object
+          properties:
+            hasStrategy: { type: boolean }
+            templateType: { type: string, nullable: true }
+            status: { type: string, nullable: true }
+
+    EnrichedData:
+      type: object
+      properties:
+        brand_name: { type: string }
+        offer: { type: string }
+        price_range: { type: string }
+        business_model: { type: string }
+        target_audience:
+          type: object
+          properties:
+            who: { type: string }
+            age_range: { type: string }
+            stage: { type: string }
+        brand_tone: { type: string }
+        positioning: { type: string }
+        platform: { type: string }
+        content_preference: { type: string }
+        competitors:
+          type: array
+          items: { type: string }
+
+    OnboardingProfile:
+      type: object
+      required: [id, clientId, rawInput]
+      properties:
+        id: { type: string }
+        clientId: { type: string }
+        rawInput:
+          type: object
+          additionalProperties: true
+        enrichedData:
+          oneOf:
+            - $ref: "#/components/schemas/EnrichedData"
+            - type: "null"
+
+    Strategy:
+      type: object
+      required: [id, clientId, structuredStrategy, strategyDocument, templateType, version, status]
+      properties:
+        id: { type: string }
+        clientId: { type: string }
+        structuredStrategy:
+          type: object
+          additionalProperties: true
+        strategyDocument: { type: string }
+        templateType: { type: string }
+        version: { type: integer }
+        status: { type: string }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+
+    ClientDetail:
+      type: object
+      required: [client]
+      properties:
+        client:
+          $ref: "#/components/schemas/Client"
+        onboarding:
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingProfile"
+            - type: "null"
+        strategy:
+          oneOf:
+            - $ref: "#/components/schemas/Strategy"
+            - type: "null"

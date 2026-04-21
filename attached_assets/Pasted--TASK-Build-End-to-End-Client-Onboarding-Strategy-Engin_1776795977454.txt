@@ -1,0 +1,249 @@
+# TASK: Build End-to-End Client Onboarding → Strategy Engine (Template-Based, DB-Ready)
+
+We are rebuilding the system to be cohesive.
+
+Goal:
+Create a connected pipeline from onboarding → structured data → narrative strategy → stored output.
+
+This must:
+
+* NOT feel like forms
+* NOT produce fragmented blocks
+* Generate usable strategy document + structured data
+* Support multiple templates (future scaling)
+
+---
+
+# 1. SYSTEM ARCHITECTURE (HIGH LEVEL)
+
+Pipeline:
+
+Input → Enrichment → Structured Data → Strategy Generation → Store → Render
+
+---
+
+# 2. INPUT (ONBOARDING)
+
+Minimal input:
+
+{
+"website_url": "",
+"instagram_handle": "",
+"one_line_description": ""
+}
+
+---
+
+# 3. ENRICHMENT LAYER (TEMPLATE-BASED)
+
+Generate:
+
+{
+"brand_name": "",
+"offer": "",
+"price_range": "",
+"business_model": "",
+"target_audience": {
+"who": "",
+"age_range": "",
+"stage": ""
+},
+"brand_tone": "",
+"positioning": "",
+"platform": "",
+"content_preference": "",
+"competitors": []
+}
+
+---
+
+# 4. STRATEGY GENERATION (DUAL OUTPUT)
+
+IMPORTANT:
+We generate BOTH:
+
+1. structured_strategy (for system use)
+2. strategy_document (for client use)
+
+---
+
+## 4A. STRUCTURED STRATEGY (DB FORMAT)
+
+{
+"market_narrative": {},
+"problem_gap_solution": {},
+"brand_foundation": {},
+"brand_philosophy": {},
+"audience": {},
+"emotional_drivers": [],
+"platform_strategy": {},
+"content_strategy": {},
+"kpis": {},
+"tracking_plan": {},
+"phases": [],
+"asset_requirements": []
+}
+
+---
+
+## 4B. STRATEGY DOCUMENT (NARRATIVE)
+
+Generate ONE continuous document:
+
+* clear headings
+* paragraph format
+* readable like a pitch deck
+* no raw JSON in UI
+
+Structure:
+
+1. Market Context
+2. Problem + Opportunity
+3. Brand Positioning
+4. Audience Understanding
+5. Strategic Direction
+6. Platform Approach
+7. Content Strategy
+8. KPI + Measurement Logic
+9. Execution Phases
+10. Asset Requirements
+
+---
+
+# 5. TEMPLATE SYSTEM (CRITICAL)
+
+Support multiple strategy styles:
+
+Templates:
+
+* "performance_marketing"
+* "brand_building"
+* "personal_brand"
+* "d2c_growth"
+
+Each template:
+
+* modifies tone
+* modifies strategy emphasis
+* modifies KPIs and content style
+
+---
+
+## Template selection logic:
+
+IF business_model == "D2C":
+→ use "d2c_growth"
+
+IF personal brand:
+→ use "personal_brand"
+
+Else:
+→ default "brand_building"
+
+---
+
+# 6. DATABASE STRUCTURE
+
+Create tables:
+
+clients:
+
+* id
+* name
+* website
+* created_at
+
+onboarding_profiles:
+
+* client_id
+* raw_input (json)
+* enriched_data (json)
+
+strategies:
+
+* client_id
+* structured_strategy (json)
+* strategy_document (text)
+* template_type
+* version
+* status (draft / approved)
+
+---
+
+# 7. WORKFLOW
+
+1. Create client
+2. Save onboarding input
+3. Run enrichment
+4. Save enriched data
+5. Run strategy generation
+6. Save strategy (structured + doc)
+7. Render strategy document in UI
+
+---
+
+# 8. UI REQUIREMENTS
+
+Strategy page should show:
+
+* Clean document view (not fields)
+* Sections with headings
+* Buttons:
+
+  * Edit
+  * Regenerate
+  * Download PDF
+
+---
+
+# 9. EDIT SYSTEM
+
+Allow:
+
+* editing structured data
+* regenerating full strategy OR sections
+
+---
+
+# 10. IMPORTANT RULES
+
+* Do NOT generate disconnected bullet points
+* Do NOT output shallow/generic marketing text
+* Every section must connect logically to previous one
+* Strategy must feel like a single narrative
+
+---
+
+# 11. OUTPUT FORMAT
+
+Return:
+
+{
+"structured_strategy": {...},
+"strategy_document": "..."
+}
+
+---
+
+# 12. GOAL
+
+User flow:
+
+Onboard client (30 sec)
+→ Strategy auto-generated
+→ User edits (2–3 min)
+→ Export / approve
+
+---
+
+# 13. FUTURE READY
+
+Keep system modular so we can later:
+
+* plug APIs for scraping
+* improve enrichment
+* add content calendar generation
+
+---
+
+Proceed step by step. Do not overcomplicate UI. Focus on flow + output quality.
