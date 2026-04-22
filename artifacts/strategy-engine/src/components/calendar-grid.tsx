@@ -20,6 +20,8 @@ interface Post {
   format: string;
   hook: string;
   status: string;
+  platform?: string;
+  priority?: string;
 }
 
 interface Props {
@@ -179,6 +181,8 @@ export function CalendarGrid({ posts, pillars, clientId, onSelectPost }: Props) 
                   pillar={p.pillar}
                   hook={p.hook}
                   status={p.status}
+                  platform={p.platform}
+                  priority={p.priority}
                   pillarColor={colorFor(p.pillar)}
                   onClick={() => onSelectPost(p.id)}
                   draggable

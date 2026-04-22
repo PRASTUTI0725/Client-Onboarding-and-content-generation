@@ -26,6 +26,7 @@ import type {
   GenerateStrategyInput,
   HealthStatus,
   Post,
+  Sow,
   Strategy,
   UpdatePostInput,
   UpdateStrategyInput,
@@ -617,6 +618,93 @@ export const useUpdateStrategy = <
   TContext
 > => {
   return useMutation(getUpdateStrategyMutationOptions(options));
+};
+
+/**
+ * @summary Set or update the Statement of Work for a client
+ */
+export const getUpdateSowUrl = (clientId: string) => {
+  return `/api/clients/${clientId}/sow`;
+};
+
+export const updateSow = async (
+  clientId: string,
+  sow: Sow,
+  options?: RequestInit,
+): Promise<Client> => {
+  return customFetch<Client>(getUpdateSowUrl(clientId), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(sow),
+  });
+};
+
+export const getUpdateSowMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof updateSow>>,
+    TError,
+    { clientId: string; data: BodyType<Sow> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof updateSow>>,
+  TError,
+  { clientId: string; data: BodyType<Sow> },
+  TContext
+> => {
+  const mutationKey = ["updateSow"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof updateSow>>,
+    { clientId: string; data: BodyType<Sow> }
+  > = (props) => {
+    const { clientId, data } = props ?? {};
+
+    return updateSow(clientId, data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type UpdateSowMutationResult = NonNullable<
+  Awaited<ReturnType<typeof updateSow>>
+>;
+export type UpdateSowMutationBody = BodyType<Sow>;
+export type UpdateSowMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Set or update the Statement of Work for a client
+ */
+export const useUpdateSow = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof updateSow>>,
+    TError,
+    { clientId: string; data: BodyType<Sow> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof updateSow>>,
+  TError,
+  { clientId: string; data: BodyType<Sow> },
+  TContext
+> => {
+  return useMutation(getUpdateSowMutationOptions(options));
 };
 
 /**

@@ -8,7 +8,10 @@
 import type { PlannerAngleBank } from "./plannerAngleBank";
 import type { PlannerDistribution } from "./plannerDistribution";
 import type { PlannerFormats } from "./plannerFormats";
+import type { PlannerKpis } from "./plannerKpis";
+import type { PlannerPhasesItem } from "./plannerPhasesItem";
 import type { PlannerPillarsItem } from "./plannerPillarsItem";
+import type { PlannerPlatformSplit } from "./plannerPlatformSplit";
 import type { PlannerWeeklyFlow } from "./plannerWeeklyFlow";
 
 export interface Planner {
@@ -16,9 +19,15 @@ export interface Planner {
   clientId: string;
   distribution: PlannerDistribution;
   formats: PlannerFormats;
+  platformSplit?: PlannerPlatformSplit;
   angleBank: PlannerAngleBank;
   hookStyles: string[];
   weeklyFlow: PlannerWeeklyFlow;
   pillars: PlannerPillarsItem[];
+  kpis?: PlannerKpis;
+  phases?: PlannerPhasesItem[] | null;
+  month?: string | null;
+  goal?: string | null;
+  notes?: string | null;
   createdAt?: string;
 }

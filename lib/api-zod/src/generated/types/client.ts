@@ -5,6 +5,7 @@
  * Strategy Engine API
  * OpenAPI spec version: 0.1.0
  */
+import type { Sow } from "./sow";
 
 export interface Client {
   id: string;
@@ -12,5 +13,6 @@ export interface Client {
   website?: string | null;
   instagramHandle?: string | null;
   oneLineDescription?: string | null;
+  sow?: Sow | null;
   createdAt: string;
 }

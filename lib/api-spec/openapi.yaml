@@ -133,6 +133,31 @@ paths:
               schema:
                 $ref: "#/components/schemas/Strategy"
 
+  /clients/{clientId}/sow:
+    parameters:
+      - in: path
+        name: clientId
+        required: true
+        schema:
+          type: string
+    put:
+      operationId: updateSow
+      tags: [clients]
+      summary: Set or update the Statement of Work for a client
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sow"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Client"
+
   /clients/{clientId}/calendar:
     parameters:
       - in: path
@@ -238,6 +263,31 @@ components:
           type: string
           enum: [draft, approved]
 
+    Sow:
+      type: object
+      required: [platforms, monthlyPosts, contentMix, deliverables, toneByPlatform]
+      properties:
+        platforms:
+          type: array
+          items: { type: string }
+          description: Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).
+        monthlyPosts:
+          type: object
+          additionalProperties: { type: integer }
+          description: "Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }."
+        contentMix:
+          type: object
+          additionalProperties: { type: number }
+          description: Pillar mix as percentages summing to 100.
+        deliverables:
+          type: array
+          items: { type: string }
+          description: Recurring deliverables (e.g. "1 monthly carousel", "weekly story takeover").
+        toneByPlatform:
+          type: object
+          additionalProperties: { type: string }
+          description: Voice/tone direction per platform.
+
     Client:
       type: object
       required: [id, name, createdAt]
@@ -247,6 +297,10 @@ components:
         website: { type: string, nullable: true }
         instagramHandle: { type: string, nullable: true }
         oneLineDescription: { type: string, nullable: true }
+        sow:
+          oneOf:
+            - $ref: "#/components/schemas/Sow"
+            - type: "null"
         createdAt: { type: string }
 
     ClientSummary:
@@ -329,9 +383,18 @@ components:
     GenerateCalendarInput:
       type: object
       properties:
+        month:
+          type: string
+          description: Month label (e.g. "May 2026"). Defaults to current month.
         startDate:
           type: string
-          description: ISO date (YYYY-MM-DD). Defaults to today.
+          description: ISO date (YYYY-MM-DD). Defaults to first of the month.
+        goal:
+          type: string
+          description: Single-sentence monthly goal (drives intent + KPIs).
+        notes:
+          type: string
+          description: Free-text notes/constraints from the strategist for this month.
 
     Planner:
       type: object
@@ -345,6 +408,10 @@ components:
         formats:
           type: object
           additionalProperties: { type: number }
+        platformSplit:
+          type: object
+          additionalProperties: { type: number }
+          nullable: true
         angleBank:
           type: object
           additionalProperties:
@@ -364,6 +431,21 @@ components:
               name: { type: string }
               color: { type: string }
               description: { type: string }
+        kpis:
+          type: object
+          additionalProperties: { type: string }
+          nullable: true
+        phases:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              focus: { type: string }
+          nullable: true
+        month: { type: string, nullable: true }
+        goal: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
         createdAt: { type: string }
 
     PostComment:
@@ -372,6 +454,11 @@ components:
         author: { type: string }
         text: { type: string }
         createdAt: { type: string }
+
+    PostExecution:
+      type: object
+      description: Format-specific execution detail. Shape depends on format.
+      additionalProperties: true
 
     Post:
       type: object
@@ -393,6 +480,17 @@ components:
           items: { type: string }
           nullable: true
         cta: { type: string }
+        strategicIntent: { type: string, nullable: true }
+        expectedMetric: { type: string, nullable: true }
+        expectedReason: { type: string, nullable: true }
+        priority:
+          type: string
+          enum: [high, medium, low]
+          nullable: true
+        execution:
+          oneOf:
+            - $ref: "#/components/schemas/PostExecution"
+            - type: "null"
         status:
           type: string
           enum: [draft, pending_approval, approved, needs_changes, scheduled]
@@ -416,6 +514,9 @@ components:
           type: array
           items: { type: string }
         cta: { type: string }
+        priority:
+          type: string
+          enum: [high, medium, low]
         addComment:
           type: object
           required: [text]

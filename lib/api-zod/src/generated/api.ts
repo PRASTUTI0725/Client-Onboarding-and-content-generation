@@ -24,6 +24,34 @@ export const ListClientsResponseItem = zod
     website: zod.string().nullish(),
     instagramHandle: zod.string().nullish(),
     oneLineDescription: zod.string().nullish(),
+    sow: zod
+      .union([
+        zod.object({
+          platforms: zod
+            .array(zod.string())
+            .describe(
+              "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+            ),
+          monthlyPosts: zod
+            .record(zod.string(), zod.number())
+            .describe(
+              "Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }.",
+            ),
+          contentMix: zod
+            .record(zod.string(), zod.number())
+            .describe("Pillar mix as percentages summing to 100."),
+          deliverables: zod
+            .array(zod.string())
+            .describe(
+              'Recurring deliverables (e.g. \"1 monthly carousel\", \"weekly story takeover\").',
+            ),
+          toneByPlatform: zod
+            .record(zod.string(), zod.string())
+            .describe("Voice\/tone direction per platform."),
+        }),
+        zod.null(),
+      ])
+      .optional(),
     createdAt: zod.string(),
   })
   .and(
@@ -59,6 +87,34 @@ export const GetClientResponse = zod.object({
     website: zod.string().nullish(),
     instagramHandle: zod.string().nullish(),
     oneLineDescription: zod.string().nullish(),
+    sow: zod
+      .union([
+        zod.object({
+          platforms: zod
+            .array(zod.string())
+            .describe(
+              "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+            ),
+          monthlyPosts: zod
+            .record(zod.string(), zod.number())
+            .describe(
+              "Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }.",
+            ),
+          contentMix: zod
+            .record(zod.string(), zod.number())
+            .describe("Pillar mix as percentages summing to 100."),
+          deliverables: zod
+            .array(zod.string())
+            .describe(
+              'Recurring deliverables (e.g. \"1 monthly carousel\", \"weekly story takeover\").',
+            ),
+          toneByPlatform: zod
+            .record(zod.string(), zod.string())
+            .describe("Voice\/tone direction per platform."),
+        }),
+        zod.null(),
+      ])
+      .optional(),
     createdAt: zod.string(),
   }),
   onboarding: zod
@@ -177,6 +233,74 @@ export const UpdateStrategyResponse = zod.object({
 });
 
 /**
+ * @summary Set or update the Statement of Work for a client
+ */
+export const UpdateSowParams = zod.object({
+  clientId: zod.coerce.string(),
+});
+
+export const UpdateSowBody = zod.object({
+  platforms: zod
+    .array(zod.string())
+    .describe(
+      "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+    ),
+  monthlyPosts: zod
+    .record(zod.string(), zod.number())
+    .describe(
+      "Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }.",
+    ),
+  contentMix: zod
+    .record(zod.string(), zod.number())
+    .describe("Pillar mix as percentages summing to 100."),
+  deliverables: zod
+    .array(zod.string())
+    .describe(
+      'Recurring deliverables (e.g. \"1 monthly carousel\", \"weekly story takeover\").',
+    ),
+  toneByPlatform: zod
+    .record(zod.string(), zod.string())
+    .describe("Voice\/tone direction per platform."),
+});
+
+export const UpdateSowResponse = zod.object({
+  id: zod.string(),
+  name: zod.string(),
+  website: zod.string().nullish(),
+  instagramHandle: zod.string().nullish(),
+  oneLineDescription: zod.string().nullish(),
+  sow: zod
+    .union([
+      zod.object({
+        platforms: zod
+          .array(zod.string())
+          .describe(
+            "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+          ),
+        monthlyPosts: zod
+          .record(zod.string(), zod.number())
+          .describe(
+            "Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }.",
+          ),
+        contentMix: zod
+          .record(zod.string(), zod.number())
+          .describe("Pillar mix as percentages summing to 100."),
+        deliverables: zod
+          .array(zod.string())
+          .describe(
+            'Recurring deliverables (e.g. \"1 monthly carousel\", \"weekly story takeover\").',
+          ),
+        toneByPlatform: zod
+          .record(zod.string(), zod.string())
+          .describe("Voice\/tone direction per platform."),
+      }),
+      zod.null(),
+    ])
+    .optional(),
+  createdAt: zod.string(),
+});
+
+/**
  * @summary Get the planner and posts for a client
  */
 export const GetCalendarParams = zod.object({
@@ -191,6 +315,7 @@ export const GetCalendarResponse = zod.object({
         clientId: zod.string(),
         distribution: zod.record(zod.string(), zod.number()),
         formats: zod.record(zod.string(), zod.number()),
+        platformSplit: zod.record(zod.string(), zod.number()).nullish(),
         angleBank: zod.record(zod.string(), zod.array(zod.string())),
         hookStyles: zod.array(zod.string()),
         weeklyFlow: zod.record(zod.string(), zod.string()),
@@ -201,6 +326,18 @@ export const GetCalendarResponse = zod.object({
             description: zod.string().optional(),
           }),
         ),
+        kpis: zod.record(zod.string(), zod.string()).nullish(),
+        phases: zod
+          .array(
+            zod.object({
+              name: zod.string().optional(),
+              focus: zod.string().optional(),
+            }),
+          )
+          .nullish(),
+        month: zod.string().nullish(),
+        goal: zod.string().nullish(),
+        notes: zod.string().nullish(),
         createdAt: zod.string().optional(),
       }),
       zod.null(),
@@ -222,6 +359,20 @@ export const GetCalendarResponse = zod.object({
         caption: zod.string().nullish(),
         hashtags: zod.array(zod.string()).nullish(),
         cta: zod.string(),
+        strategicIntent: zod.string().nullish(),
+        expectedMetric: zod.string().nullish(),
+        expectedReason: zod.string().nullish(),
+        priority: zod.enum(["high", "medium", "low"]).nullish(),
+        execution: zod
+          .union([
+            zod
+              .record(zod.string(), zod.unknown())
+              .describe(
+                "Format-specific execution detail. Shape depends on format.",
+              ),
+            zod.null(),
+          ])
+          .optional(),
         status: zod.enum([
           "draft",
           "pending_approval",
@@ -253,10 +404,24 @@ export const GenerateCalendarParams = zod.object({
 });
 
 export const GenerateCalendarBody = zod.object({
+  month: zod
+    .string()
+    .optional()
+    .describe('Month label (e.g. \"May 2026\"). Defaults to current month.'),
   startDate: zod
     .string()
     .optional()
-    .describe("ISO date (YYYY-MM-DD). Defaults to today."),
+    .describe("ISO date (YYYY-MM-DD). Defaults to first of the month."),
+  goal: zod
+    .string()
+    .optional()
+    .describe("Single-sentence monthly goal (drives intent + KPIs)."),
+  notes: zod
+    .string()
+    .optional()
+    .describe(
+      "Free-text notes\/constraints from the strategist for this month.",
+    ),
 });
 
 export const GenerateCalendarResponse = zod.object({
@@ -267,6 +432,7 @@ export const GenerateCalendarResponse = zod.object({
         clientId: zod.string(),
         distribution: zod.record(zod.string(), zod.number()),
         formats: zod.record(zod.string(), zod.number()),
+        platformSplit: zod.record(zod.string(), zod.number()).nullish(),
         angleBank: zod.record(zod.string(), zod.array(zod.string())),
         hookStyles: zod.array(zod.string()),
         weeklyFlow: zod.record(zod.string(), zod.string()),
@@ -277,6 +443,18 @@ export const GenerateCalendarResponse = zod.object({
             description: zod.string().optional(),
           }),
         ),
+        kpis: zod.record(zod.string(), zod.string()).nullish(),
+        phases: zod
+          .array(
+            zod.object({
+              name: zod.string().optional(),
+              focus: zod.string().optional(),
+            }),
+          )
+          .nullish(),
+        month: zod.string().nullish(),
+        goal: zod.string().nullish(),
+        notes: zod.string().nullish(),
         createdAt: zod.string().optional(),
       }),
       zod.null(),
@@ -298,6 +476,20 @@ export const GenerateCalendarResponse = zod.object({
         caption: zod.string().nullish(),
         hashtags: zod.array(zod.string()).nullish(),
         cta: zod.string(),
+        strategicIntent: zod.string().nullish(),
+        expectedMetric: zod.string().nullish(),
+        expectedReason: zod.string().nullish(),
+        priority: zod.enum(["high", "medium", "low"]).nullish(),
+        execution: zod
+          .union([
+            zod
+              .record(zod.string(), zod.unknown())
+              .describe(
+                "Format-specific execution detail. Shape depends on format.",
+              ),
+            zod.null(),
+          ])
+          .optional(),
         status: zod.enum([
           "draft",
           "pending_approval",
@@ -343,6 +535,7 @@ export const UpdatePostBody = zod.object({
   caption: zod.string().optional(),
   hashtags: zod.array(zod.string()).optional(),
   cta: zod.string().optional(),
+  priority: zod.enum(["high", "medium", "low"]).optional(),
   addComment: zod
     .object({
       author: zod.string().optional(),
@@ -365,6 +558,18 @@ export const UpdatePostResponse = zod.object({
   caption: zod.string().nullish(),
   hashtags: zod.array(zod.string()).nullish(),
   cta: zod.string(),
+  strategicIntent: zod.string().nullish(),
+  expectedMetric: zod.string().nullish(),
+  expectedReason: zod.string().nullish(),
+  priority: zod.enum(["high", "medium", "low"]).nullish(),
+  execution: zod
+    .union([
+      zod
+        .record(zod.string(), zod.unknown())
+        .describe("Format-specific execution detail. Shape depends on format."),
+      zod.null(),
+    ])
+    .optional(),
   status: zod.enum([
     "draft",
     "pending_approval",

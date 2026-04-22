@@ -6,6 +6,7 @@
  * OpenAPI spec version: 0.1.0
  */
 import type { UpdatePostInputAddComment } from "./updatePostInputAddComment";
+import type { UpdatePostInputPriority } from "./updatePostInputPriority";
 import type { UpdatePostInputStatus } from "./updatePostInputStatus";
 
 export interface UpdatePostInput {
@@ -15,5 +16,6 @@ export interface UpdatePostInput {
   caption?: string;
   hashtags?: string[];
   cta?: string;
+  priority?: UpdatePostInputPriority;
   addComment?: UpdatePostInputAddComment;
 }

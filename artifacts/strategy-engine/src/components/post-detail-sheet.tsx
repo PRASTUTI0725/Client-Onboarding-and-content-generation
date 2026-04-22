@@ -17,6 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/hooks/use-toast";
+import { ExecutionDetail } from "./execution-detail";
 
 interface PostLike {
   id: string;
@@ -31,6 +32,11 @@ interface PostLike {
   caption?: string | null;
   hashtags?: string[] | null;
   status: string;
+  strategicIntent?: string | null;
+  expectedMetric?: string | null;
+  expectedReason?: string | null;
+  priority?: "high" | "medium" | "low" | string | null;
+  execution?: Record<string, unknown> | null;
   comments?: Array<{ author?: string; text: string; createdAt?: string }>;
 }
 
@@ -49,6 +55,12 @@ const STATUS_LABELS: Record<UpdatePostInputStatus, string> = {
   approved: "Approved",
   needs_changes: "Needs changes",
   scheduled: "Scheduled",
+};
+
+const PRIORITY_STYLES: Record<string, string> = {
+  high: "bg-[#B85C38]/10 text-[#B85C38] border-[#B85C38]/30",
+  medium: "bg-[#A38560]/10 text-[#8B7355] border-[#A38560]/30",
+  low: "bg-muted text-muted-foreground border-border",
 };
 
 export function PostDetailSheet({
@@ -86,6 +98,9 @@ export function PostDetailSheet({
   const setStatus = (status: UpdatePostInputStatus) =>
     update.mutate({ postId: post.id, data: { status } });
 
+  const setPriority = (priority: "high" | "medium" | "low") =>
+    update.mutate({ postId: post.id, data: { priority } });
+
   const submitComment = () => {
     if (!comment.trim()) return;
     update.mutate(
@@ -99,16 +114,25 @@ export function PostDetailSheet({
     );
   };
 
+  const priority = (post.priority ?? "medium") as "high" | "medium" | "low";
+
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="w-full sm:max-w-md overflow-y-auto">
+      <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
         <SheetHeader className="space-y-3 pb-2">
-          <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground">
+          <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground flex-wrap">
             <span>{formatDate(post.date)}</span>
             <span className="text-border">·</span>
             <span>{post.platform}</span>
             <span className="text-border">·</span>
             <span>{post.format}</span>
+            <span
+              className={`ml-auto px-2 py-0.5 rounded-full border text-[10px] tracking-wider ${
+                PRIORITY_STYLES[priority] ?? PRIORITY_STYLES.medium
+              }`}
+            >
+              {priority}
+            </span>
           </div>
           <SheetTitle className="font-serif text-2xl leading-snug tracking-tight">
             {post.hook}
@@ -133,9 +157,7 @@ export function PostDetailSheet({
           </Field>
 
           <Field label="Objective">
-            <p className="text-sm leading-relaxed text-foreground/80">
-              {post.objective}
-            </p>
+            <p className="text-sm leading-relaxed text-foreground/80">{post.objective}</p>
           </Field>
 
           <Field label="CTA">
@@ -162,6 +184,48 @@ export function PostDetailSheet({
             </Field>
           )}
 
+          {(post.strategicIntent || post.expectedMetric) && (
+            <>
+              <Separator />
+              <Field label="Decision layer">
+                <div className="rounded-md border border-border bg-muted/30 p-3 space-y-2">
+                  {post.strategicIntent && (
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-0.5">
+                        Strategic intent
+                      </p>
+                      <p className="text-sm leading-relaxed text-foreground/85">
+                        {post.strategicIntent}
+                      </p>
+                    </div>
+                  )}
+                  {post.expectedMetric && (
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-0.5">
+                        Expected outcome
+                      </p>
+                      <p className="text-sm text-foreground/85">
+                        <span className="font-medium">{post.expectedMetric}</span>
+                        {post.expectedReason && (
+                          <span className="text-muted-foreground"> — {post.expectedReason}</span>
+                        )}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </Field>
+            </>
+          )}
+
+          {post.execution && Object.keys(post.execution).length > 0 && (
+            <>
+              <Separator />
+              <Field label={`${post.format} execution`}>
+                <ExecutionDetail format={post.format} execution={post.execution} />
+              </Field>
+            </>
+          )}
+
           <Separator />
 
           <Field label="Strategy context">
@@ -183,19 +247,38 @@ export function PostDetailSheet({
 
           <Separator />
 
-          <Field label="Status">
-            <div className="flex flex-wrap gap-2">
-              {(Object.entries(STATUS_LABELS) as Array<[UpdatePostInputStatus, string]>).map(([key, label]) => (
+          <Field label="Priority">
+            <div className="flex gap-2">
+              {(["high", "medium", "low"] as const).map((p) => (
                 <Button
-                  key={key}
+                  key={p}
                   size="sm"
-                  variant={post.status === key ? "default" : "outline"}
-                  onClick={() => setStatus(key)}
+                  variant={priority === p ? "default" : "outline"}
+                  onClick={() => setPriority(p)}
                   disabled={update.isPending}
+                  className="capitalize"
                 >
-                  {label}
+                  {p}
                 </Button>
               ))}
+            </div>
+          </Field>
+
+          <Field label="Status">
+            <div className="flex flex-wrap gap-2">
+              {(Object.entries(STATUS_LABELS) as Array<[UpdatePostInputStatus, string]>).map(
+                ([key, label]) => (
+                  <Button
+                    key={key}
+                    size="sm"
+                    variant={post.status === key ? "default" : "outline"}
+                    onClick={() => setStatus(key)}
+                    disabled={update.isPending}
+                  >
+                    {label}
+                  </Button>
+                ),
+              )}
             </div>
           </Field>
 
@@ -204,9 +287,7 @@ export function PostDetailSheet({
           <Field label="Comments">
             <div className="space-y-3">
               {(post.comments ?? []).length === 0 && (
-                <p className="text-xs text-muted-foreground italic">
-                  No comments yet.
-                </p>
+                <p className="text-xs text-muted-foreground italic">No comments yet.</p>
               )}
               {(post.comments ?? []).map((c, i) => (
                 <div
@@ -215,9 +296,7 @@ export function PostDetailSheet({
                 >
                   <div className="flex items-center justify-between text-xs text-muted-foreground">
                     <span>{c.author ?? "Strategist"}</span>
-                    {c.createdAt && (
-                      <span>{formatDate(c.createdAt.slice(0, 10))}</span>
-                    )}
+                    {c.createdAt && <span>{formatDate(c.createdAt.slice(0, 10))}</span>}
                   </div>
                   <p className="text-foreground/80 leading-relaxed">{c.text}</p>
                 </div>

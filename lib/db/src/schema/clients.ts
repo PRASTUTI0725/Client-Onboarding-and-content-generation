@@ -8,6 +8,7 @@ export const clientsTable = pgTable("clients", {
   website: text("website"),
   instagramHandle: text("instagram_handle"),
   oneLineDescription: text("one_line_description"),
+  sow: jsonb("sow"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -37,10 +38,16 @@ export const plannersTable = pgTable("planners", {
   clientId: uuid("client_id").notNull().references(() => clientsTable.id, { onDelete: "cascade" }),
   distribution: jsonb("distribution").notNull(),
   formats: jsonb("formats").notNull(),
+  platformSplit: jsonb("platform_split"),
   angleBank: jsonb("angle_bank").notNull(),
   hookStyles: jsonb("hook_styles").notNull(),
   weeklyFlow: jsonb("weekly_flow").notNull(),
   pillars: jsonb("pillars").notNull(),
+  kpis: jsonb("kpis"),
+  phases: jsonb("phases"),
+  month: text("month"),
+  goal: text("goal"),
+  notes: text("notes"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -58,6 +65,11 @@ export const postsTable = pgTable("posts", {
   caption: text("caption"),
   hashtags: jsonb("hashtags"),
   cta: text("cta").notNull(),
+  strategicIntent: text("strategic_intent"),
+  expectedMetric: text("expected_metric"),
+  expectedReason: text("expected_reason"),
+  priority: text("priority"),
+  execution: jsonb("execution"),
   status: text("status").notNull().default("draft"),
   comments: jsonb("comments").notNull().default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

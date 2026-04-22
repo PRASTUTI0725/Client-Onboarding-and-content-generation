@@ -6,10 +6,18 @@ interface Props {
   hook: string;
   status: string;
   pillarColor: string;
+  platform?: string;
+  priority?: string;
   onClick: () => void;
   draggable?: boolean;
   onDragStart?: (e: React.DragEvent) => void;
 }
+
+const PRIORITY_DOT: Record<string, string> = {
+  high: "bg-[#B85C38]",
+  medium: "bg-[#A38560]",
+  low: "bg-muted-foreground/30",
+};
 
 export function CalendarCard({
   format,
@@ -17,6 +25,8 @@ export function CalendarCard({
   hook,
   status,
   pillarColor,
+  platform,
+  priority,
   onClick,
   draggable,
   onDragStart,
@@ -33,10 +43,20 @@ export function CalendarCard({
       <div className="absolute left-0 top-0 bottom-0 w-1" style={accent} />
       <div className="pl-1.5 space-y-1">
         <div className="flex items-center justify-between gap-1">
-          <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-            {format}
+          <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground truncate">
+            {platform ? `${platform} · ${format}` : format}
           </span>
-          <StatusDot status={status} />
+          <span className="flex items-center gap-1">
+            {priority && (
+              <span
+                className={`inline-block size-1.5 rounded-full ${
+                  PRIORITY_DOT[priority] ?? PRIORITY_DOT.medium
+                }`}
+                title={`Priority: ${priority}`}
+              />
+            )}
+            <StatusDot status={status} />
+          </span>
         </div>
         <p className="text-[11px] leading-snug text-foreground line-clamp-2 font-medium">
           {hook}

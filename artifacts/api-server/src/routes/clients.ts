@@ -5,6 +5,7 @@ import {
   CreateClientBody,
   GenerateStrategyBody,
   UpdateStrategyBody,
+  UpdateSowBody,
 } from "@workspace/api-zod";
 import { enrich } from "../lib/strategy/enrich.js";
 import {
@@ -130,6 +131,28 @@ router.get("/clients/:clientId", async (req, res) => {
     strategy: strategy ? serializeStrategy(strategy) : null,
     hasCalendar: !!planner,
   });
+});
+
+router.put("/clients/:clientId/sow", async (req, res) => {
+  const { clientId } = req.params;
+  if (!clientId) {
+    res.status(400).json({ error: "clientId required" });
+    return;
+  }
+  const body = UpdateSowBody.parse(req.body);
+
+  const [updated] = await db
+    .update(clientsTable)
+    .set({ sow: body })
+    .where(eq(clientsTable.id, clientId))
+    .returning();
+
+  if (!updated) {
+    res.status(404).json({ error: "Client not found" });
+    return;
+  }
+
+  res.json(serializeClient(updated));
 });
 
 router.delete("/clients/:clientId", async (req, res) => {
@@ -271,6 +294,7 @@ function serializeClient(c: typeof clientsTable.$inferSelect) {
     website: c.website,
     instagramHandle: c.instagramHandle,
     oneLineDescription: c.oneLineDescription,
+    sow: c.sow ?? null,
     createdAt: c.createdAt instanceof Date ? c.createdAt.toISOString() : String(c.createdAt),
   };
 }

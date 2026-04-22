@@ -9,10 +9,7 @@ import {
 } from "@workspace/db";
 import { eq, desc, asc } from "drizzle-orm";
 import { GenerateCalendarBody, UpdatePostBody } from "@workspace/api-zod";
-import {
-  generatePlannerLayer,
-  generateCalendarPosts,
-} from "../lib/planner/generate.js";
+import { generateMonthlyPlan, type SowInput } from "../lib/planner/generate.js";
 
 const router: IRouter = Router();
 
@@ -60,6 +57,10 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
     res.status(404).json({ error: "Client not found" });
     return;
   }
+  if (!client.sow) {
+    res.status(400).json({ error: "Set the SOW (Statement of Work) before generating the calendar." });
+    return;
+  }
   const [strategy] = await db
     .select()
     .from(strategiesTable)
@@ -79,17 +80,33 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
 
   const enriched = (profile?.enrichedData ?? {}) as Record<string, unknown>;
   const structured = strategy.structuredStrategy as Record<string, unknown>;
-  const startDate = body.startDate ?? new Date().toISOString().slice(0, 10);
+  const sow = client.sow as SowInput;
+
+  const today = new Date();
+  const monthAnchor = body.startDate
+    ? new Date(body.startDate + "T00:00:00Z")
+    : new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
+  const startDate = monthAnchor.toISOString().slice(0, 10);
+  const monthLabel =
+    body.month ||
+    monthAnchor.toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC",
+    });
 
   try {
-    const planner = await generatePlannerLayer(client.name, enriched, structured);
-    const posts = await generateCalendarPosts(
-      client.name,
-      planner,
-      enriched,
-      structured,
+    const { planner, posts } = await generateMonthlyPlan(client.name, enriched, structured, sow, {
+      month: monthLabel,
       startDate,
-    );
+      goal: body.goal ?? "",
+      notes: body.notes ?? "",
+    });
+
+    if (posts.length === 0) {
+      res.status(500).json({ error: "Generation returned no posts." });
+      return;
+    }
 
     // Replace any prior planner/posts for this client.
     await db.delete(plannersTable).where(eq(plannersTable.clientId, clientId));
@@ -100,10 +117,16 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
         clientId,
         distribution: planner.distribution,
         formats: planner.formats,
+        platformSplit: planner.platformSplit,
         angleBank: planner.angleBank,
         hookStyles: planner.hookStyles,
         weeklyFlow: planner.weeklyFlow,
         pillars: planner.pillars,
+        kpis: planner.kpis,
+        phases: planner.phases,
+        month: monthLabel,
+        goal: body.goal ?? null,
+        notes: body.notes ?? null,
       })
       .returning();
 
@@ -125,7 +148,14 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           format: p.format,
           objective: p.objective,
           hook: p.hook,
+          caption: p.caption ?? null,
+          hashtags: p.hashtags ?? null,
           cta: p.cta,
+          strategicIntent: p.strategicIntent,
+          expectedMetric: p.expectedMetric,
+          expectedReason: p.expectedReason,
+          priority: p.priority,
+          execution: p.execution,
           status: "draft",
         })),
       )
@@ -162,6 +192,7 @@ router.patch("/posts/:postId", async (req, res) => {
   if (body.caption !== undefined) updates.caption = body.caption;
   if (body.hashtags !== undefined) updates.hashtags = body.hashtags;
   if (body.cta !== undefined) updates.cta = body.cta;
+  if (body.priority !== undefined) updates.priority = body.priority;
 
   if (body.addComment) {
     const prior = Array.isArray(existing.comments) ? (existing.comments as unknown[]) : [];
@@ -195,10 +226,16 @@ function serializePlanner(p: typeof plannersTable.$inferSelect) {
     clientId: p.clientId,
     distribution: p.distribution,
     formats: p.formats,
+    platformSplit: p.platformSplit,
     angleBank: p.angleBank,
     hookStyles: p.hookStyles,
     weeklyFlow: p.weeklyFlow,
     pillars: p.pillars,
+    kpis: p.kpis,
+    phases: p.phases,
+    month: p.month,
+    goal: p.goal,
+    notes: p.notes,
     createdAt: p.createdAt instanceof Date ? p.createdAt.toISOString() : String(p.createdAt),
   };
 }
@@ -218,6 +255,11 @@ function serializePost(p: typeof postsTable.$inferSelect) {
     caption: p.caption,
     hashtags: p.hashtags,
     cta: p.cta,
+    strategicIntent: p.strategicIntent,
+    expectedMetric: p.expectedMetric,
+    expectedReason: p.expectedReason,
+    priority: p.priority,
+    execution: p.execution,
     status: p.status,
     comments: p.comments ?? [],
     createdAt: p.createdAt instanceof Date ? p.createdAt.toISOString() : String(p.createdAt),

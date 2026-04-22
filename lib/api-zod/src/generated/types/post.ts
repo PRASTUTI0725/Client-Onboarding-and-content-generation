@@ -6,6 +6,8 @@
  * OpenAPI spec version: 0.1.0
  */
 import type { PostComment } from "./postComment";
+import type { PostExecution } from "./postExecution";
+import type { PostPriority } from "./postPriority";
 import type { PostStatus } from "./postStatus";
 
 export interface Post {
@@ -22,6 +24,11 @@ export interface Post {
   caption?: string | null;
   hashtags?: string[] | null;
   cta: string;
+  strategicIntent?: string | null;
+  expectedMetric?: string | null;
+  expectedReason?: string | null;
+  priority?: PostPriority;
+  execution?: PostExecution | null;
   status: PostStatus;
   comments?: PostComment[];
   createdAt?: string;

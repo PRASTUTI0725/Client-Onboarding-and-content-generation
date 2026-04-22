@@ -7,6 +7,12 @@
  */
 
 export interface GenerateCalendarInput {
-  /** ISO date (YYYY-MM-DD). Defaults to today. */
+  /** Month label (e.g. "May 2026"). Defaults to current month. */
+  month?: string;
+  /** ISO date (YYYY-MM-DD). Defaults to first of the month. */
   startDate?: string;
+  /** Single-sentence monthly goal (drives intent + KPIs). */
+  goal?: string;
+  /** Free-text notes/constraints from the strategist for this month. */
+  notes?: string;
 }

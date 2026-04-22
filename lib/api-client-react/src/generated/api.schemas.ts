@@ -47,12 +47,41 @@ export interface UpdateStrategyInput {
   status?: UpdateStrategyInputStatus;
 }
 
+/**
+ * Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }.
+ */
+export type SowMonthlyPosts = { [key: string]: number };
+
+/**
+ * Pillar mix as percentages summing to 100.
+ */
+export type SowContentMix = { [key: string]: number };
+
+/**
+ * Voice/tone direction per platform.
+ */
+export type SowToneByPlatform = { [key: string]: string };
+
+export interface Sow {
+  /** Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube). */
+  platforms: string[];
+  /** Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }. */
+  monthlyPosts: SowMonthlyPosts;
+  /** Pillar mix as percentages summing to 100. */
+  contentMix: SowContentMix;
+  /** Recurring deliverables (e.g. "1 monthly carousel", "weekly story takeover"). */
+  deliverables: string[];
+  /** Voice/tone direction per platform. */
+  toneByPlatform: SowToneByPlatform;
+}
+
 export interface Client {
   id: string;
   name: string;
   website?: string | null;
   instagramHandle?: string | null;
   oneLineDescription?: string | null;
+  sow?: Sow | null;
   createdAt: string;
 }
 
@@ -112,13 +141,21 @@ export interface ClientDetail {
 }
 
 export interface GenerateCalendarInput {
-  /** ISO date (YYYY-MM-DD). Defaults to today. */
+  /** Month label (e.g. "May 2026"). Defaults to current month. */
+  month?: string;
+  /** ISO date (YYYY-MM-DD). Defaults to first of the month. */
   startDate?: string;
+  /** Single-sentence monthly goal (drives intent + KPIs). */
+  goal?: string;
+  /** Free-text notes/constraints from the strategist for this month. */
+  notes?: string;
 }
 
 export type PlannerDistribution = { [key: string]: number };
 
 export type PlannerFormats = { [key: string]: number };
+
+export type PlannerPlatformSplit = { [key: string]: number } | null;
 
 export type PlannerAngleBank = { [key: string]: string[] };
 
@@ -130,15 +167,28 @@ export type PlannerPillarsItem = {
   description?: string;
 };
 
+export type PlannerKpis = { [key: string]: string } | null;
+
+export type PlannerPhasesItem = {
+  name?: string;
+  focus?: string;
+};
+
 export interface Planner {
   id: string;
   clientId: string;
   distribution: PlannerDistribution;
   formats: PlannerFormats;
+  platformSplit?: PlannerPlatformSplit;
   angleBank: PlannerAngleBank;
   hookStyles: string[];
   weeklyFlow: PlannerWeeklyFlow;
   pillars: PlannerPillarsItem[];
+  kpis?: PlannerKpis;
+  phases?: PlannerPhasesItem[] | null;
+  month?: string | null;
+  goal?: string | null;
+  notes?: string | null;
   createdAt?: string;
 }
 
@@ -147,6 +197,23 @@ export interface PostComment {
   text?: string;
   createdAt?: string;
 }
+
+/**
+ * Format-specific execution detail. Shape depends on format.
+ */
+export interface PostExecution {
+  [key: string]: unknown;
+}
+
+export type PostPriority =
+  | (typeof PostPriority)[keyof typeof PostPriority]
+  | null;
+
+export const PostPriority = {
+  high: "high",
+  medium: "medium",
+  low: "low",
+} as const;
 
 export type PostStatus = (typeof PostStatus)[keyof typeof PostStatus];
 
@@ -172,6 +239,11 @@ export interface Post {
   caption?: string | null;
   hashtags?: string[] | null;
   cta: string;
+  strategicIntent?: string | null;
+  expectedMetric?: string | null;
+  expectedReason?: string | null;
+  priority?: PostPriority;
+  execution?: PostExecution | null;
   status: PostStatus;
   comments?: PostComment[];
   createdAt?: string;
@@ -189,6 +261,15 @@ export const UpdatePostInputStatus = {
   scheduled: "scheduled",
 } as const;
 
+export type UpdatePostInputPriority =
+  (typeof UpdatePostInputPriority)[keyof typeof UpdatePostInputPriority];
+
+export const UpdatePostInputPriority = {
+  high: "high",
+  medium: "medium",
+  low: "low",
+} as const;
+
 export type UpdatePostInputAddComment = {
   author?: string;
   text: string;
@@ -201,6 +282,7 @@ export interface UpdatePostInput {
   caption?: string;
   hashtags?: string[];
   cta?: string;
+  priority?: UpdatePostInputPriority;
   addComment?: UpdatePostInputAddComment;
 }
 

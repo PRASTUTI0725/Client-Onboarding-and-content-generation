@@ -23,6 +23,7 @@ import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, Pencil, RefreshCw, CheckCircle2, Printer, Globe, Instagram, CalendarDays } from "lucide-react";
 import { GeneratingStrategy } from "@/components/generating-strategy";
 import { StructuredStrategyPanel } from "@/components/structured-strategy-panel";
+import { SowForm } from "@/components/sow-form";
 
 type TemplateChoice =
   | "auto"
@@ -349,7 +350,23 @@ export default function Workspace() {
           </div>
         ) : (
           /* Reading mode */
-          <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-12">
+          <div className="space-y-12">
+            <section
+              id="sow"
+              className="border border-border rounded-xl bg-card/40 p-6 shadow-sm scroll-mt-28"
+            >
+              <div className="flex items-baseline justify-between mb-1 flex-wrap gap-2">
+                <h2 className="font-serif text-2xl tracking-tight">Statement of Work</h2>
+                <span className="text-xs text-muted-foreground">
+                  Defines what the calendar plans against — total posts, mix, tone, recurring deliverables.
+                </span>
+              </div>
+              <div className="mt-4">
+                <SowForm clientId={id ?? ""} initial={data?.client.sow ?? null} />
+              </div>
+            </section>
+
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-12">
             <article className="strategy-doc">
               <div
                 className="prose prose-stone prose-headings:font-serif prose-headings:tracking-tight prose-h1:text-4xl prose-h1:mb-2 prose-h2:text-2xl prose-h2:mt-12 prose-h2:mb-4 prose-h3:text-lg prose-p:leading-relaxed prose-p:text-foreground/85 prose-li:text-foreground/85 max-w-[70ch]"
@@ -366,6 +383,7 @@ export default function Workspace() {
                 />
               </div>
             </aside>
+            </div>
           </div>
         )}
       </main>
