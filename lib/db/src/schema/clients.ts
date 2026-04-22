@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, jsonb, integer, uuid } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, jsonb, integer, uuid, date } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
@@ -32,9 +32,43 @@ export const strategiesTable = pgTable("strategies", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const plannersTable = pgTable("planners", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clientsTable.id, { onDelete: "cascade" }),
+  distribution: jsonb("distribution").notNull(),
+  formats: jsonb("formats").notNull(),
+  angleBank: jsonb("angle_bank").notNull(),
+  hookStyles: jsonb("hook_styles").notNull(),
+  weeklyFlow: jsonb("weekly_flow").notNull(),
+  pillars: jsonb("pillars").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const postsTable = pgTable("posts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clientsTable.id, { onDelete: "cascade" }),
+  plannerId: uuid("planner_id").notNull().references(() => plannersTable.id, { onDelete: "cascade" }),
+  date: date("date").notNull(),
+  platform: text("platform").notNull(),
+  pillar: text("pillar").notNull(),
+  angle: text("angle").notNull(),
+  format: text("format").notNull(),
+  objective: text("objective").notNull(),
+  hook: text("hook").notNull(),
+  caption: text("caption"),
+  hashtags: jsonb("hashtags"),
+  cta: text("cta").notNull(),
+  status: text("status").notNull().default("draft"),
+  comments: jsonb("comments").notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const insertClientSchema = createInsertSchema(clientsTable).omit({ id: true, createdAt: true });
 export type InsertClient = z.infer<typeof insertClientSchema>;
 export type Client = typeof clientsTable.$inferSelect;
 
 export type OnboardingProfile = typeof onboardingProfilesTable.$inferSelect;
 export type Strategy = typeof strategiesTable.$inferSelect;
+export type Planner = typeof plannersTable.$inferSelect;
+export type Post = typeof postsTable.$inferSelect;

@@ -13,4 +13,5 @@ export interface ClientDetail {
   client: Client;
   onboarding?: OnboardingProfile | null;
   strategy?: Strategy | null;
+  hasCalendar?: boolean;
 }

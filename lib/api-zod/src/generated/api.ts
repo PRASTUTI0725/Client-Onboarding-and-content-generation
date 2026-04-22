@@ -110,6 +110,7 @@ export const GetClientResponse = zod.object({
       zod.null(),
     ])
     .optional(),
+  hasCalendar: zod.boolean().optional(),
 });
 
 /**
@@ -171,6 +172,215 @@ export const UpdateStrategyResponse = zod.object({
   templateType: zod.string(),
   version: zod.number(),
   status: zod.string(),
+  createdAt: zod.string().optional(),
+  updatedAt: zod.string().optional(),
+});
+
+/**
+ * @summary Get the planner and posts for a client
+ */
+export const GetCalendarParams = zod.object({
+  clientId: zod.coerce.string(),
+});
+
+export const GetCalendarResponse = zod.object({
+  planner: zod
+    .union([
+      zod.object({
+        id: zod.string(),
+        clientId: zod.string(),
+        distribution: zod.record(zod.string(), zod.number()),
+        formats: zod.record(zod.string(), zod.number()),
+        angleBank: zod.record(zod.string(), zod.array(zod.string())),
+        hookStyles: zod.array(zod.string()),
+        weeklyFlow: zod.record(zod.string(), zod.string()),
+        pillars: zod.array(
+          zod.object({
+            name: zod.string().optional(),
+            color: zod.string().optional(),
+            description: zod.string().optional(),
+          }),
+        ),
+        createdAt: zod.string().optional(),
+      }),
+      zod.null(),
+    ])
+    .optional(),
+  posts: zod
+    .array(
+      zod.object({
+        id: zod.string(),
+        clientId: zod.string(),
+        plannerId: zod.string(),
+        date: zod.string(),
+        platform: zod.string(),
+        pillar: zod.string(),
+        angle: zod.string(),
+        format: zod.string(),
+        objective: zod.string(),
+        hook: zod.string(),
+        caption: zod.string().nullish(),
+        hashtags: zod.array(zod.string()).nullish(),
+        cta: zod.string(),
+        status: zod.enum([
+          "draft",
+          "pending_approval",
+          "approved",
+          "needs_changes",
+          "scheduled",
+        ]),
+        comments: zod
+          .array(
+            zod.object({
+              author: zod.string().optional(),
+              text: zod.string().optional(),
+              createdAt: zod.string().optional(),
+            }),
+          )
+          .optional(),
+        createdAt: zod.string().optional(),
+        updatedAt: zod.string().optional(),
+      }),
+    )
+    .optional(),
+});
+
+/**
+ * @summary Build planner layer and generate a 30-day calendar from the strategy
+ */
+export const GenerateCalendarParams = zod.object({
+  clientId: zod.coerce.string(),
+});
+
+export const GenerateCalendarBody = zod.object({
+  startDate: zod
+    .string()
+    .optional()
+    .describe("ISO date (YYYY-MM-DD). Defaults to today."),
+});
+
+export const GenerateCalendarResponse = zod.object({
+  planner: zod
+    .union([
+      zod.object({
+        id: zod.string(),
+        clientId: zod.string(),
+        distribution: zod.record(zod.string(), zod.number()),
+        formats: zod.record(zod.string(), zod.number()),
+        angleBank: zod.record(zod.string(), zod.array(zod.string())),
+        hookStyles: zod.array(zod.string()),
+        weeklyFlow: zod.record(zod.string(), zod.string()),
+        pillars: zod.array(
+          zod.object({
+            name: zod.string().optional(),
+            color: zod.string().optional(),
+            description: zod.string().optional(),
+          }),
+        ),
+        createdAt: zod.string().optional(),
+      }),
+      zod.null(),
+    ])
+    .optional(),
+  posts: zod
+    .array(
+      zod.object({
+        id: zod.string(),
+        clientId: zod.string(),
+        plannerId: zod.string(),
+        date: zod.string(),
+        platform: zod.string(),
+        pillar: zod.string(),
+        angle: zod.string(),
+        format: zod.string(),
+        objective: zod.string(),
+        hook: zod.string(),
+        caption: zod.string().nullish(),
+        hashtags: zod.array(zod.string()).nullish(),
+        cta: zod.string(),
+        status: zod.enum([
+          "draft",
+          "pending_approval",
+          "approved",
+          "needs_changes",
+          "scheduled",
+        ]),
+        comments: zod
+          .array(
+            zod.object({
+              author: zod.string().optional(),
+              text: zod.string().optional(),
+              createdAt: zod.string().optional(),
+            }),
+          )
+          .optional(),
+        createdAt: zod.string().optional(),
+        updatedAt: zod.string().optional(),
+      }),
+    )
+    .optional(),
+});
+
+/**
+ * @summary Update a calendar post (status, date, fields, comment)
+ */
+export const UpdatePostParams = zod.object({
+  postId: zod.coerce.string(),
+});
+
+export const UpdatePostBody = zod.object({
+  date: zod.string().optional(),
+  status: zod
+    .enum([
+      "draft",
+      "pending_approval",
+      "approved",
+      "needs_changes",
+      "scheduled",
+    ])
+    .optional(),
+  hook: zod.string().optional(),
+  caption: zod.string().optional(),
+  hashtags: zod.array(zod.string()).optional(),
+  cta: zod.string().optional(),
+  addComment: zod
+    .object({
+      author: zod.string().optional(),
+      text: zod.string(),
+    })
+    .optional(),
+});
+
+export const UpdatePostResponse = zod.object({
+  id: zod.string(),
+  clientId: zod.string(),
+  plannerId: zod.string(),
+  date: zod.string(),
+  platform: zod.string(),
+  pillar: zod.string(),
+  angle: zod.string(),
+  format: zod.string(),
+  objective: zod.string(),
+  hook: zod.string(),
+  caption: zod.string().nullish(),
+  hashtags: zod.array(zod.string()).nullish(),
+  cta: zod.string(),
+  status: zod.enum([
+    "draft",
+    "pending_approval",
+    "approved",
+    "needs_changes",
+    "scheduled",
+  ]),
+  comments: zod
+    .array(
+      zod.object({
+        author: zod.string().optional(),
+        text: zod.string().optional(),
+        createdAt: zod.string().optional(),
+      }),
+    )
+    .optional(),
   createdAt: zod.string().optional(),
   updatedAt: zod.string().optional(),
 });

@@ -47,6 +47,28 @@ UI exposes a dropdown (auto / 4 templates) on the workspace page.
   - Edit mode: side-by-side textareas for the doc (Markdown) and the structured strategy (JSON, validated on save).
   - Print: `@media print` rules in `index.css` hide sticky header and side panel; `window.print()` produces clean PDF.
 
+## Content Planner + Calendar
+
+After a strategy exists, the user can build a 30-day content calendar from it.
+
+Backend (`artifacts/api-server/src/lib/planner/`):
+1. `generatePlannerLayer` — builds the planner layer JSON (`distribution`, `formats`, `angleBank`, `hookStyles`, `weeklyFlow`, `pillars` with assigned colors). Pillars are derived from `structured.content_strategy.pillars`.
+2. `generateCalendarPosts` — produces 30 dated posts honoring the distribution and weekly flow, each with `platform`, `pillar`, `angle`, `format`, `objective`, `hook`, `cta`.
+
+DB tables: `planners`, `posts`. Generating a new calendar replaces any prior planner (and its posts cascade).
+
+Endpoints:
+- `GET  /api/clients/:id/calendar`
+- `POST /api/clients/:id/calendar/generate` (`{ startDate? }`, defaults to today)
+- `PATCH /api/posts/:postId` — change date (drag-to-reschedule), status, hook/caption/cta/hashtags, or append a comment via `addComment`.
+
+Frontend (`pages/calendar.tsx`):
+- Calendar-first interface — monthly grid pre-filled, no empty states.
+- Header strip: pillar mix, format mix, weekly flow, hook styles.
+- Cards: format label, color-coded pillar bar, hook (truncated), status dot. Drag a card to another day to reschedule.
+- Click → `PostDetailSheet`: angle, objective, CTA, caption, hashtags, strategy context (pillar + how it supports the goal), status pills (draft / pending_approval / approved / needs_changes / scheduled), and a comment thread.
+- Workspace page links to the calendar via a "Calendar" button in the sticky header once a strategy exists.
+
 ## Constraints
 
 - No emojis in UI.

@@ -108,4 +108,103 @@ export interface ClientDetail {
   client: Client;
   onboarding?: OnboardingProfile | null;
   strategy?: Strategy | null;
+  hasCalendar?: boolean;
+}
+
+export interface GenerateCalendarInput {
+  /** ISO date (YYYY-MM-DD). Defaults to today. */
+  startDate?: string;
+}
+
+export type PlannerDistribution = { [key: string]: number };
+
+export type PlannerFormats = { [key: string]: number };
+
+export type PlannerAngleBank = { [key: string]: string[] };
+
+export type PlannerWeeklyFlow = { [key: string]: string };
+
+export type PlannerPillarsItem = {
+  name?: string;
+  color?: string;
+  description?: string;
+};
+
+export interface Planner {
+  id: string;
+  clientId: string;
+  distribution: PlannerDistribution;
+  formats: PlannerFormats;
+  angleBank: PlannerAngleBank;
+  hookStyles: string[];
+  weeklyFlow: PlannerWeeklyFlow;
+  pillars: PlannerPillarsItem[];
+  createdAt?: string;
+}
+
+export interface PostComment {
+  author?: string;
+  text?: string;
+  createdAt?: string;
+}
+
+export type PostStatus = (typeof PostStatus)[keyof typeof PostStatus];
+
+export const PostStatus = {
+  draft: "draft",
+  pending_approval: "pending_approval",
+  approved: "approved",
+  needs_changes: "needs_changes",
+  scheduled: "scheduled",
+} as const;
+
+export interface Post {
+  id: string;
+  clientId: string;
+  plannerId: string;
+  date: string;
+  platform: string;
+  pillar: string;
+  angle: string;
+  format: string;
+  objective: string;
+  hook: string;
+  caption?: string | null;
+  hashtags?: string[] | null;
+  cta: string;
+  status: PostStatus;
+  comments?: PostComment[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export type UpdatePostInputStatus =
+  (typeof UpdatePostInputStatus)[keyof typeof UpdatePostInputStatus];
+
+export const UpdatePostInputStatus = {
+  draft: "draft",
+  pending_approval: "pending_approval",
+  approved: "approved",
+  needs_changes: "needs_changes",
+  scheduled: "scheduled",
+} as const;
+
+export type UpdatePostInputAddComment = {
+  author?: string;
+  text: string;
+};
+
+export interface UpdatePostInput {
+  date?: string;
+  status?: UpdatePostInputStatus;
+  hook?: string;
+  caption?: string;
+  hashtags?: string[];
+  cta?: string;
+  addComment?: UpdatePostInputAddComment;
+}
+
+export interface CalendarDetail {
+  planner?: Planner | null;
+  posts?: Post[];
 }

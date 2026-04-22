@@ -6,19 +6,33 @@
  * OpenAPI spec version: 0.1.0
  */
 
+export * from "./calendarDetail";
 export * from "./client";
 export * from "./clientDetail";
 export * from "./clientSummary";
 export * from "./createClientInput";
 export * from "./enrichedData";
 export * from "./enrichedDataTargetAudience";
+export * from "./generateCalendarInput";
 export * from "./generateStrategyInput";
 export * from "./generateStrategyInputTemplateType";
 export * from "./healthStatus";
 export * from "./onboardingProfile";
 export * from "./onboardingProfileRawInput";
+export * from "./planner";
+export * from "./plannerAngleBank";
+export * from "./plannerDistribution";
+export * from "./plannerFormats";
+export * from "./plannerPillarsItem";
+export * from "./plannerWeeklyFlow";
+export * from "./post";
+export * from "./postComment";
+export * from "./postStatus";
 export * from "./strategy";
 export * from "./strategyStructuredStrategy";
+export * from "./updatePostInput";
+export * from "./updatePostInputAddComment";
+export * from "./updatePostInputStatus";
 export * from "./updateStrategyInput";
 export * from "./updateStrategyInputStatus";
 export * from "./updateStrategyInputStructuredStrategy";

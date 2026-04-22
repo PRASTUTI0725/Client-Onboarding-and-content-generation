@@ -1,5 +1,5 @@
 import { Router, type IRouter } from "express";
-import { db, clientsTable, onboardingProfilesTable, strategiesTable } from "@workspace/db";
+import { db, clientsTable, onboardingProfilesTable, strategiesTable, plannersTable } from "@workspace/db";
 import { eq, desc, sql } from "drizzle-orm";
 import {
   CreateClientBody,
@@ -111,6 +111,12 @@ router.get("/clients/:clientId", async (req, res) => {
     .orderBy(desc(strategiesTable.version))
     .limit(1);
 
+  const [planner] = await db
+    .select({ id: plannersTable.id })
+    .from(plannersTable)
+    .where(eq(plannersTable.clientId, clientId))
+    .limit(1);
+
   res.json({
     client: serializeClient(client),
     onboarding: onboarding
@@ -122,6 +128,7 @@ router.get("/clients/:clientId", async (req, res) => {
         }
       : null,
     strategy: strategy ? serializeStrategy(strategy) : null,
+    hasCalendar: !!planner,
   });
 });
 

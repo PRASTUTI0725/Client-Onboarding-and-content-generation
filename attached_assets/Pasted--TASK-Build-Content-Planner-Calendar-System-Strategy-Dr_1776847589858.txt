@@ -1,0 +1,207 @@
+# TASK: Build Content Planner + Calendar System (Strategy-Driven, UI-First)
+
+We are building a system that converts strategy into a fully usable content calendar.
+
+This is NOT a manual planner.
+This is NOT a document.
+This is a visual, pre-filled calendar like Buffer/Notion.
+
+---
+
+# 1. INPUT
+
+Use strategy output:
+
+* content_strategy.pillars
+* audience
+* goal
+* platform_strategy
+* phases
+
+---
+
+# 2. CREATE PLANNER LAYER (LOGIC ENGINE)
+
+Generate:
+
+{
+"distribution": {
+"education": 40,
+"engagement": 30,
+"conversion": 30
+},
+"formats": {
+"reels": 50,
+"carousel": 30,
+"static": 20
+},
+"angle_bank": {
+"education": ["mistakes", "myths", "how-to"],
+"engagement": ["relatable", "story", "opinion"],
+"conversion": ["offer", "testimonial", "case study"]
+},
+"hook_styles": ["curiosity", "authority", "relatable"],
+"weekly_flow": {
+"week_1": "awareness",
+"week_2": "engagement",
+"week_3": "conversion",
+"week_4": "mix"
+}
+}
+
+---
+
+# 3. CALENDAR GENERATION
+
+Generate 30-day calendar.
+
+Each item:
+
+{
+"date": "",
+"platform": "",
+"pillar": "",
+"angle": "",
+"format": "",
+"objective": "",
+"hook": "",
+"cta": "",
+"status": "draft"
+}
+
+---
+
+# RULES
+
+* Align posts with:
+
+  * distribution %
+  * weekly flow
+  * strategy goals
+
+* Ensure:
+
+  * pillar balance
+  * format variation
+  * clear CTA per post
+
+* Do NOT generate generic ideas
+
+---
+
+# 4. UI (MOST IMPORTANT)
+
+We are building a CALENDAR-FIRST INTERFACE.
+
+---
+
+## DEFAULT VIEW:
+
+* Monthly calendar grid
+* Pre-filled posts
+* No empty states
+
+---
+
+## EACH CALENDAR CARD:
+
+Display:
+
+* Format (Reel / Carousel)
+* Pillar (color-coded)
+* Short hook/title
+* Status (Draft / Approved / Scheduled)
+
+---
+
+## INTERACTIONS:
+
+* Click → open side panel
+* Drag → reschedule
+
+---
+
+# 5. POST DETAIL PANEL
+
+On click show:
+
+* Hook
+* Caption (generated later)
+* Hashtags
+* CTA
+* Platform
+* Status
+
+---
+
+## ADD SMALL SECTION:
+
+"Strategy Context"
+
+Explain briefly:
+
+* which pillar + goal this supports
+
+---
+
+# 6. APPROVAL SYSTEM
+
+Each post:
+
+status:
+
+* draft
+* pending_approval
+* approved
+* needs_changes
+
+---
+
+Actions:
+
+* Approve
+* Request Changes
+* Add comment
+
+---
+
+# 7. FLOW
+
+Onboarding
+↓
+Strategy generated
+↓
+Planner generated (hidden)
+↓
+User clicks "Generate Calendar"
+↓
+Calendar appears fully filled
+
+---
+
+# 8. UX RULES
+
+* No document UI
+* No long text blocks
+* No blank calendar
+* Everything should feel pre-done
+
+---
+
+# 9. GOAL
+
+User should feel:
+
+"I didn’t plan anything — it's already structured"
+
+---
+
+# 10. FUTURE (DO NOT BUILD NOW)
+
+* Scheduling
+* Analytics
+* CRM
+
+---
+
+Proceed step by step.

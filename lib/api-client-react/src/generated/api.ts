@@ -17,13 +17,17 @@ import type {
 } from "@tanstack/react-query";
 
 import type {
+  CalendarDetail,
   Client,
   ClientDetail,
   ClientSummary,
   CreateClientInput,
+  GenerateCalendarInput,
   GenerateStrategyInput,
   HealthStatus,
+  Post,
   Strategy,
+  UpdatePostInput,
   UpdateStrategyInput,
 } from "./api.schemas";
 
@@ -613,4 +617,265 @@ export const useUpdateStrategy = <
   TContext
 > => {
   return useMutation(getUpdateStrategyMutationOptions(options));
+};
+
+/**
+ * @summary Get the planner and posts for a client
+ */
+export const getGetCalendarUrl = (clientId: string) => {
+  return `/api/clients/${clientId}/calendar`;
+};
+
+export const getCalendar = async (
+  clientId: string,
+  options?: RequestInit,
+): Promise<CalendarDetail> => {
+  return customFetch<CalendarDetail>(getGetCalendarUrl(clientId), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetCalendarQueryKey = (clientId: string) => {
+  return [`/api/clients/${clientId}/calendar`] as const;
+};
+
+export const getGetCalendarQueryOptions = <
+  TData = Awaited<ReturnType<typeof getCalendar>>,
+  TError = ErrorType<unknown>,
+>(
+  clientId: string,
+  options?: {
+    query?: UseQueryOptions<
+      Awaited<ReturnType<typeof getCalendar>>,
+      TError,
+      TData
+    >;
+    request?: SecondParameter<typeof customFetch>;
+  },
+) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getGetCalendarQueryKey(clientId);
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getCalendar>>> = ({
+    signal,
+  }) => getCalendar(clientId, { signal, ...requestOptions });
+
+  return {
+    queryKey,
+    queryFn,
+    enabled: !!clientId,
+    ...queryOptions,
+  } as UseQueryOptions<
+    Awaited<ReturnType<typeof getCalendar>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type GetCalendarQueryResult = NonNullable<
+  Awaited<ReturnType<typeof getCalendar>>
+>;
+export type GetCalendarQueryError = ErrorType<unknown>;
+
+/**
+ * @summary Get the planner and posts for a client
+ */
+
+export function useGetCalendar<
+  TData = Awaited<ReturnType<typeof getCalendar>>,
+  TError = ErrorType<unknown>,
+>(
+  clientId: string,
+  options?: {
+    query?: UseQueryOptions<
+      Awaited<ReturnType<typeof getCalendar>>,
+      TError,
+      TData
+    >;
+    request?: SecondParameter<typeof customFetch>;
+  },
+): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getGetCalendarQueryOptions(clientId, options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * @summary Build planner layer and generate a 30-day calendar from the strategy
+ */
+export const getGenerateCalendarUrl = (clientId: string) => {
+  return `/api/clients/${clientId}/calendar/generate`;
+};
+
+export const generateCalendar = async (
+  clientId: string,
+  generateCalendarInput?: GenerateCalendarInput,
+  options?: RequestInit,
+): Promise<CalendarDetail> => {
+  return customFetch<CalendarDetail>(getGenerateCalendarUrl(clientId), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(generateCalendarInput),
+  });
+};
+
+export const getGenerateCalendarMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof generateCalendar>>,
+    TError,
+    { clientId: string; data: BodyType<GenerateCalendarInput> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof generateCalendar>>,
+  TError,
+  { clientId: string; data: BodyType<GenerateCalendarInput> },
+  TContext
+> => {
+  const mutationKey = ["generateCalendar"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof generateCalendar>>,
+    { clientId: string; data: BodyType<GenerateCalendarInput> }
+  > = (props) => {
+    const { clientId, data } = props ?? {};
+
+    return generateCalendar(clientId, data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type GenerateCalendarMutationResult = NonNullable<
+  Awaited<ReturnType<typeof generateCalendar>>
+>;
+export type GenerateCalendarMutationBody = BodyType<GenerateCalendarInput>;
+export type GenerateCalendarMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Build planner layer and generate a 30-day calendar from the strategy
+ */
+export const useGenerateCalendar = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof generateCalendar>>,
+    TError,
+    { clientId: string; data: BodyType<GenerateCalendarInput> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof generateCalendar>>,
+  TError,
+  { clientId: string; data: BodyType<GenerateCalendarInput> },
+  TContext
+> => {
+  return useMutation(getGenerateCalendarMutationOptions(options));
+};
+
+/**
+ * @summary Update a calendar post (status, date, fields, comment)
+ */
+export const getUpdatePostUrl = (postId: string) => {
+  return `/api/posts/${postId}`;
+};
+
+export const updatePost = async (
+  postId: string,
+  updatePostInput: UpdatePostInput,
+  options?: RequestInit,
+): Promise<Post> => {
+  return customFetch<Post>(getUpdatePostUrl(postId), {
+    ...options,
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(updatePostInput),
+  });
+};
+
+export const getUpdatePostMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof updatePost>>,
+    TError,
+    { postId: string; data: BodyType<UpdatePostInput> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof updatePost>>,
+  TError,
+  { postId: string; data: BodyType<UpdatePostInput> },
+  TContext
+> => {
+  const mutationKey = ["updatePost"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof updatePost>>,
+    { postId: string; data: BodyType<UpdatePostInput> }
+  > = (props) => {
+    const { postId, data } = props ?? {};
+
+    return updatePost(postId, data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type UpdatePostMutationResult = NonNullable<
+  Awaited<ReturnType<typeof updatePost>>
+>;
+export type UpdatePostMutationBody = BodyType<UpdatePostInput>;
+export type UpdatePostMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Update a calendar post (status, date, fields, comment)
+ */
+export const useUpdatePost = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof updatePost>>,
+    TError,
+    { postId: string; data: BodyType<UpdatePostInput> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof updatePost>>,
+  TError,
+  { postId: string; data: BodyType<UpdatePostInput> },
+  TContext
+> => {
+  return useMutation(getUpdatePostMutationOptions(options));
 };

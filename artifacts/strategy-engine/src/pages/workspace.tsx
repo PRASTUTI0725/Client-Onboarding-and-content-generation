@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
-import { ArrowLeft, Pencil, RefreshCw, CheckCircle2, Printer, Globe, Instagram } from "lucide-react";
+import { ArrowLeft, Pencil, RefreshCw, CheckCircle2, Printer, Globe, Instagram, CalendarDays } from "lucide-react";
 import { GeneratingStrategy } from "@/components/generating-strategy";
 import { StructuredStrategyPanel } from "@/components/structured-strategy-panel";
 
@@ -192,6 +192,11 @@ export default function Workspace() {
 
           {strategy && !editing && (
             <div className="flex items-center gap-2">
+              <Link href={`/clients/${id}/calendar`}>
+                <Button variant="default" size="sm" className="gap-2">
+                  <CalendarDays className="size-4" /> Calendar
+                </Button>
+              </Link>
               <Button variant="ghost" size="sm" onClick={startEdit} className="gap-2">
                 <Pencil className="size-4" /> Edit
               </Button>
@@ -206,7 +211,7 @@ export default function Workspace() {
                 Regenerate
               </Button>
               {strategy.status !== "approved" && (
-                <Button size="sm" onClick={approveStrategy} className="gap-2">
+                <Button variant="outline" size="sm" onClick={approveStrategy} className="gap-2">
                   <CheckCircle2 className="size-4" /> Approve
                 </Button>
               )}

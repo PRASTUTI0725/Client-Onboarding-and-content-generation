@@ -10,6 +10,7 @@ tags:
   - name: health
   - name: clients
   - name: strategies
+  - name: calendar
 paths:
   /healthz:
     get:
@@ -132,6 +133,75 @@ paths:
               schema:
                 $ref: "#/components/schemas/Strategy"
 
+  /clients/{clientId}/calendar:
+    parameters:
+      - in: path
+        name: clientId
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getCalendar
+      tags: [calendar]
+      summary: Get the planner and posts for a client
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarDetail"
+
+  /clients/{clientId}/calendar/generate:
+    parameters:
+      - in: path
+        name: clientId
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: generateCalendar
+      tags: [calendar]
+      summary: Build planner layer and generate a 30-day calendar from the strategy
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateCalendarInput"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarDetail"
+
+  /posts/{postId}:
+    parameters:
+      - in: path
+        name: postId
+        required: true
+        schema:
+          type: string
+    patch:
+      operationId: updatePost
+      tags: [calendar]
+      summary: Update a calendar post (status, date, fields, comment)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePostInput"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Post"
+
 components:
   schemas:
     HealthStatus:
@@ -253,3 +323,114 @@ components:
           oneOf:
             - $ref: "#/components/schemas/Strategy"
             - type: "null"
+        hasCalendar:
+          type: boolean
+
+    GenerateCalendarInput:
+      type: object
+      properties:
+        startDate:
+          type: string
+          description: ISO date (YYYY-MM-DD). Defaults to today.
+
+    Planner:
+      type: object
+      required: [id, clientId, distribution, formats, angleBank, hookStyles, weeklyFlow, pillars]
+      properties:
+        id: { type: string }
+        clientId: { type: string }
+        distribution:
+          type: object
+          additionalProperties: { type: number }
+        formats:
+          type: object
+          additionalProperties: { type: number }
+        angleBank:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+        hookStyles:
+          type: array
+          items: { type: string }
+        weeklyFlow:
+          type: object
+          additionalProperties: { type: string }
+        pillars:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              color: { type: string }
+              description: { type: string }
+        createdAt: { type: string }
+
+    PostComment:
+      type: object
+      properties:
+        author: { type: string }
+        text: { type: string }
+        createdAt: { type: string }
+
+    Post:
+      type: object
+      required: [id, clientId, plannerId, date, platform, pillar, angle, format, objective, hook, cta, status]
+      properties:
+        id: { type: string }
+        clientId: { type: string }
+        plannerId: { type: string }
+        date: { type: string }
+        platform: { type: string }
+        pillar: { type: string }
+        angle: { type: string }
+        format: { type: string }
+        objective: { type: string }
+        hook: { type: string }
+        caption: { type: string, nullable: true }
+        hashtags:
+          type: array
+          items: { type: string }
+          nullable: true
+        cta: { type: string }
+        status:
+          type: string
+          enum: [draft, pending_approval, approved, needs_changes, scheduled]
+        comments:
+          type: array
+          items:
+            $ref: "#/components/schemas/PostComment"
+        createdAt: { type: string }
+        updatedAt: { type: string }
+
+    UpdatePostInput:
+      type: object
+      properties:
+        date: { type: string }
+        status:
+          type: string
+          enum: [draft, pending_approval, approved, needs_changes, scheduled]
+        hook: { type: string }
+        caption: { type: string }
+        hashtags:
+          type: array
+          items: { type: string }
+        cta: { type: string }
+        addComment:
+          type: object
+          required: [text]
+          properties:
+            author: { type: string }
+            text: { type: string }
+
+    CalendarDetail:
+      type: object
+      properties:
+        planner:
+          oneOf:
+            - $ref: "#/components/schemas/Planner"
+            - type: "null"
+        posts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Post"
