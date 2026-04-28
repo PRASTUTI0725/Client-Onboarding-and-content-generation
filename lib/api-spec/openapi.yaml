@@ -270,7 +270,7 @@ components:
         platforms:
           type: array
           items: { type: string }
-          description: Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).
+          description: Active platforms (e.g. Instagram, LinkedIn, Pinterest, X, YouTube).
         monthlyPosts:
           type: object
           additionalProperties: { type: integer }
@@ -493,7 +493,7 @@ components:
             - type: "null"
         status:
           type: string
-          enum: [draft, pending_approval, approved, needs_changes, scheduled]
+          enum: [draft, pending_approval, approved, needs_changes, scheduled, published]
         comments:
           type: array
           items:
@@ -507,7 +507,7 @@ components:
         date: { type: string }
         status:
           type: string
-          enum: [draft, pending_approval, approved, needs_changes, scheduled]
+          enum: [draft, pending_approval, approved, needs_changes, scheduled, published]
         hook: { type: string }
         caption: { type: string }
         hashtags:

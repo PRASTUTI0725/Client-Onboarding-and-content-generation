@@ -112,22 +112,23 @@ export function CalendarGrid({ posts, pillars, clientId, onSelectPost }: Props) 
 
   return (
     <div className="space-y-4">
-      <div className="flex items-baseline justify-between">
-        <h2 className="font-serif text-2xl tracking-tight">{monthLabel}</h2>
-        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+      <div className="flex items-baseline justify-between gap-3 flex-wrap">
+        <h2 className="font-serif text-xl sm:text-2xl tracking-tight">{monthLabel}</h2>
+        <div className="flex items-center gap-3 text-xs text-muted-foreground flex-wrap">
           {pillars.map((p) => (
             <span key={p.name} className="inline-flex items-center gap-1.5">
               <span
                 className="inline-block size-2 rounded-full"
                 style={{ backgroundColor: p.color }}
               />
-              {p.name}
+              {humanize(p.name)}
             </span>
           ))}
         </div>
       </div>
 
-      <div className="grid grid-cols-7 gap-px bg-border rounded-lg overflow-hidden border border-border shadow-sm">
+      <div className="overflow-x-auto rounded-lg border border-border shadow-sm">
+        <div className="grid grid-cols-7 gap-px bg-border min-w-[680px]">
         {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
           <div
             key={d}
@@ -138,7 +139,7 @@ export function CalendarGrid({ posts, pillars, clientId, onSelectPost }: Props) 
         ))}
         {cells.map(({ date, key }) => {
           if (!date) {
-            return <div key={key} className="bg-muted/30 min-h-[120px]" />;
+            return <div key={key} className="bg-muted/30 min-h-[108px] sm:min-h-[120px]" />;
           }
           const dayPosts = postsByDate.get(date) ?? [];
           const isToday = date === todayIso;
@@ -159,7 +160,7 @@ export function CalendarGrid({ posts, pillars, clientId, onSelectPost }: Props) 
                   update.mutate({ postId, data: { date } });
                 }
               }}
-              className={`bg-card min-h-[120px] p-1.5 space-y-1 transition-colors ${
+              className={`bg-card min-h-[108px] sm:min-h-[120px] p-1.5 space-y-1 transition-colors ${
                 dragOver === date ? "bg-accent/40" : ""
               }`}
             >
@@ -186,6 +187,7 @@ export function CalendarGrid({ posts, pillars, clientId, onSelectPost }: Props) 
                   pillarColor={colorFor(p.pillar)}
                   onClick={() => onSelectPost(p.id)}
                   draggable
+                  testId={`calendar-post-${p.id}`}
                   onDragStart={(e) => {
                     e.dataTransfer.setData("text/post-id", p.id);
                     e.dataTransfer.setData("text/post-date", p.date);
@@ -196,7 +198,13 @@ export function CalendarGrid({ posts, pillars, clientId, onSelectPost }: Props) 
             </div>
           );
         })}
+        </div>
       </div>
     </div>
   );
+}
+
+function humanize(value: string): string {
+  const spaced = value.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  return spaced ? spaced.charAt(0).toUpperCase() + spaced.slice(1) : value;
 }

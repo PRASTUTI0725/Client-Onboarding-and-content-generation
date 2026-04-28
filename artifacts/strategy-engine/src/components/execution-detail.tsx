@@ -1,105 +1,84 @@
+import type { NormalizedPostDetail } from "@/lib/post-detail";
+
 interface Props {
-  format: string;
-  execution: Record<string, unknown>;
+  detail: NormalizedPostDetail;
 }
 
-interface Slide {
-  n?: number;
-  role?: string;
-  headline?: string;
-  body?: string;
-}
-interface Frame {
-  n?: number;
-  role?: string;
-  copy?: string;
-  interaction?: string;
-}
-
-export function ExecutionDetail({ format, execution }: Props) {
-  const fmt = format.toLowerCase();
-
-  if (fmt.includes("carousel")) {
-    const slides = (execution["slides"] as Slide[] | undefined) ?? [];
-    const dir = execution["design_direction"] as string | undefined;
+export function ExecutionDetail({ detail }: Props) {
+  if (detail.formatKind === "reel" && detail.reelExecution) {
     return (
-      <div className="space-y-3">
-        <ol className="space-y-2">
-          {slides.map((s, i) => (
-            <li
-              key={i}
-              className="rounded-md border border-border bg-card p-3 space-y-1"
-            >
-              <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
-                <span>Slide {s.n ?? i + 1}</span>
-                {s.role && <span>{s.role}</span>}
-              </div>
-              {s.headline && (
-                <p className="text-sm font-medium leading-snug">{s.headline}</p>
-              )}
-              {s.body && (
-                <p className="text-sm text-foreground/75 leading-relaxed">{s.body}</p>
-              )}
-            </li>
-          ))}
-        </ol>
-        {dir && <Hint label="Design direction" value={dir} />}
-      </div>
-    );
-  }
-
-  if (fmt.includes("reel") || (fmt.includes("video") && !fmt.includes("long"))) {
-    const hook = execution["hook_2s"] as string | undefined;
-    const interrupt = execution["pattern_interrupt"] as string | undefined;
-    const beats = (execution["beats"] as string[] | undefined) ?? [];
-    const ctaOnScreen = execution["cta_on_screen"] as string | undefined;
-    const visual = execution["visual_direction"] as string | undefined;
-    const audio = execution["audio"] as string | undefined;
-    return (
-      <div className="space-y-3">
-        {hook && <Hint label="First 2 seconds" value={hook} accent />}
-        {interrupt && <Hint label="Pattern interrupt" value={interrupt} />}
-        {beats.length > 0 && (
-          <div className="rounded-md border border-border bg-card p-3 space-y-1.5">
-            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Beats
-            </p>
-            <ol className="space-y-1.5">
-              {beats.map((b, i) => (
-                <li key={i} className="text-sm leading-relaxed flex gap-2">
-                  <span className="text-muted-foreground font-mono text-xs pt-0.5">
-                    {String(i + 1).padStart(2, "0")}
-                  </span>
-                  <span className="text-foreground/85">{b}</span>
-                </li>
-              ))}
-            </ol>
+      <div className="space-y-4" data-testid="post-detail-reel-execution">
+        <DetailCard label="Hook line" accent>
+          <p className="text-sm leading-relaxed text-foreground/90">{detail.reelExecution.hookLine}</p>
+        </DetailCard>
+        <DetailCard label="Flow">
+          <div className="flex flex-wrap gap-2">
+            {detail.reelExecution.flow.map((step, index) => (
+              <span
+                key={`${step}-${index}`}
+                className="rounded-full border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground"
+              >
+                {step}
+              </span>
+            ))}
           </div>
-        )}
-        {ctaOnScreen && <Hint label="On-screen CTA" value={ctaOnScreen} />}
-        {visual && <Hint label="Visual direction" value={visual} />}
-        {audio && <Hint label="Audio" value={audio} />}
+        </DetailCard>
+        <DetailCard label="Script">
+          <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground/85">
+            {detail.reelExecution.script}
+          </p>
+        </DetailCard>
+        <div className="grid gap-3 md:grid-cols-2">
+          <DetailCard label="Visual direction">
+            <p className="text-sm leading-relaxed text-foreground/85">
+              {detail.reelExecution.visualDirection}
+            </p>
+          </DetailCard>
+          <DetailCard label="Editing style">
+            <p className="text-sm leading-relaxed text-foreground/85">
+              {detail.reelExecution.editingStyle}
+            </p>
+          </DetailCard>
+        </div>
       </div>
     );
   }
 
-  if (fmt.includes("story") || fmt.includes("stories")) {
-    const frames = (execution["frames"] as Frame[] | undefined) ?? [];
+  if (detail.formatKind === "carousel" && detail.carouselExecution) {
     return (
-      <div className="space-y-2">
-        {frames.map((f, i) => (
+      <div className="space-y-3" data-testid="post-detail-carousel-execution">
+        {detail.carouselExecution.map((slide) => (
           <div
-            key={i}
-            className="rounded-md border border-border bg-card p-3 space-y-1"
+            key={slide.slide}
+            className="rounded-xl border border-border bg-card p-3.5 shadow-sm"
           >
-            <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
-              <span>Frame {f.n ?? i + 1}</span>
-              {f.role && <span>{f.role}</span>}
+            <div className="mb-1.5 flex items-center justify-between gap-3 text-[10px] uppercase tracking-wider text-muted-foreground">
+              <span>Slide {slide.slide}</span>
+              <span>{slide.type}</span>
             </div>
-            {f.copy && <p className="text-sm leading-relaxed">{f.copy}</p>}
-            {f.interaction && f.interaction !== "none" && (
-              <p className="text-xs text-muted-foreground italic">
-                Interaction: {f.interaction}
+            <p className="text-sm leading-relaxed text-foreground/85">{slide.text}</p>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (detail.formatKind === "story" && detail.storyExecution) {
+    return (
+      <div className="space-y-3" data-testid="post-detail-story-execution">
+        {detail.storyExecution.map((frame) => (
+          <div
+            key={frame.frame}
+            className="rounded-xl border border-border bg-card p-3.5 shadow-sm"
+          >
+            <div className="mb-1.5 flex items-center justify-between gap-3 text-[10px] uppercase tracking-wider text-muted-foreground">
+              <span>Frame {frame.frame}</span>
+              <span>{frame.type}</span>
+            </div>
+            <p className="text-sm leading-relaxed text-foreground/85">{frame.text}</p>
+            {frame.interaction && (
+              <p className="mt-2 text-xs font-medium text-foreground/70">
+                Interaction: {frame.interaction}
               </p>
             )}
           </div>
@@ -108,74 +87,58 @@ export function ExecutionDetail({ format, execution }: Props) {
     );
   }
 
-  if (fmt.includes("static")) {
-    const visual = execution["visual_idea"] as string | undefined;
-    const headline = execution["headline"] as string | undefined;
-    const depth = execution["caption_depth"] as string | undefined;
+  if (detail.formatKind === "static" && detail.staticExecution) {
     return (
-      <div className="space-y-2">
-        {visual && <Hint label="Visual idea" value={visual} accent />}
-        {headline && <Hint label="On-image headline" value={headline} />}
-        {depth && <Hint label="What the caption uniquely carries" value={depth} />}
-      </div>
-    );
-  }
-
-  if (fmt.includes("text") || fmt.includes("thread")) {
-    const opening = execution["opening_line"] as string | undefined;
-    const body = execution["body"] as string | undefined;
-    const close = execution["close"] as string | undefined;
-    return (
-      <div className="space-y-2">
-        {opening && <Hint label="Opening line" value={opening} accent />}
-        {body && (
-          <div className="rounded-md border border-border bg-card p-3">
-            <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
-              Body
-            </p>
+      <div className="grid gap-3 md:grid-cols-2" data-testid="post-detail-static-execution">
+        <DetailCard label="Headline" accent>
+          <p className="text-sm leading-relaxed text-foreground/90">
+            {detail.staticExecution.headline}
+          </p>
+        </DetailCard>
+        <DetailCard label="Visual direction">
+          <p className="text-sm leading-relaxed text-foreground/85">
+            {detail.staticExecution.visualDirection}
+          </p>
+        </DetailCard>
+        <div className="md:col-span-2">
+          <DetailCard label="Posting caption">
             <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground/85">
-              {body}
+              {detail.staticExecution.caption}
             </p>
-          </div>
-        )}
-        {close && <Hint label="Close" value={close} />}
+          </DetailCard>
+        </div>
       </div>
     );
   }
 
-  // Generic fallback: render keys as a definition list.
   return (
-    <div className="space-y-2">
-      {Object.entries(execution).map(([k, v]) => (
-        <Hint key={k} label={prettify(k)} value={typeof v === "string" ? v : JSON.stringify(v)} />
-      ))}
-    </div>
+    <DetailCard label="Execution plan">
+      <p className="text-sm leading-relaxed text-foreground/85">
+        Use the post overview, caption, and conversion path below as the operating brief for this format.
+      </p>
+    </DetailCard>
   );
 }
 
-function Hint({
+function DetailCard({
   label,
-  value,
+  children,
   accent,
 }: {
   label: string;
-  value: string;
+  children: React.ReactNode;
   accent?: boolean;
 }) {
   return (
     <div
-      className={`rounded-md border p-3 ${
-        accent ? "border-foreground/20 bg-foreground/[0.03]" : "border-border bg-card"
+      className={`rounded-xl border p-3.5 shadow-sm ${
+        accent ? "border-foreground/15 bg-foreground/[0.035]" : "border-border bg-card"
       }`}
     >
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+      <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
         {label}
       </p>
-      <p className="text-sm leading-relaxed text-foreground/85">{value}</p>
+      {children}
     </div>
   );
-}
-
-function prettify(s: string) {
-  return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }

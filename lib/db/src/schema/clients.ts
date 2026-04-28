@@ -45,6 +45,7 @@ export const plannersTable = pgTable("planners", {
   pillars: jsonb("pillars").notNull(),
   kpis: jsonb("kpis"),
   phases: jsonb("phases"),
+  metadata: jsonb("metadata"),
   month: text("month"),
   goal: text("goal"),
   notes: text("notes"),
@@ -70,10 +71,27 @@ export const postsTable = pgTable("posts", {
   expectedReason: text("expected_reason"),
   priority: text("priority"),
   execution: jsonb("execution"),
+  metadata: jsonb("metadata"),
   status: text("status").notNull().default("draft"),
   comments: jsonb("comments").notNull().default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const contentCalendar = pgTable("content_calendar", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  clientId: uuid("client_id").references(() => clientsTable.id, { onDelete: "cascade" }),
+  title: text("title").notNull(),
+  platform: text("platform").$type<
+    "instagram" | "linkedin" | "twitter" | "facebook" | "pinterest"
+  >(),
+  content: text("content"),
+  imageUrl: text("image_url"),
+  scheduledDate: date("scheduled_date"),
+  status: text("status")
+    .default("draft")
+    .$type<"draft" | "scheduled" | "posted" | "archived">(),
+  createdAt: timestamp("created_at").defaultNow(),
 });
 
 export const insertClientSchema = createInsertSchema(clientsTable).omit({ id: true, createdAt: true });
@@ -84,3 +102,4 @@ export type OnboardingProfile = typeof onboardingProfilesTable.$inferSelect;
 export type Strategy = typeof strategiesTable.$inferSelect;
 export type Planner = typeof plannersTable.$inferSelect;
 export type Post = typeof postsTable.$inferSelect;
+export type ContentCalendar = typeof contentCalendar.$inferSelect;

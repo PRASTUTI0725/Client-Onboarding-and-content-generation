@@ -8,15 +8,15 @@ import {
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
-  SheetDescription,
 } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
+import { normalizePostDetail } from "@/lib/post-detail";
 import { ExecutionDetail } from "./execution-detail";
 
 interface PostLike {
@@ -49,17 +49,18 @@ interface Props {
   pillarDescription?: string;
 }
 
-const STATUS_LABELS: Record<UpdatePostInputStatus, string> = {
+const STATUS_LABELS: Record<string, string> = {
   draft: "Draft",
   pending_approval: "Pending review",
   approved: "Approved",
   needs_changes: "Needs changes",
   scheduled: "Scheduled",
+  published: "Published",
 };
 
 const PRIORITY_STYLES: Record<string, string> = {
-  high: "bg-[#B85C38]/10 text-[#B85C38] border-[#B85C38]/30",
-  medium: "bg-[#A38560]/10 text-[#8B7355] border-[#A38560]/30",
+  high: "bg-destructive/10 text-destructive border-destructive/30",
+  medium: "bg-primary/10 text-primary border-primary/30",
   low: "bg-muted text-muted-foreground border-border",
 };
 
@@ -95,11 +96,14 @@ export function PostDetailSheet({
 
   if (!post) return null;
 
+  const detail = normalizePostDetail(post);
+  const priority = (post.priority ?? "medium") as "high" | "medium" | "low";
+
   const setStatus = (status: UpdatePostInputStatus) =>
     update.mutate({ postId: post.id, data: { status } });
 
-  const setPriority = (priority: "high" | "medium" | "low") =>
-    update.mutate({ postId: post.id, data: { priority } });
+  const setPriority = (nextPriority: "high" | "medium" | "low") =>
+    update.mutate({ postId: post.id, data: { priority: nextPriority } });
 
   const submitComment = () => {
     if (!comment.trim()) return;
@@ -114,20 +118,18 @@ export function PostDetailSheet({
     );
   };
 
-  const priority = (post.priority ?? "medium") as "high" | "medium" | "low";
-
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
+      <SheetContent className="w-full overflow-y-auto px-4 sm:max-w-xl sm:px-6">
         <SheetHeader className="space-y-3 pb-2">
-          <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground flex-wrap">
+          <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground">
             <span>{formatDate(post.date)}</span>
             <span className="text-border">·</span>
             <span>{post.platform}</span>
             <span className="text-border">·</span>
             <span>{post.format}</span>
             <span
-              className={`ml-auto px-2 py-0.5 rounded-full border text-[10px] tracking-wider ${
+              className={`ml-auto rounded-full border px-2 py-0.5 text-[10px] tracking-wider ${
                 PRIORITY_STYLES[priority] ?? PRIORITY_STYLES.medium
               }`}
             >
@@ -146,92 +148,134 @@ export function PostDetailSheet({
                 className="inline-block size-2 rounded-full"
                 style={{ backgroundColor: pillarColor }}
               />
-              {post.pillar}
+              {humanizeDisplay(post.pillar)}
             </span>
           </SheetDescription>
         </SheetHeader>
 
         <div className="space-y-6 pt-2">
-          <Field label="Angle">
-            <p className="text-sm leading-relaxed">{post.angle}</p>
-          </Field>
-
-          <Field label="Objective">
-            <p className="text-sm leading-relaxed text-foreground/80">{post.objective}</p>
-          </Field>
-
-          <Field label="CTA">
-            <p className="text-sm font-medium leading-relaxed">{post.cta}</p>
-          </Field>
-
-          {post.caption && (
-            <Field label="Caption">
-              <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground/80">
-                {post.caption}
-              </p>
-            </Field>
-          )}
-
-          {post.hashtags && post.hashtags.length > 0 && (
-            <Field label="Hashtags">
-              <div className="flex flex-wrap gap-1.5">
-                {post.hashtags.map((h) => (
-                  <Badge key={h} variant="secondary" className="font-normal">
-                    {h.startsWith("#") ? h : `#${h}`}
-                  </Badge>
+          <Field label="Post overview">
+            <div className="space-y-4 rounded-xl border border-border bg-card p-4 shadow-sm">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <OverviewRow label="Angle" value={post.angle} />
+                <OverviewRow label="Objective" value={post.objective} />
+                <OverviewRow label="Creative type" value={humanizeDisplay(post.format)} />
+                {detail.overview.map((item) => (
+                  <OverviewRow key={item.label} label={item.label} value={item.value} />
                 ))}
               </div>
-            </Field>
-          )}
+            </div>
+          </Field>
 
-          {(post.strategicIntent || post.expectedMetric) && (
-            <>
-              <Separator />
-              <Field label="Decision layer">
-                <div className="rounded-md border border-border bg-muted/30 p-3 space-y-2">
-                  {post.strategicIntent && (
-                    <div>
-                      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-0.5">
-                        Strategic intent
-                      </p>
-                      <p className="text-sm leading-relaxed text-foreground/85">
-                        {post.strategicIntent}
-                      </p>
-                    </div>
-                  )}
-                  {post.expectedMetric && (
-                    <div>
-                      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-0.5">
-                        Expected outcome
-                      </p>
-                      <p className="text-sm text-foreground/85">
-                        <span className="font-medium">{post.expectedMetric}</span>
-                        {post.expectedReason && (
-                          <span className="text-muted-foreground"> — {post.expectedReason}</span>
-                        )}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </Field>
-            </>
-          )}
+          <Field label="Caption">
+            <div className="space-y-3" data-testid="post-detail-caption">
+              <div className="flex flex-wrap gap-2">
+                {detail.caption.structure.map((step) => (
+                  <span
+                    key={step}
+                    className="rounded-full border border-border bg-muted/40 px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
+                  >
+                    {step}
+                  </span>
+                ))}
+              </div>
+              <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
+                <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
+                  {detail.caption.text}
+                </p>
+              </div>
+            </div>
+          </Field>
 
-          {post.execution && Object.keys(post.execution).length > 0 && (
-            <>
-              <Separator />
-              <Field label={`${post.format} execution`}>
-                <ExecutionDetail format={post.format} execution={post.execution} />
-              </Field>
-            </>
-          )}
+          <Field label="Hashtags">
+            <div className="space-y-3" data-testid="post-detail-hashtags">
+              <HashtagGroup label="Niche" tags={detail.hashtags.niche} testId="post-detail-hashtags-niche" />
+              <HashtagGroup
+                label="Problem"
+                tags={detail.hashtags.problem}
+                testId="post-detail-hashtags-problem"
+              />
+              <HashtagGroup label="Broad" tags={detail.hashtags.broad} testId="post-detail-hashtags-broad" />
+            </div>
+          </Field>
+
+          <Separator />
+
+          <Field label="Execution plan">
+            <ExecutionDetail detail={detail} />
+          </Field>
+
+          <Field label="Conversion path">
+            <div className="grid gap-3 md:grid-cols-3" data-testid="post-detail-conversion-path">
+              <InfoCard label="Entry point" value={detail.conversionPath.entryPoint} />
+              <InfoCard label="Next step" value={detail.conversionPath.nextStep} />
+              <InfoCard label="Final goal" value={detail.conversionPath.finalGoal} />
+            </div>
+          </Field>
+
+          <Field label="Repurpose plan">
+            <div
+              className="rounded-xl border border-border bg-card p-4 shadow-sm"
+              data-testid="post-detail-repurpose-plan"
+            >
+              <ol className="space-y-2">
+                {detail.repurposePlan.map((item, index) => (
+                  <li
+                    key={`${item}-${index}`}
+                    className="flex gap-3 text-sm leading-relaxed text-foreground/85"
+                  >
+                    <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground">
+                      {index + 1}
+                    </span>
+                    <span>{item}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          </Field>
+
+          <Field label="Timeline">
+            <div className="grid gap-3 sm:grid-cols-2" data-testid="post-detail-timeline">
+              {detail.timeline.map((item) => (
+                <InfoCard key={item.label} label={item.label} value={item.value} />
+              ))}
+            </div>
+          </Field>
+
+          <Field label="Dependencies">
+            <div
+              className="rounded-xl border border-border bg-card p-4 shadow-sm"
+              data-testid="post-detail-dependencies"
+            >
+              <div className="flex flex-wrap gap-2">
+                {detail.dependencies.map((item) => (
+                  <span
+                    key={item}
+                    className="rounded-full border border-border bg-muted/35 px-3 py-1.5 text-xs font-medium text-foreground/80"
+                  >
+                    {item}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </Field>
+
+          <Field label="Feedback">
+            <div
+              className="space-y-2 rounded-xl border border-border bg-card p-4 shadow-sm"
+              data-testid="post-detail-feedback"
+            >
+              <DecisionRow label="Feedback type" value={detail.feedback.type} strong />
+              <DecisionRow label="Reviewer note" value={detail.feedback.comment} />
+            </div>
+          </Field>
 
           <Separator />
 
           <Field label="Strategy context">
-            <div className="rounded-md border border-border bg-muted/30 p-3 space-y-1">
+            <div className="space-y-1 rounded-md border border-border bg-muted/30 p-3">
               <p className="text-xs font-medium" style={{ color: pillarColor }}>
-                {post.pillar}
+                {humanizeDisplay(post.pillar)}
               </p>
               {pillarDescription && (
                 <p className="text-xs leading-relaxed text-muted-foreground">
@@ -239,7 +283,7 @@ export function PostDetailSheet({
                 </p>
               )}
               <p className="text-xs leading-relaxed text-muted-foreground">
-                Supports the {post.pillar.toLowerCase()} pillar via the{" "}
+                Supports the {humanizeDisplay(post.pillar).toLowerCase()} pillar via the{" "}
                 <span className="text-foreground/80">{post.angle}</span> angle.
               </p>
             </div>
@@ -248,17 +292,18 @@ export function PostDetailSheet({
           <Separator />
 
           <Field label="Priority">
-            <div className="flex gap-2">
-              {(["high", "medium", "low"] as const).map((p) => (
+            <div className="flex flex-wrap gap-2">
+              {(["high", "medium", "low"] as const).map((value) => (
                 <Button
-                  key={p}
+                  key={value}
                   size="sm"
-                  variant={priority === p ? "default" : "outline"}
-                  onClick={() => setPriority(p)}
+                  variant={priority === value ? "default" : "outline"}
+                  onClick={() => setPriority(value)}
                   disabled={update.isPending}
                   className="capitalize"
+                  data-testid={`post-priority-${value}`}
                 >
-                  {p}
+                  {value}
                 </Button>
               ))}
             </div>
@@ -274,6 +319,7 @@ export function PostDetailSheet({
                     variant={post.status === key ? "default" : "outline"}
                     onClick={() => setStatus(key)}
                     disabled={update.isPending}
+                    data-testid={`post-status-${key}`}
                   >
                     {label}
                   </Button>
@@ -287,18 +333,18 @@ export function PostDetailSheet({
           <Field label="Comments">
             <div className="space-y-3">
               {(post.comments ?? []).length === 0 && (
-                <p className="text-xs text-muted-foreground italic">No comments yet.</p>
+                <p className="text-xs italic text-muted-foreground">No comments yet.</p>
               )}
-              {(post.comments ?? []).map((c, i) => (
+              {(post.comments ?? []).map((entry, index) => (
                 <div
-                  key={i}
-                  className="rounded-md border border-border bg-card p-3 text-sm space-y-1"
+                  key={index}
+                  className="space-y-1 rounded-md border border-border bg-card p-3 text-sm"
                 >
                   <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>{c.author ?? "Strategist"}</span>
-                    {c.createdAt && <span>{formatDate(c.createdAt.slice(0, 10))}</span>}
+                    <span>{entry.author ?? "Strategist"}</span>
+                    {entry.createdAt && <span>{formatDate(entry.createdAt.slice(0, 10))}</span>}
                   </div>
-                  <p className="text-foreground/80 leading-relaxed">{c.text}</p>
+                  <p className="leading-relaxed text-foreground/80">{entry.text}</p>
                 </div>
               ))}
               <div className="space-y-2">
@@ -307,11 +353,13 @@ export function PostDetailSheet({
                   onChange={(e) => setComment(e.target.value)}
                   placeholder="Add a note for the team..."
                   rows={2}
+                  data-testid="post-comment-input"
                 />
                 <Button
                   size="sm"
                   onClick={submitComment}
                   disabled={update.isPending || !comment.trim()}
+                  data-testid="post-comment-submit"
                 >
                   Add comment
                 </Button>
@@ -327,7 +375,7 @@ export function PostDetailSheet({
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
         {label}
       </p>
       {children}
@@ -335,13 +383,87 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function formatDate(d: string): string {
-  const date = new Date(d + "T00:00:00Z");
-  if (Number.isNaN(date.getTime())) return d;
+function OverviewRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-muted/25 px-3 py-2.5">
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className="mt-1 text-sm leading-relaxed text-foreground/85">
+        {value?.trim() ? value : "Not available from current inputs"}
+      </p>
+    </div>
+  );
+}
+
+function DecisionRow({
+  label,
+  value,
+  strong,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+}) {
+  return (
+    <div>
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className={`mt-1 text-sm leading-relaxed ${strong ? "font-medium text-foreground/90" : "text-foreground/85"}`}>
+        {value?.trim() ? value : "Not available from current inputs"}
+      </p>
+    </div>
+  );
+}
+
+function InfoCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-border bg-card p-3.5 shadow-sm">
+      <p className="mb-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className="text-sm leading-relaxed text-foreground/85">
+        {value?.trim() ? value : "Add manual context to improve this section"}
+      </p>
+    </div>
+  );
+}
+
+function HashtagGroup({
+  label,
+  tags,
+  testId,
+}: {
+  label: string;
+  tags: string[];
+  testId?: string;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-card p-4 shadow-sm" data-testid={testId}>
+      <p className="mb-2 text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <div className="flex flex-wrap gap-2">
+        {tags.map((tag) => (
+          <span
+            key={`${label}-${tag}`}
+            className="rounded-full border border-teal-500/20 bg-teal-500/10 px-3 py-1.5 text-xs font-semibold text-teal-700"
+          >
+            {tag.startsWith("#") ? tag : `#${tag}`}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatDate(value: string): string {
+  const date = new Date(value + "T00:00:00Z");
+  if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleDateString(undefined, {
     weekday: "short",
     month: "short",
     day: "numeric",
     timeZone: "UTC",
   });
+}
+
+function humanizeDisplay(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "Not available from current inputs";
+  const spaced = trimmed.replace(/[_-]+/g, " ").replace(/\s+/g, " ").toLowerCase();
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }

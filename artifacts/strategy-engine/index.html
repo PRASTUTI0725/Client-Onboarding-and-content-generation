@@ -8,6 +8,29 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              background: "hsl(var(--background))",
+              foreground: "hsl(var(--foreground))",
+              border: "hsl(var(--border))",
+              card: "hsl(var(--card))",
+              primary: "hsl(var(--primary))",
+              "primary-foreground": "hsl(var(--primary-foreground))",
+              muted: "hsl(var(--muted))",
+              "muted-foreground": "hsl(var(--muted-foreground))",
+            },
+            fontFamily: {
+              sans: ["Inter", "system-ui", "sans-serif"],
+              serif: ["Georgia", "Playfair Display", "serif"],
+            },
+          },
+        },
+      };
+    </script>
   </head>
   <body>
     <div id="root"></div>

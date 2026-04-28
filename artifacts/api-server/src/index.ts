@@ -15,7 +15,7 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-app.listen(port, (err) => {
+const server = app.listen(port, (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);
@@ -23,3 +23,9 @@ app.listen(port, (err) => {
 
   logger.info({ port }, "Server listening");
 });
+
+// Match long-running strategy/calendar generation (req/res also set to 600s on those routes).
+server.setTimeout(600_000);
+if ("requestTimeout" in server && typeof server.requestTimeout === "number") {
+  server.requestTimeout = 600_000;
+}

@@ -11,6 +11,7 @@ interface Props {
   onClick: () => void;
   draggable?: boolean;
   onDragStart?: (e: React.DragEvent) => void;
+  testId?: string;
 }
 
 const PRIORITY_DOT: Record<string, string> = {
@@ -30,6 +31,7 @@ export function CalendarCard({
   onClick,
   draggable,
   onDragStart,
+  testId,
 }: Props) {
   const accent: CSSProperties = { backgroundColor: pillarColor };
   return (
@@ -38,13 +40,14 @@ export function CalendarCard({
       onClick={onClick}
       draggable={draggable}
       onDragStart={onDragStart}
+      data-testid={testId}
       className="group w-full text-left bg-card hover:bg-accent/40 border border-border hover:border-primary/30 rounded-md p-2 cursor-pointer transition-all relative overflow-hidden"
     >
       <div className="absolute left-0 top-0 bottom-0 w-1" style={accent} />
       <div className="pl-1.5 space-y-1">
         <div className="flex items-center justify-between gap-1">
           <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground truncate">
-            {platform ? `${platform} · ${format}` : format}
+            {platform ? `${platform} · ${humanize(format)}` : humanize(format)}
           </span>
           <span className="flex items-center gap-1">
             {priority && (
@@ -66,7 +69,7 @@ export function CalendarCard({
           style={{ color: pillarColor }}
           title={pillar}
         >
-          {pillar}
+          {humanize(pillar)}
         </p>
       </div>
     </button>
@@ -87,4 +90,9 @@ function StatusDot({ status }: { status: string }) {
       title={status.replace(/_/g, " ")}
     />
   );
+}
+
+function humanize(value: string): string {
+  const spaced = value.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  return spaced ? spaced.charAt(0).toUpperCase() + spaced.slice(1) : value;
 }

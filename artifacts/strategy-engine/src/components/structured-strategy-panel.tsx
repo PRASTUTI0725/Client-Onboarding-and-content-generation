@@ -51,7 +51,8 @@ export function StructuredStrategyPanel({ data }: Props) {
 }
 
 function prettify(s: string) {
-  return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  const spaced = s.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  return spaced ? spaced.charAt(0).toUpperCase() + spaced.slice(1) : s;
 }
 
 function renderValue(value: unknown): React.ReactNode {

@@ -41,6 +41,7 @@
     "@replit/vite-plugin-cartographer": "catalog:",
     "@replit/vite-plugin-dev-banner": "catalog:",
     "@replit/vite-plugin-runtime-error-modal": "catalog:",
+    "@tailwindcss/oxide-win32-x64-msvc": "4.2.4",
     "@tailwindcss/typography": "^0.5.15",
     "@tailwindcss/vite": "catalog:",
     "@tanstack/react-query": "catalog:",
@@ -75,6 +76,7 @@
     "zod": "catalog:"
   },
   "dependencies": {
+    "@react-pdf/renderer": "4.1.5",
     "marked": "^18.0.2"
   }
 }

@@ -1,5 +1,12 @@
-import { openai } from "../openaiClient.js";
+import { getLLMProvider, type LLMProvider } from "../llm/index.js";
+import { getStrictJsonWithRetry } from "../llm/json-retry.js";
+import { assertPromptWithinBudget, trimToTokenBudget } from "../llm/prompt-budget.js";
 import { buildPillarMeta, type PillarMeta } from "./pillars.js";
+import { buildPostDetailPayload } from "./post-detail.js";
+import type {
+  InstagramSummary,
+  WebsiteSummary,
+} from "../extraction/summaries.js";
 
 export interface SowInput {
   platforms: string[];
@@ -36,6 +43,7 @@ export interface CalendarPost {
   pillar: string;
   angle: string;
   format: string;
+  repurposeTargets?: string[];
   objective: string;
   hook: string;
   cta: string;
@@ -53,130 +61,51 @@ export interface GenerationResult {
   posts: CalendarPost[];
 }
 
-const SYSTEM = `You are a senior social media strategist + operator running an agency's content engine.
-
-You receive: brand strategy, SOW (platforms + monthly post counts + content mix + deliverables + tone-per-platform), and a monthly brief (month + goal + notes). You output ONE complete JSON object containing the planner layer and a fully-resolved calendar — every post specific, intentional, and ready to execute.
-
-Return STRICT JSON only. No prose.
-
-Schema:
+const PLANNER_SYSTEM = `You are a senior social strategist. Return STRICT compact JSON only.
+Output:
 {
   "planner": {
-    "distribution":   { "<pillar_key>": <number> },         // pillar mix percentages summing to 100; respect SOW.contentMix as the source of truth
-    "formats":        { "<format_key>": <number> },         // format mix percentages summing to 100, derived from how the platforms breakdown
-    "platformSplit":  { "<platform>": <number> },           // post counts per platform (NOT percent) — must equal SOW.monthlyPosts
-    "angleBank":      { "<pillar_key>": ["...", "..."] },   // 4-6 sharp brand-specific angles per pillar
-    "hookStyles":     ["...", "..."],                       // 5-7 hook archetypes
-    "weeklyFlow":     { "week_1": "...", "week_2": "...", "week_3": "...", "week_4": "..." },
-    "kpis":           { "<metric>": "<target/definition>" },// 3-5 KPIs aligned to the monthly goal
-    "phases":         [ { "name": "Week 1: Awareness", "focus": "..." } ]
-  },
+    "distribution": { "<pillar_key>": <number> },
+    "formats": { "<format_key>": <number> },
+    "platformSplit": { "<platform>": <number> },
+    "angleBank": { "<pillar_key>": ["...", "..."] },
+    "hookStyles": ["...", "..."],
+    "weeklyFlow": { "week_1": "...", "week_2": "...", "week_3": "...", "week_4": "..." },
+    "kpis": { "<metric>": "<target/definition>" },
+    "phases": [{ "name": "Week 1", "focus": "..." }]
+  }
+}
+Rules: concise values only.`;
+
+const WEEK_POSTS_SYSTEM = `You are a social strategist. Return STRICT JSON only:
+{
   "posts": [
     {
       "date": "YYYY-MM-DD",
-      "platform": "Instagram" | "LinkedIn" | "TikTok" | "X" | "YouTube",
-      "pillar": "<exact pillar name>",
-      "angle": "<one specific brand angle>",
-      "format": "<format native to this platform — see Format Intelligence below>",
-      "objective": "<one sentence>",
-      "hook": "<6-14 word opening line, brand voice, NEVER generic>",
-      "caption": "<1-3 short paragraphs of caption copy in this platform's tone>",
-      "hashtags": ["#tag", "#tag"],
-      "cta": "<one specific CTA>",
-      "strategicIntent": "<WHY this post exists and what role it plays in the month's flow>",
-      "expectedMetric": "<reach | saves | shares | comments | profile visits | link clicks | replies | DMs | watch_time>",
-      "expectedReason": "<one sentence: WHY we expect that metric to move>",
-      "priority": "high" | "medium" | "low",
-      "execution": <FORMAT-SPECIFIC OBJECT — see below>
+      "platform": "Instagram" | "LinkedIn" | "Pinterest" | "X" | "YouTube",
+      "pillar": "<pillar>",
+      "angle": "<short angle>",
+      "format": "carousel" | "reel" | "story" | "static" | "text post" | "thread" | "image post" | "static pin" | "video pin" | "short video" | "long video" | "community post" | "pdf carousel",
+      "repurposeTargets": ["<platform> - <format>", "<platform> - <format>"],
+      "objective": "<short objective>",
+      "hook": "<short hook>",
+      "caption": "<short caption>",
+      "cta": "<cta>",
+      "priority": "high" | "medium" | "low"
     }
   ]
 }
-
-CRITICAL RULES:
-
-1. SOW IS LAW.
-   - Total post count = sum of SOW.monthlyPosts. Do NOT default to 30. Do NOT add or remove posts.
-   - Per-platform counts = exactly SOW.monthlyPosts. Reflect that in "platformSplit".
-   - Pillar mix percentages = SOW.contentMix (you may round to integers if needed but they must sum to 100).
-   - Honor SOW.deliverables as recurring slots (e.g. "weekly story takeover" = one Story per week on a consistent day).
-
-2. PLATFORM DIFFERENTIATION IS MANDATORY.
-   - Instagram ≠ LinkedIn ≠ TikTok. Tone, hook style, caption length, format, and CTA must change.
-   - Use the SOW.toneByPlatform mapping verbatim — if LinkedIn says "operator-to-operator, no fluff", that voice MUST appear in those posts.
-   - Do not put a LinkedIn-style essay on Instagram, and do not put an Instagram Reel hook on LinkedIn.
-
-3. EVERY POST MUST FEEL INTENTIONAL.
-   - "strategicIntent" must explain why THIS post in THIS slot — no boilerplate.
-   - "expectedMetric" + "expectedReason" must be honest (not every post is a viral reel — some are nurture, some are conversion).
-   - "priority" — roughly 20-30% high, 50-60% medium, rest low. High = anchor posts (launches, hero pieces, big stories). Low = utility posts (UGC repost, story poll, simple repurpose).
-
-4. FOLLOW THE WEEKLY FLOW.
-   - Spread posts across the month so each week reflects its phase (e.g. week 1 awareness/baseline, week 4 conversion/proof). Use the chosen month's actual dates.
-   - Avoid clumping the same pillar or format on consecutive days.
-
-5. CONTENT QUALITY.
-   - No "Did you know...", no "5 tips for...", no generic listicle hooks.
-   - Hooks reference the actual offer/audience/pain.
-   - CTAs are SPECIFIC (e.g. "DM 'AUDIT' for the checklist", not "Comment below").
-   - Captions feel native to the platform (LinkedIn = first-person operator, IG = punchy + scannable, TikTok = casual + spoken cadence).
-
-6. FORMAT INTELLIGENCE — "execution" SHAPE BY FORMAT:
-
-   CAROUSEL:
-   {
-     "slides": [
-       { "n": 1, "role": "hook",       "headline": "...", "body": "..." },
-       { "n": 2, "role": "value",      "headline": "...", "body": "..." },
-       { "n": 3, "role": "value",      "headline": "...", "body": "..." },
-       { "n": 4, "role": "value",      "headline": "...", "body": "..." },
-       { "n": 5, "role": "insight",    "headline": "...", "body": "..." },
-       { "n": 6, "role": "cta",        "headline": "...", "body": "..." }
-     ],
-     "design_direction": "<typography/imagery cue>"
-   }
-
-   REEL (or short-form video on TikTok/YouTube Shorts):
-   {
-     "hook_2s": "<the literal first 2 seconds — spoken + visual>",
-     "pattern_interrupt": "<what changes at ~3-5s to keep them>",
-     "beats": ["<beat 1>", "<beat 2>", "<beat 3>", "<beat 4>"],
-     "cta_on_screen": "<final on-screen CTA>",
-     "visual_direction": "<shot list / b-roll / setting>",
-     "audio": "<music/sound direction or 'spoken-only'>"
-   }
-
-   STATIC (single image/post):
-   {
-     "visual_idea": "<the one strong image>",
-     "headline": "<short on-image headline if any>",
-     "caption_depth": "<what the caption uniquely carries that the image doesn't>"
-   }
-
-   STORIES:
-   {
-     "frames": [
-       { "n": 1, "role": "hook",  "copy": "...", "interaction": "poll | question | slider | quiz" },
-       { "n": 2, "role": "value", "copy": "...", "interaction": "none" },
-       { "n": 3, "role": "value", "copy": "...", "interaction": "none" },
-       { "n": 4, "role": "cta",   "copy": "...", "interaction": "link sticker | DM keyword" }
-     ]
-   }
-
-   TEXT (LinkedIn text post / X thread):
-   {
-     "opening_line": "<scroll-stopper>",
-     "body": "<the full post copy>",
-     "close": "<line that earns the comment/DM>"
-   }
-
-   VIDEO (long-form, e.g. LinkedIn video, YouTube):
-   {
-     "hook_5s": "...",
-     "structure": ["intro", "point 1", "point 2", "point 3", "cta"],
-     "visual_direction": "..."
-   }
-
-7. NEVER use placeholders. Every string must be real, usable copy. The strategist should be able to hand the JSON to a designer/editor without thinking.`;
+Rules:
+- Match platform and format correctly. Do not default everything to Instagram or Stories.
+- Instagram: carousel, reel, story, static.
+- LinkedIn: text post, carousel, pdf carousel, short video.
+- X: text post, thread, image post.
+- Pinterest: static pin, video pin.
+- YouTube: short video, long video, community post.
+- Educational or how-to content should prefer carousel on Instagram or LinkedIn where it fits.
+- CTA must fit the platform. Examples: Instagram "DM/comment/save/share", LinkedIn "comment/follow/connect", X "reply/repost/bookmark", Pinterest "save/click", YouTube "comment/subscribe/watch".
+- Add 0-2 repurposeTargets only when the post is a good candidate for reuse across platforms.
+- Concise output, no commentary.`;
 
 export async function generateMonthlyPlan(
   brandName: string,
@@ -184,28 +113,37 @@ export async function generateMonthlyPlan(
   structured: Record<string, unknown>,
   sow: SowInput,
   brief: MonthlyBrief,
+  provider?: LLMProvider,
+  extraction?: {
+    websiteSummary?: WebsiteSummary | null;
+    instagramSummary?: InstagramSummary | null;
+    strategySummary?: string | null;
+    pillarPriorities?: string[] | null;
+    monthlyGoals?: string[] | null;
+  },
 ): Promise<GenerationResult> {
   const pillars = buildPillarMeta(structured["content_strategy"] as Record<string, unknown>);
-  const totalPosts = Object.values(sow.monthlyPosts).reduce((a, b) => a + (Number(b) || 0), 0);
+  const targetPlatformCounts = normalizePlatformTargets(sow.monthlyPosts, sow.platforms);
+  const totalPosts = Object.values(targetPlatformCounts).reduce((a, b) => a + (Number(b) || 0), 0);
+
+  const compactEnriched = pickCompactEnriched(enriched);
+  const compactStructured = pickCompactStructured(structured);
+  const compactExtraction = {
+    strategy_summary: trimToTokenBudget(
+      extraction?.strategySummary || buildDefaultStrategySummary(brandName, compactStructured),
+      220,
+    ),
+    pillar_priorities: (extraction?.pillarPriorities ?? pillars.map((p) => p.name)).slice(0, 5),
+    monthly_goals: (extraction?.monthlyGoals ?? [brief.goal || "Support the approved strategy goals"]).slice(0, 4),
+  };
 
   const userPrompt = `BRAND: ${brandName}
 
-ENRICHED PROFILE:
-${JSON.stringify(enriched, null, 2)}
+ENRICHED PROFILE (compact):
+${JSON.stringify(compactEnriched, null, 2)}
 
-STRUCTURED STRATEGY (pillars, audience, positioning, phases):
-${JSON.stringify(
-  {
-    audience: structured["audience"],
-    brand_philosophy: structured["brand_philosophy"],
-    platform_strategy: structured["platform_strategy"],
-    content_strategy: structured["content_strategy"],
-    phases: structured["phases"],
-    kpis: structured["kpis"],
-  },
-  null,
-  2,
-)}
+CALENDAR INPUT (compact):
+${JSON.stringify(compactExtraction, null, 2)}
 
 PILLARS (use snake_case keys for distribution/angleBank):
 ${pillars.map((p) => `- ${p.name} (key: ${pillarKey(p.name)})${p.description ? ` — ${p.description}` : ""}`).join("\n")}
@@ -220,90 +158,202 @@ MONTHLY BRIEF:
 - Notes: ${brief.notes || "(none)"}
 
 TOTAL POSTS REQUIRED: ${totalPosts} (sum of SOW.monthlyPosts).
-Spread these posts across the month starting from ${brief.startDate}, following the weekly flow.
+Return ONLY the planner JSON object.`;
 
-Return ONE JSON object: { "planner": {...}, "posts": [...] }.`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-5.2",
-    max_completion_tokens: 16384,
-    response_format: { type: "json_object" },
+  assertPromptWithinBudget("calendar planner", [PLANNER_SYSTEM, userPrompt], 2000, 450);
+  const llmProvider = provider ?? getLLMProvider();
+  const plannerStartedAt = Date.now();
+  const parsedPlanner = await getStrictJsonWithRetry<{
+    planner?: Partial<PlannerLayer>;
+  }>(llmProvider, {
+    contextLabel: "calendar planner",
+    maxOutputTokens: 450,
     messages: [
-      { role: "system", content: SYSTEM },
+      { role: "system", content: PLANNER_SYSTEM },
       { role: "user", content: userPrompt },
     ],
   });
-
-  const content = completion.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(content) as {
-    planner?: Partial<PlannerLayer>;
-    posts?: Array<Partial<CalendarPost>>;
-  };
+  console.info(
+    `[llm-observe] calendar.planner ttft_ms=unavailable total_ms=${Date.now() - plannerStartedAt}`,
+  );
 
   const pillarKeys = pillars.map((p) => pillarKey(p.name));
   const formatKeys = inferFormatKeys(sow);
 
   const planner: PlannerLayer = {
     distribution: normalizePercents(
-      parsed.planner?.distribution ?? toPillarKeyMap(sow.contentMix, pillars),
+      parsedPlanner.planner?.distribution ?? toPillarKeyMap(sow.contentMix, pillars),
       pillarKeys,
     ),
-    formats: normalizePercents(parsed.planner?.formats, formatKeys),
-    platformSplit: normalizeCounts(parsed.planner?.platformSplit, sow.monthlyPosts),
-    angleBank: parsed.planner?.angleBank ?? {},
+    formats: normalizePercents(parsedPlanner.planner?.formats, formatKeys),
+    platformSplit: targetPlatformCounts,
+    angleBank: parsedPlanner.planner?.angleBank ?? {},
     hookStyles:
-      Array.isArray(parsed.planner?.hookStyles) && parsed.planner!.hookStyles!.length
-        ? (parsed.planner!.hookStyles as string[])
+      Array.isArray(parsedPlanner.planner?.hookStyles) && parsedPlanner.planner!.hookStyles!.length
+        ? (parsedPlanner.planner!.hookStyles as string[])
         : ["curiosity", "authority", "story", "contrarian", "data"],
     weeklyFlow:
-      parsed.planner?.weeklyFlow ?? {
+      parsedPlanner.planner?.weeklyFlow ?? {
         week_1: "Awareness + baseline",
         week_2: "Trust + repeatability",
         week_3: "Conversion / offer",
         week_4: "Proof + community",
       },
     pillars,
-    kpis: parsed.planner?.kpis ?? {},
-    phases: Array.isArray(parsed.planner?.phases)
-      ? (parsed.planner!.phases as Array<{ name: string; focus: string }>)
+    kpis: parsedPlanner.planner?.kpis ?? {},
+    phases: Array.isArray(parsedPlanner.planner?.phases)
+      ? (parsedPlanner.planner!.phases as Array<{ name: string; focus: string }>)
       : [],
   };
 
   const start = new Date(brief.startDate + "T00:00:00Z");
-  const fallbackPlatform = sow.platforms[0] ?? "Instagram";
+  const fallbackPlatform = preferredFallbackPlatform(sow.platforms);
   const fallbackPillar = pillars[0]?.name ?? "Education";
+  const weeklyTargets = splitAcrossWeeks(totalPosts, 4);
+  const weekTasks: Array<{
+    weekIndex: number;
+    targetCount: number;
+    prompt: string;
+  }> = [];
+  for (let week = 0; week < weeklyTargets.length; week += 1) {
+    const targetCount = weeklyTargets[week]!;
+    if (targetCount <= 0) continue;
+    const weekStart = new Date(start);
+    weekStart.setUTCDate(weekStart.getUTCDate() + week * 7);
+    const weekPrompt = `BRAND: ${brandName}
+MONTH: ${brief.month}
+WEEK: ${week + 1}
+START_DATE: ${weekStart.toISOString().slice(0, 10)}
+TARGET_POSTS: ${targetCount}
+PLATFORMS: ${JSON.stringify(sow.platforms)}
+PILLARS: ${JSON.stringify(pillars.map((p) => p.name))}
+WEEKLY_FLOW: ${JSON.stringify(planner.weeklyFlow)}
+GOAL: ${brief.goal || "Support strategy goals"}
+NOTES: ${brief.notes || ""}
+Return exactly ${targetCount} posts in JSON.
+Use platform-specific formats and CTAs, and add repurposeTargets only when reuse is obvious.`;
+    weekTasks.push({ weekIndex: week, targetCount, prompt: weekPrompt });
+  }
 
-  const rawPosts = Array.isArray(parsed.posts) ? parsed.posts : [];
-  const posts: CalendarPost[] = rawPosts.slice(0, totalPosts).map((p, i) => {
+  const rawPostsByWeek = await runWithConcurrency(
+    weekTasks,
+    2,
+    async (task) => {
+      assertPromptWithinBudget(`calendar week ${task.weekIndex + 1}`, [WEEK_POSTS_SYSTEM, task.prompt], 1200, 320);
+      const weekStartedAt = Date.now();
+      const parsedWeek = await getStrictJsonWithRetry<{ posts?: Array<Partial<CalendarPost>> }>(
+        llmProvider,
+        {
+          contextLabel: `calendar week ${task.weekIndex + 1}`,
+          maxOutputTokens: 320,
+          messages: [
+            { role: "system", content: WEEK_POSTS_SYSTEM },
+            { role: "user", content: task.prompt },
+          ],
+        },
+      );
+      const postsForWeek = Array.isArray(parsedWeek.posts)
+        ? parsedWeek.posts.slice(0, task.targetCount)
+        : [];
+      console.info(
+        `[llm-observe] calendar.week${task.weekIndex + 1} ttft_ms=unavailable total_ms=${Date.now() - weekStartedAt} posts=${postsForWeek.length}`,
+      );
+      return { weekIndex: task.weekIndex, posts: postsForWeek };
+    },
+  );
+
+  const rawPosts: Array<Partial<CalendarPost>> = rawPostsByWeek
+    .sort((a, b) => a.weekIndex - b.weekIndex)
+    .flatMap((entry) => entry.posts);
+  const assignedPlatforms = assignPlatformsByQuota(rawPosts, targetPlatformCounts, fallbackPlatform);
+  const sourcePosts = Array.from({ length: totalPosts }, (_, index) => rawPosts[index] ?? {});
+
+  const normalizeStartedAt = Date.now();
+  const posts: CalendarPost[] = sourcePosts.map((p, i) => {
     const fallback = new Date(start);
     fallback.setUTCDate(fallback.getUTCDate() + i);
     const fallbackIso = fallback.toISOString().slice(0, 10);
+    const normalizedPlatform = assignedPlatforms[i] ?? fallbackPlatform;
+    const normalizedFormat = normalizeFormatForPlatform(
+      typeof p.format === "string" ? p.format : "",
+      normalizedPlatform,
+    );
+    const repurposeTargets = normalizeRepurposeTargets(p.repurposeTargets);
+    const cta = p.cta || defaultCtaForPlatform(normalizedPlatform, normalizedFormat);
+    const normalizedDetail = buildPostDetailPayload({
+      format: normalizedFormat,
+      platform: normalizedPlatform,
+      pillar: p.pillar || fallbackPillar,
+      objective: p.objective || "",
+      hook: p.hook || "",
+      cta,
+      caption: p.caption ?? null,
+      hashtags: Array.isArray(p.hashtags) ? p.hashtags : null,
+      strategicIntent: p.strategicIntent || "",
+      expectedMetric: p.expectedMetric || "reach",
+      expectedReason: p.expectedReason || "",
+      priority: normalizePriority(p.priority),
+      execution: {
+        ...((p.execution && typeof p.execution === "object" ? p.execution : {}) as Record<string, unknown>),
+        ...(repurposeTargets.length > 0 ? { repurpose_targets: repurposeTargets } : {}),
+      },
+    });
     return {
       date:
         typeof p.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(p.date)
           ? p.date
           : fallbackIso,
-      platform: p.platform || fallbackPlatform,
+      platform: normalizedPlatform,
       pillar: p.pillar || fallbackPillar,
       angle: p.angle || "",
-      format: p.format || "Reel",
+      format: normalizedFormat,
+      ...(repurposeTargets.length > 0 ? { repurposeTargets } : {}),
       objective: p.objective || "",
       hook: p.hook || "",
-      caption: p.caption ?? null,
-      hashtags: Array.isArray(p.hashtags) ? p.hashtags : null,
-      cta: p.cta || "",
+      caption: normalizedDetail.caption,
+      hashtags: normalizedDetail.hashtags,
+      cta,
       strategicIntent: p.strategicIntent || "",
       expectedMetric: p.expectedMetric || "reach",
-      expectedReason: p.expectedReason || "",
+      expectedReason: "",
       priority: normalizePriority(p.priority),
-      execution: (p.execution && typeof p.execution === "object" ? p.execution : {}) as Record<
-        string,
-        unknown
-      >,
+      execution: normalizedDetail.execution,
     };
   });
+  const normalizedPosts = ensureCreativeFormatCoverage(posts);
+  console.info(
+    `[llm-observe] calendar.postprocess normalize_ms=${Date.now() - normalizeStartedAt} posts=${normalizedPosts.length}`,
+  );
+  return { planner, posts: normalizedPosts };
+}
 
-  return { planner, posts };
+function pickCompactEnriched(enriched: Record<string, unknown>) {
+  const audience = (enriched.target_audience as Record<string, unknown> | undefined) ?? {};
+  return {
+    brand_name: String(enriched.brand_name ?? ""),
+    offer: String(enriched.offer ?? ""),
+    positioning: String(enriched.positioning ?? ""),
+    platform: String(enriched.platform ?? ""),
+    content_preference: String(enriched.content_preference ?? ""),
+    target_audience: {
+      who: String(audience.who ?? ""),
+      stage: String(audience.stage ?? ""),
+      pains: String(audience.pains ?? ""),
+    },
+    competitors: Array.isArray(enriched.competitors)
+      ? (enriched.competitors as unknown[]).slice(0, 5)
+      : [],
+  };
+}
+
+function pickCompactStructured(structured: Record<string, unknown>) {
+  return {
+    audience: trimToTokenBudget(stringifyValue(structured["audience"]), 140),
+    platform_strategy: trimToTokenBudget(stringifyValue(structured["platform_strategy"]), 140),
+    content_strategy: trimToTokenBudget(stringifyValue(structured["content_strategy"]), 180),
+    phases: trimToTokenBudget(stringifyValue(structured["phases"]), 100),
+    kpis: trimToTokenBudget(stringifyValue(structured["kpis"]), 100),
+  };
 }
 
 function inferFormatKeys(sow: SowInput): string[] {
@@ -313,11 +363,13 @@ function inferFormatKeys(sow: SowInput): string[] {
     if (lower.includes("instagram")) {
       ["reel", "carousel", "static", "story"].forEach((f) => set.add(f));
     } else if (lower.includes("linkedin")) {
-      ["text", "carousel", "video"].forEach((f) => set.add(f));
-    } else if (lower.includes("tiktok") || lower.includes("youtube")) {
-      ["reel", "video"].forEach((f) => set.add(f));
+      ["text post", "carousel", "pdf carousel", "short video"].forEach((f) => set.add(f));
     } else if (lower.includes("twitter") || lower === "x") {
-      ["text", "thread"].forEach((f) => set.add(f));
+      ["text post", "thread", "image post"].forEach((f) => set.add(f));
+    } else if (lower.includes("pinterest")) {
+      ["static pin", "video pin"].forEach((f) => set.add(f));
+    } else if (lower.includes("youtube")) {
+      ["short video", "long video", "community post"].forEach((f) => set.add(f));
     }
   }
   if (set.size === 0) ["reel", "carousel", "static"].forEach((f) => set.add(f));
@@ -382,3 +434,216 @@ function normalizeCounts(
 }
 
 export { pillarKey };
+
+function normalizePlatformTargets(
+  monthlyPosts: Record<string, number>,
+  platforms: string[],
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const platform of platforms) {
+    const normalized = normalizePlatformName(platform, platform);
+    out[normalized] = Number(monthlyPosts[platform] ?? monthlyPosts[normalized] ?? 0) || 0;
+  }
+  for (const [platform, count] of Object.entries(monthlyPosts)) {
+    const normalized = normalizePlatformName(platform, platform);
+    out[normalized] = Math.max(out[normalized] ?? 0, Number(count) || 0);
+  }
+  return Object.fromEntries(Object.entries(out).filter(([, count]) => count > 0));
+}
+
+function assignPlatformsByQuota(
+  rawPosts: Array<Partial<CalendarPost>>,
+  targetCounts: Record<string, number>,
+  fallbackPlatform: string,
+): string[] {
+  const remaining = new Map<string, number>(Object.entries(targetCounts));
+  const preferredOrder = Object.keys(targetCounts);
+  const assigned: string[] = [];
+  for (const post of rawPosts.slice(0, preferredOrder.reduce((sum, key) => sum + (targetCounts[key] ?? 0), 0))) {
+    const preferred = normalizePlatformName(post.platform, fallbackPlatform);
+    const preferredRemaining = remaining.get(preferred) ?? 0;
+    if (preferredRemaining > 0) {
+      assigned.push(preferred);
+      remaining.set(preferred, preferredRemaining - 1);
+      continue;
+    }
+    const nextPlatform =
+      preferredOrder.find((platform) => (remaining.get(platform) ?? 0) > 0) ?? fallbackPlatform;
+    assigned.push(nextPlatform);
+    remaining.set(nextPlatform, Math.max(0, (remaining.get(nextPlatform) ?? 0) - 1));
+  }
+  for (const platform of preferredOrder) {
+    let left = remaining.get(platform) ?? 0;
+    while (left > 0) {
+      assigned.push(platform);
+      left -= 1;
+    }
+  }
+  return assigned;
+}
+
+function ensureCreativeFormatCoverage(posts: CalendarPost[]): CalendarPost[] {
+  const next = posts.map((post) => ({ ...post }));
+  const byPlatform = new Map<string, number[]>();
+  next.forEach((post, idx) => {
+    const key = post.platform.trim().toLowerCase();
+    const bucket = byPlatform.get(key) ?? [];
+    bucket.push(idx);
+    byPlatform.set(key, bucket);
+  });
+  for (const [platform, indices] of byPlatform.entries()) {
+    const required = requiredFormatsForPlatform(platform, indices.length);
+    if (required.length === 0) continue;
+    const present = new Set(indices.map((i) => next[i]!.format.trim().toLowerCase()));
+    let writePtr = 0;
+    for (const requiredFormat of required) {
+      if (present.has(requiredFormat)) continue;
+      const targetIdx = indices[writePtr % indices.length]!;
+      next[targetIdx] = {
+        ...next[targetIdx]!,
+        format: requiredFormat,
+      };
+      const execution = next[targetIdx]!.execution;
+      if (execution && typeof execution === "object") {
+        next[targetIdx]!.execution = {
+          ...execution,
+          format_style: requiredFormat,
+        };
+      }
+      writePtr += 1;
+    }
+  }
+  return next;
+}
+
+function preferredFallbackPlatform(platforms: string[]): string {
+  const ordered = ["Instagram", "LinkedIn", "X", "Pinterest", "YouTube"];
+  for (const platform of ordered) {
+    const match = platforms.find((value) => normalizePlatformName(value, platform) === platform);
+    if (match) return normalizePlatformName(match, platform);
+  }
+  return normalizePlatformName(platforms[0], "Instagram");
+}
+
+function normalizePlatformName(value: unknown, fallback: string): string {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (raw === "x" || raw.includes("twitter")) return "X";
+  if (raw.includes("linkedin")) return "LinkedIn";
+  if (raw.includes("pinterest")) return "Pinterest";
+  if (raw.includes("youtube")) return "YouTube";
+  if (raw.includes("instagram")) return "Instagram";
+  return fallback;
+}
+
+function normalizeFormatForPlatform(format: string, platform: string): string {
+  const lower = format.trim().toLowerCase();
+  if (platform === "Instagram") {
+    if (lower.includes("story")) return "story";
+    if (lower.includes("carousel")) return "carousel";
+    if (lower.includes("static") || lower.includes("image")) return "static";
+    if (lower.includes("reel") || lower.includes("short") || lower.includes("video")) return "reel";
+    return "carousel";
+  }
+  if (platform === "LinkedIn") {
+    if (lower.includes("pdf")) return "pdf carousel";
+    if (lower.includes("carousel")) return "carousel";
+    if (lower.includes("video") || lower.includes("short")) return "short video";
+    if (lower.includes("text") || lower.includes("post")) return "text post";
+    return "text post";
+  }
+  if (platform === "X") {
+    if (lower.includes("thread")) return "thread";
+    if (lower.includes("image") || lower.includes("static")) return "image post";
+    if (lower.includes("text") || lower.includes("post")) return "text post";
+    return "text post";
+  }
+  if (platform === "Pinterest") {
+    if (lower.includes("video")) return "video pin";
+    if (lower.includes("pin") || lower.includes("static") || lower.includes("image")) return "static pin";
+    return "static pin";
+  }
+  if (platform === "YouTube") {
+    if (lower.includes("community")) return "community post";
+    if (lower.includes("long")) return "long video";
+    if (lower.includes("short") || lower.includes("reel") || lower.includes("video")) return "short video";
+    return "short video";
+  }
+  return lower || "carousel";
+}
+
+function defaultCtaForPlatform(platform: string, format: string): string {
+  if (platform === "Instagram") {
+    if (format === "story") return "Reply to this story or DM START for the next step.";
+    return "Comment START or DM START if you want the full breakdown.";
+  }
+  if (platform === "LinkedIn") {
+    return "Comment with your biggest takeaway and follow for the next part.";
+  }
+  if (platform === "X") {
+    return "Reply with your take and repost if this matches your experience.";
+  }
+  if (platform === "Pinterest") {
+    return "Save this pin for later and click through for the full guide.";
+  }
+  if (platform === "YouTube") {
+    return format === "community post"
+      ? "Comment with the next question you want covered and subscribe for more."
+      : "Comment with your question and subscribe for the next breakdown.";
+  }
+  return "Comment for the next step.";
+}
+
+function normalizeRepurposeTargets(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean).slice(0, 2)
+    : [];
+}
+
+function requiredFormatsForPlatform(platform: string, count: number): string[] {
+  if (count < 2) return [];
+  if (platform.includes("instagram")) return count >= 4 ? ["carousel", "reel", "story"] : ["carousel", "reel"];
+  if (platform.includes("linkedin")) return ["text post", "carousel"];
+  if (platform === "x") return ["text post", "thread"];
+  if (platform.includes("pinterest")) return ["static pin", "video pin"];
+  if (platform.includes("youtube")) return ["short video", "community post"];
+  return [];
+}
+
+function buildDefaultStrategySummary(brandName: string, compactStructured: Record<string, unknown>) {
+  return `${brandName}: ${Object.values(compactStructured).join(" ")}`.replace(/\s+/g, " ").trim();
+}
+
+function stringifyValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function splitAcrossWeeks(total: number, weeks: number): number[] {
+  if (weeks <= 0) return [];
+  const base = Math.floor(total / weeks);
+  const remainder = total % weeks;
+  return Array.from({ length: weeks }, (_, idx) => base + (idx < remainder ? 1 : 0));
+}
+
+async function runWithConcurrency<TItem, TResult>(
+  items: TItem[],
+  concurrency: number,
+  worker: (item: TItem) => Promise<TResult>,
+): Promise<TResult[]> {
+  const out: TResult[] = [];
+  const queue = [...items];
+  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (queue.length > 0) {
+      const next = queue.shift();
+      if (!next) return;
+      out.push(await worker(next));
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}

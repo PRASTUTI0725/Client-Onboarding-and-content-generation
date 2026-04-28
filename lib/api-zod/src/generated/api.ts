@@ -30,7 +30,7 @@ export const ListClientsResponseItem = zod
           platforms: zod
             .array(zod.string())
             .describe(
-              "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+              "Active platforms (e.g. Instagram, LinkedIn, Pinterest, X, YouTube).",
             ),
           monthlyPosts: zod
             .record(zod.string(), zod.number())
@@ -93,7 +93,7 @@ export const GetClientResponse = zod.object({
           platforms: zod
             .array(zod.string())
             .describe(
-              "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+              "Active platforms (e.g. Instagram, LinkedIn, Pinterest, X, YouTube).",
             ),
           monthlyPosts: zod
             .record(zod.string(), zod.number())
@@ -243,7 +243,7 @@ export const UpdateSowBody = zod.object({
   platforms: zod
     .array(zod.string())
     .describe(
-      "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+      "Active platforms (e.g. Instagram, LinkedIn, Pinterest, X, YouTube).",
     ),
   monthlyPosts: zod
     .record(zod.string(), zod.number())
@@ -275,7 +275,7 @@ export const UpdateSowResponse = zod.object({
         platforms: zod
           .array(zod.string())
           .describe(
-            "Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube).",
+            "Active platforms (e.g. Instagram, LinkedIn, Pinterest, X, YouTube).",
           ),
         monthlyPosts: zod
           .record(zod.string(), zod.number())
@@ -379,6 +379,7 @@ export const GetCalendarResponse = zod.object({
           "approved",
           "needs_changes",
           "scheduled",
+          "published",
         ]),
         comments: zod
           .array(
@@ -529,6 +530,7 @@ export const UpdatePostBody = zod.object({
       "approved",
       "needs_changes",
       "scheduled",
+      "published",
     ])
     .optional(),
   hook: zod.string().optional(),
@@ -576,6 +578,7 @@ export const UpdatePostResponse = zod.object({
     "approved",
     "needs_changes",
     "scheduled",
+    "published",
   ]),
   comments: zod
     .array(

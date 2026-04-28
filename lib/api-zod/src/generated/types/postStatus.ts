@@ -14,4 +14,5 @@ export const PostStatus = {
   approved: "approved",
   needs_changes: "needs_changes",
   scheduled: "scheduled",
+  published: "published",
 } as const;

@@ -6,11 +6,28 @@
     "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
     "typecheck:libs": "tsc --build",
-    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
+    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
+    "test:e2e": "playwright test",
+    "test:e2e:ci": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:install": "playwright install",
+    "kill-ports": "npx kill-port 5173 3000 5174 3001 3015",
+    "start:isolated": "pnpm run kill-ports && concurrently \"dotenv -e ./artifacts/api-server/.env.local -- cmd /c pnpm --filter @workspace/scripts run mcp-local\" \"dotenv -e ./artifacts/api-server/.env.local -- cmd /c pnpm --filter @workspace/api-server run dev\" \"dotenv -e ./artifacts/strategy-engine/.env.local -- cmd /c pnpm --filter @workspace/strategy-engine run dev\"",
+    "start:full": "pnpm run kill-ports && dotenv -e ./artifacts/api-server/.env.local -- npx pnpm --filter @workspace/db run push && concurrently \"dotenv -e ./artifacts/api-server/.env.local -- cmd /c pnpm --filter @workspace/scripts run mcp-local\" \"dotenv -e ./artifacts/api-server/.env.local -- cmd /c pnpm --filter @workspace/api-server run dev\" \"dotenv -e ./artifacts/strategy-engine/.env.local -- cmd /c pnpm --filter @workspace/strategy-engine run dev\""
   },
   "private": true,
   "devDependencies": {
-    "typescript": "~5.9.2",
-    "prettier": "^3.8.1"
+    "@playwright/test": "^1.59.1",
+    "@rollup/rollup-win32-x64-msvc": "^4.60.2",
+    "concurrently": "^9.2.1",
+    "dotenv-cli": "^8.0.0",
+    "kill-port": "^2.0.1",
+    "lightningcss-win32-x64-msvc": "^1.32.0",
+    "prettier": "^3.8.1",
+    "typescript": "~5.9.2"
+  },
+  "dependencies": {
+    "superpowers": "^0.0.2"
   }
 }

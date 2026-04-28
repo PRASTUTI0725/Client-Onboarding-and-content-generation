@@ -47,3 +47,41 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# local secrets and env
+.env
+.env.*
+**/.env
+**/.env.*
+
+# local logs and runtime artifacts
+*.log
+*.err.log
+*.out.log
+*.pid
+
+# local caches / temp
+.tmp-check/
+playwright-report/
+test-results/
+reports/
+
+# app-specific env files
+artifacts/api-server/.env.local
+artifacts/strategy-engine/.env.local
+
+# local generated verification artifacts
+artifacts/*.png
+artifacts/*.pdf
+artifacts/*.json
+
+# local agent/config folders
+.claude/
+.cursor/
+.cursorrules
+.mcp.json
+.opencode.json
+.windsurfrules
+AGENTS.md
+CLAUDE.md
+GEMINI.md

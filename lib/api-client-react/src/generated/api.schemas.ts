@@ -63,7 +63,7 @@ export type SowContentMix = { [key: string]: number };
 export type SowToneByPlatform = { [key: string]: string };
 
 export interface Sow {
-  /** Active platforms (e.g. Instagram, LinkedIn, TikTok, X, YouTube). */
+  /** Active platforms (e.g. Instagram, LinkedIn, Pinterest, X, YouTube). */
   platforms: string[];
   /** Posts per platform per month, e.g. { Instagram: 16, LinkedIn: 8 }. */
   monthlyPosts: SowMonthlyPosts;
@@ -186,6 +186,8 @@ export interface Planner {
   pillars: PlannerPillarsItem[];
   kpis?: PlannerKpis;
   phases?: PlannerPhasesItem[] | null;
+  /** Generation provenance: calendarSource, calendarAiFailure, etc. */
+  metadata?: Record<string, unknown> | null;
   month?: string | null;
   goal?: string | null;
   notes?: string | null;

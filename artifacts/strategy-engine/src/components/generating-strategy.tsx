@@ -1,46 +1,59 @@
 import { useEffect, useState } from "react";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const STAGES = [
-  "Reading your site...",
-  "Mapping your audience...",
-  "Drafting positioning...",
-  "Composing the document...",
+  "Fetching website context...",
+  "Fetching Instagram context...",
+  "Generating core strategy...",
+  "Refining detailed sections...",
 ];
 
-export function GeneratingStrategy() {
+type Props = Record<string, never>;
+
+export function GeneratingStrategy(_: Props) {
   const [stage, setStage] = useState(0);
 
   useEffect(() => {
     const id = setInterval(() => {
-      setStage((s) => (s + 1) % STAGES.length);
+      setStage((x) => (x + 1) % STAGES.length);
     }, 3500);
     return () => clearInterval(id);
   }, []);
 
   return (
-    <div className="flex flex-col items-center justify-center py-24 px-6 text-center">
-      <div className="relative size-12 mb-6">
-        <div className="absolute inset-0 rounded-full border-2 border-primary/20" />
-        <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-primary animate-spin" />
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-10 space-y-8">
+      <div className="space-y-2">
+        <Skeleton className="h-8 w-72" />
+        <Skeleton className="h-4 w-full max-w-[28rem]" />
       </div>
-      <h3 className="font-serif text-xl text-foreground mb-2">
-        Building your strategy
-      </h3>
-      <div className="h-6 relative w-full max-w-sm">
-        {STAGES.map((s, i) => (
-          <p
-            key={s}
-            className="absolute inset-0 text-sm text-muted-foreground transition-opacity duration-700"
-            style={{ opacity: i === stage ? 1 : 0 }}
-          >
-            {s}
-          </p>
-        ))}
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-10">
+        <div className="space-y-4">
+          <Skeleton className="h-6 w-1/3" />
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-11/12" />
+          <Skeleton className="h-4 w-10/12" />
+          <Skeleton className="h-4 w-9/12" />
+          <Skeleton className="h-6 w-1/4 mt-8" />
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-10/12" />
+          <Skeleton className="h-4 w-8/12" />
+        </div>
+        <div className="space-y-3 rounded-xl border border-border bg-card/40 p-4">
+          <Skeleton className="h-5 w-1/2" />
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
+        </div>
       </div>
-      <p className="text-xs text-muted-foreground/60 mt-8 max-w-xs leading-relaxed">
-        This usually takes 15–30 seconds. We're enriching the brand profile and
-        composing a full strategy document.
-      </p>
+      <div className="space-y-1">
+        <p className="text-sm font-medium text-foreground" data-testid="strategy-generating-timer">
+          Usually takes 2–3 minutes
+        </p>
+        <p className="text-sm text-muted-foreground">
+          Building your strategy: {STAGES[stage]}
+        </p>
+      </div>
     </div>
   );
 }
