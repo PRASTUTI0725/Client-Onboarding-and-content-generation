@@ -85,3 +85,7 @@ artifacts/*.json
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+
+artifacts/api-server/mcp-prov-result.json
+artifacts/fixtures/
+artifacts/rc-candidate/
