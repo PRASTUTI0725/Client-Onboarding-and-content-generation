@@ -7,7 +7,7 @@ import {
   plannersTable,
   postsTable,
 } from "@workspace/db";
-import { eq, desc, asc } from "drizzle-orm";
+import { eq, and, desc, asc, sql } from "drizzle-orm";
 import { GenerateCalendarBody, UpdatePostBody } from "@workspace/api-zod";
 import { generateMonthlyPlan, type SowInput } from "../lib/planner/generate.js";
 import { randomUUID } from "node:crypto";
@@ -381,6 +381,22 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
         year: "numeric",
         timeZone: "UTC",
       });
+    const [{ count }] = await db
+      .select({ count: sql<number>`COUNT(*)::int` })
+      .from(plannersTable)
+      .where(
+        and(
+          eq(plannersTable.clientId, clientId),
+          eq(plannersTable.month, monthLabel),
+        ),
+      );
+    if (count >= 2) {
+      res.status(429).json({
+        error: "Calendar generation limit reached for this month.",
+        maxAttempts: 2,
+      });
+      return;
+    }
     const mcpConfig = getMcpConfigFromEnv();
     const mcpAvailable = isMcpAvailable(mcpConfig);
     const mcpInstagramHandle =
