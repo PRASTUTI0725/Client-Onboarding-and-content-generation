@@ -768,7 +768,7 @@ export async function buildBusinessDnaFromPublicSignals(params: {
       clearTimeout(timeout);
       if (response.ok) {
         websiteData = await response.text();
-        fetchedWebsite = extractWebsiteSignals(websiteData, response.url, params.name);
+        fetchedWebsite = extractWebsiteSignals(websiteData, url, params.name);
       } else {
         base.mcp.website = { ok: false, error: `HTTP ${response.status}` };
       }
@@ -983,12 +983,15 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     base.toneOfVoice.style.includes("reassuring") ? "fear-heavy language" : "",
     base.toneOfVoice.style.includes("clear") ? "buzzwords without specifics" : "",
   ]);
-  base.languageStyle.ctaStyle = uniqueStrings(websiteSignals?.conversionElements ?? []).join(", ");
+  base.languageStyle.ctaStyle = websiteSignals?.conversionElements?.length
+    ? "Direct CTA language present on site"
+    : "";
 
-  base.targetAudience.segments = uniqueStrings([
-    stringOrEmpty(enriched.target_audience && asRecord(enriched.target_audience)?.who),
-    ...splitSignals((asRecord(enriched.target_audience)?.who as unknown) ?? ""),
-  ]);
+  base.targetAudience.segments = uniqueStrings(
+    splitSignals(stringOrEmpty(
+      enriched.target_audience && asRecord(enriched.target_audience)?.who,
+    )),
+  );
   base.targetAudience.demographics = uniqueStrings([
     stringOrEmpty(asRecord(enriched.target_audience)?.age_range),
   ]);
@@ -997,7 +1000,7 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     /\bclarity|confidence|trust/.test(fullText.toLowerCase()) ? "certainty-seeking decision makers" : "",
     /\broutine|consisten/.test(fullText.toLowerCase()) ? "habit-building audiences" : "",
   ]);
-  base.targetAudience.geographies = uniqueStrings([safeUrlHostname(websiteSignals?.url)]);
+  base.targetAudience.geographies = [];
   base.targetAudience.pains = uniqueStrings([
     /\buncertain|confus|fear|hesitat/.test(fullText.toLowerCase()) ? "Uncertainty before purchase" : "",
     /\btime|busy/.test(fullText.toLowerCase()) ? "Time pressure" : "",
@@ -1026,14 +1029,19 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   base.positioning.marketAngle = firstNonEmpty(websiteSignals?.heroExcerpt, params.oneLineDescription);
   base.positioning.reasonToBelieve = uniqueStrings([
     ...websiteSignals?.trustElements ?? [],
-    ...splitSignals(enriched.price_range),
     /\btestimonial/.test(websiteSignals?.html?.toLowerCase() ?? "") ? "Testimonials present on site" : "",
   ]);
 
   base.offers.primaryOffers = uniqueStrings([stringOrEmpty(enriched.offer), params.oneLineDescription]);
-  base.offers.pricingSignals = splitSignals(enriched.price_range);
+  base.offers.pricingSignals = splitSignals(enriched.price_range).filter(
+    (s) => !/^\$[\d,]+/.test(s),
+  );
   base.offers.transformationPromise = firstNonEmpty(description, enriched.offer);
-  base.offers.urgencyStyle = uniqueStrings(websiteSignals?.conversionElements ?? []).join(", ");
+  base.offers.urgencyStyle = websiteSignals?.conversionElements?.some(
+    (c) => /book|consult|now|limited/i.test(c),
+  )
+    ? "Limited-time availability framing"
+    : "";
 
   base.contentStrategy.contentPillars = uniqueStrings([
     ...splitSignals((params.existing as Record<string, unknown> | null | undefined)?.content_patterns),
