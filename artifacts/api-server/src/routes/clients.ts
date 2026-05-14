@@ -3306,6 +3306,11 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
 
     req.log.info({ source: strategySource }, "Strategy generation source selected");
     res.setHeader("x-strategy-source", strategySource);
+    if (resolvedStrategyLlm) {
+      const info = resolvedStrategyLlm.describe?.() ?? { provider: "unknown", model: "default" };
+      res.setHeader("x-ai-provider", info.provider);
+      res.setHeader("x-ai-model", info.model);
+    }
     res.json({
       ...serializeStrategy(strategy),
       strategySource,

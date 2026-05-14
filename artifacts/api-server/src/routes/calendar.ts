@@ -763,6 +763,14 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
 
     req.log.info({ source: calendarSource }, "Calendar generation source selected");
     res.setHeader("x-calendar-source", calendarSource);
+    if (resolvedCalendarLlm) {
+      const info = resolvedCalendarLlm.describe?.() ?? { provider: "unknown", model: "default" };
+      res.setHeader("x-ai-provider", info.provider);
+      res.setHeader("x-ai-model", info.model);
+      // NOTE: These headers reflect the ENTRY provider in the fallback chain,
+      // not necessarily the provider that won. Exact provider tracing requires
+      // propagating the winning provider from FallbackProvider.chatCompletion().
+    }
     res.json({
       planner: serializePlanner(savedPlanner),
       posts: inserted.map(serializePost),
