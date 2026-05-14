@@ -93,6 +93,7 @@ type MemoryPost = {
 
 const memoryPlanners = new Map<string, MemoryPlanner>();
 const memoryPosts = new Map<string, MemoryPost[]>();
+const memoryCalendarGenerationCounts = new Map<string, number>();
 function estimateRequestBytes(value: unknown): number {
   if (value == null) return 0;
   try {
@@ -850,6 +851,12 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           year: "numeric",
           timeZone: "UTC",
         });
+      const attemptKey = `${clientId}:${monthLabel}`;
+      const prevAttempts = memoryCalendarGenerationCounts.get(attemptKey) ?? 0;
+      if (prevAttempts >= 2) {
+        res.status(429).json({ error: "Calendar generation limit reached for this month.", maxAttempts: 2 });
+        return;
+      }
       const generated = generateDemoCalendarPayload(clientId, monthAnchor, monthLabel, body);
       generated.posts = generated.posts.map((post) => enrichPostForExecution(post));
       let memD = { provider: "demo", model: "deterministic" };
@@ -879,6 +886,7 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       };
       memoryPlanners.set(clientId, plannerOut);
       memoryPosts.set(clientId, generated.posts);
+      memoryCalendarGenerationCounts.set(attemptKey, prevAttempts + 1);
       res.setHeader("x-calendar-source", "fallback");
       res.json({
         planner: plannerOut,
