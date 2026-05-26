@@ -9,6 +9,7 @@ import type { CalendarBrief, PlannerLayer } from "./generate.js";
 import { GroqRunTokenPacer } from "./groq-run-pacer.js";
 import {
   CALENDAR_WEEK_MAX_OUTPUT_GROQ,
+  CALENDAR_WEEK_SAFE_INPUT_GROQ,
   CALENDAR_WEEK_TARGET_INPUT_GROQ,
   calendarWeekStaggerMs,
   resolveCalendarMaxOutputTokens,
@@ -123,13 +124,15 @@ function buildFixturePlanner(): PlannerLayer {
   };
 }
 
-test("Groq weekly system + instruction overhead is under 450 tokens", () => {
+test("Groq weekly system + instruction overhead stays compact", () => {
   const overhead = estimateWeeklyPromptOverheadTokens("groq", 4);
-  assert.ok(overhead.totalFixedTokens <= 450, `fixed overhead too large: ${overhead.totalFixedTokens}`);
+  assert.ok(overhead.totalFixedTokens <= 200, `fixed overhead too large: ${overhead.totalFixedTokens}`);
+  assert.ok(overhead.instructionTokens <= 90, `instruction block too large: ${overhead.instructionTokens}`);
+  assert.ok(overhead.systemTokens <= 80, `system prompt too large: ${overhead.systemTokens}`);
   assert.ok(overhead.systemTokens < estimateWeeklyPromptOverheadTokens("openrouter", 4).systemTokens);
 });
 
-test("compact weekly prompt for 16-post fixture stays within Groq week target", () => {
+test("compact weekly prompt for 16-post fixture stays within Groq safe target", () => {
   const brief = buildFixtureBrief();
   const planner = buildFixturePlanner();
   const base = buildCompactCalendarContext(brief, 0);
@@ -151,6 +154,10 @@ test("compact weekly prompt for 16-post fixture stays within Groq week target", 
     });
     maxAfter = Math.max(maxAfter, compacted.afterTokens);
     assert.equal(compacted.overBudget, false, `week ${weekIndex + 1} still over budget: ${compacted.afterTokens}`);
+    assert.ok(
+      compacted.afterTokens <= CALENDAR_WEEK_SAFE_INPUT_GROQ,
+      `week ${weekIndex + 1} tokens ${compacted.afterTokens} exceed safe target ${CALENDAR_WEEK_SAFE_INPUT_GROQ}`,
+    );
     assert.ok(
       compacted.afterTokens <= CALENDAR_WEEK_TARGET_INPUT_GROQ,
       `week ${weekIndex + 1} tokens ${compacted.afterTokens}`,

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { estimateTokens, trimToTokenBudget } from "../llm/prompt-budget.js";
+import { normalizeCalendarProviderId } from "./provider-budget.js";
 import type { CalendarBrief, PlannerLayer } from "./generate.js";
 
 export type CalendarCompactionTier = 0 | 1 | 2 | 3;
@@ -320,6 +321,29 @@ export function applyWeekCompactionTier(
     next.weekAngleBank = Object.fromEntries(
       Object.entries(next.weekAngleBank).slice(0, 2).map(([key, values]) => [key, values.slice(0, 2)]),
     );
+    next.deliverables = [];
+    next.hardConstraints = next.hardConstraints.slice(0, 2).map((item) => capText(item, 48));
+    next.planningNotes = next.planningNotes.slice(0, 1).map((item) => capText(item, 48));
+    next.brand.tone = capText(next.brand.tone, 24);
+    next.brand.personality = "";
+    next.brand.positioning = capText(next.brand.positioning, 80);
+    next.brand.offer = capText(next.brand.offer, 48);
+    next.monthlyGoal = next.monthlyGoal ? capText(next.monthlyGoal, 48) : null;
+    next.audience.desires = [];
+    next.audience.pains = next.audience.pains.slice(0, 2).map((item) => capText(item, 48));
+    next.audience.segments = next.audience.segments.slice(0, 2).map((item) => capText(item, 48));
+    next.pillars = next.pillars.slice(0, 3).map((pillar) => ({
+      name: pillar.name,
+      ...(pillar.angle ? { angle: capText(pillar.angle, 40) } : {}),
+    }));
+    next.strategySummaries = {
+      contentMoves: capText(next.strategySummaries.contentMoves, 72),
+      platformRoles: "",
+      weeklyFlowHint: [],
+    };
+    next.platformCounts = next.weeklyPlatformTargets;
+    next.contentBuckets = next.bucketTargets;
+    next.proofConstraints.availableProofTypes = next.proofConstraints.availableProofTypes.slice(0, 2);
   }
   if (tier >= 3) {
     next.monthlyGoal = next.monthlyGoal ? capText(next.monthlyGoal, 48) : null;
@@ -372,6 +396,77 @@ export function applyWeekCompactionTier(
   return next;
 }
 
+const GROQ_SAFE_CLAIMS = [
+  "calm ritual",
+  "wind-down",
+  "alcohol-free fragrance",
+  "magnesium-infused scent",
+];
+
+const GROQ_FORBIDDEN_CLAIMS = [
+  "improve sleep",
+  "reduce stress",
+  "treat",
+  "heal",
+  "therapy",
+  "guaranteed",
+];
+
+/** Ultra-compact Groq week payload — only fields needed for valid skeleton generation. */
+export function buildGroqWeekBriefPayload(
+  context: CompactCalendarWeekContext,
+  tier: CalendarCompactionTier,
+): Record<string, unknown> {
+  const forbid = Array.from(
+    new Set([...context.proofConstraints.forbiddenTerms, ...GROQ_FORBIDDEN_CLAIMS]),
+  ).slice(0, tier >= 3 ? 4 : tier >= 2 ? 5 : 6);
+
+  const payload: Record<string, unknown> = {
+    brand: context.brand.name,
+    pos: capText(context.brand.positioning, tier >= 3 ? 56 : tier >= 2 ? 72 : 96),
+    aud: capList(
+      [...context.audience.segments, ...context.audience.pains],
+      tier >= 2 ? 2 : 3,
+      tier >= 2 ? 40 : 56,
+    ).join("; "),
+    pillars: context.pillars.slice(0, tier >= 2 ? 2 : 3).map((pillar) => pillar.name),
+    safe: GROQ_SAFE_CLAIMS.slice(0, tier >= 3 ? 3 : 4),
+    ban: forbid,
+    week: context.weekLabel,
+    req: context.requiredBuckets,
+    plat: context.weeklyPlatformTargets,
+    buckets: context.bucketTargets,
+    n: context.weeklyTotalPosts,
+    start: context.weekStartDate,
+    proof: {
+      a: context.proofConstraints.proofAssetsAvailable,
+      t: context.proofConstraints.testimonialStyleAllowed,
+      h: context.proofConstraints.healthClaimSafetyMode,
+    },
+  };
+
+  const focus = capText(context.weeklyFocus ?? context.executionPhase ?? "", tier >= 2 ? 40 : 56);
+  if (focus) payload.focus = focus;
+
+  if (tier === 0 && context.brand.offer) {
+    payload.offer = capText(context.brand.offer, 48);
+  }
+  if (context.productAnchors.length > 0 && tier < 3) {
+    payload.anchors = context.productAnchors.slice(0, tier >= 2 ? 1 : 2);
+  }
+  if (context.priorWeekThemes.length > 0) {
+    payload.prior = context.priorWeekThemes.slice(0, tier >= 2 ? 1 : 2);
+  }
+
+  return Object.fromEntries(
+    Object.entries(payload).filter(([, value]) => {
+      if (value === undefined || value === null || value === "") return false;
+      if (Array.isArray(value) && value.length === 0) return false;
+      return true;
+    }),
+  );
+}
+
 export function estimateCompactContextTokens(value: unknown): number {
   return estimateTokens(value);
 }
@@ -411,10 +506,17 @@ export function buildWeeklyPromptPartsFromCompact(
   brief: CompactCalendarWeekContext,
   targetCount: number,
   instructionBlock: string,
+  options?: { providerId?: string; compactionTier?: CalendarCompactionTier },
 ): Array<{ label: string; value: string }> {
+  const providerId = normalizeCalendarProviderId(options?.providerId);
+  const tier = options?.compactionTier ?? 0;
+  const briefJson =
+    providerId === "groq"
+      ? JSON.stringify(buildGroqWeekBriefPayload(brief, tier))
+      : JSON.stringify(brief);
   return [
     { label: "brief_header", value: "WEEKLY CALENDAR BRIEF:\n" },
-    { label: "brief_json", value: JSON.stringify(brief) },
+    { label: "brief_json", value: briefJson },
     { label: "instruction_header", value: "\n\n" },
     { label: "instruction_block", value: instructionBlock },
   ];

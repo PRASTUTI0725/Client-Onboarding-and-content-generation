@@ -35,8 +35,19 @@ Rules:
 - No commentary.`;
 
 /** Groq-safe compact system prompt — validator covers field rules. */
-export const WEEK_POSTS_SYSTEM_GROQ = `Return STRICT JSON: {"posts":[{"date","week","platform","pillar","topic","format","objective","hook","cta","strategicAngle","audienceTension","specificReference","proofMode","proofSource","claimSafetyNote","priority","status","repurposeTargets?}]}
-Skeleton posts only. Match brief requiredBuckets order. No captions/hashtags. Concise fields.`;
+export const WEEK_POSTS_SYSTEM_GROQ = `JSON:{"posts":[{"date","week","platform","pillar","topic","format","objective","hook","cta","strategicAngle","audienceTension","specificReference","proofMode","proofSource","claimSafetyNote","priority","status","repurposeTargets?}]}
+Match req bucket order. Non-empty topic/objective/hook/cta. Skeleton only.`;
+
+/** Ultra-compact semantic guard for Groq weekly generation. */
+export const CALENDAR_SEMANTIC_GUARD_GROQ_WEEKLY =
+  "SAFE: calm ritual,wind-down,alcohol-free,magnesium|FORBID: sleep fix,stress cure,treat,heal,therapy|HOOK: brand/product/ingredient/ritual|No fake reviews if proof.t=false";
+
+/** Compact semantic guard for repair prompts (separate budget). */
+export const CALENDAR_SEMANTIC_GUARD_REPAIR =
+  "SAFE: calm ritual,wind-down,alcohol-free|FORBID: sleep,stress,treat,heal,therapy|HOOK: brand/product/ritual|No fake reviews if disallowed";
+
+/** @deprecated Use CALENDAR_SEMANTIC_GUARD_GROQ_WEEKLY or CALENDAR_SEMANTIC_GUARD_REPAIR */
+export const CALENDAR_SEMANTIC_GUARD_COMPACT = CALENDAR_SEMANTIC_GUARD_REPAIR;
 
 export function resolveWeekPostsSystemPrompt(providerId: string): string {
   return normalizeCalendarProviderId(providerId) === "groq"
@@ -46,13 +57,7 @@ export function resolveWeekPostsSystemPrompt(providerId: string): string {
 
 export function buildWeeklyInstructionBlock(providerId: string, targetCount: number): string {
   if (normalizeCalendarProviderId(providerId) === "groq") {
-    return [
-      `Return exactly ${targetCount} posts.`,
-      "- Follow requiredBuckets order (post i uses requiredBuckets[i-1]).",
-      "- Use bucketTargets labels and weeklyPlatformTargets.",
-      "- Honor proofConstraints; no invented testimonials when disallowed.",
-      "- Keep topic/objective/hook/cta non-empty and brief-specific.",
-    ].join("\n");
+    return [`Exactly ${targetCount} posts; req order.`, CALENDAR_SEMANTIC_GUARD_GROQ_WEEKLY].join("\n");
   }
   return [
     `Return exactly ${targetCount} posts in JSON.`,

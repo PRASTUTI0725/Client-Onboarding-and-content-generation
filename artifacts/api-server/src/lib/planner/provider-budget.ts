@@ -9,6 +9,8 @@ export const CALENDAR_REPAIR_MAX_OUTPUT = 180;
 
 export const CALENDAR_PLANNER_TARGET_INPUT = 1200;
 export const CALENDAR_WEEK_TARGET_INPUT_GROQ = 1000;
+/** Groq weekly input target with headroom before hard limit (rate-limit / estimate drift). */
+export const CALENDAR_WEEK_SAFE_INPUT_GROQ = 880;
 export const CALENDAR_WEEK_TARGET_INPUT_DEFAULT = 1550;
 
 export type CalendarBudgetStage = "planner" | "week" | "repair";

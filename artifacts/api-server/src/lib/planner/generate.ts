@@ -41,7 +41,7 @@ import {
   enforceWeeklyInputBeforeProviderCall,
   isGroqRateLimitError,
 } from "./weekly-generation-budget.js";
-import { buildWeeklyInstructionBlock } from "./weekly-prompt.js";
+import { buildWeeklyInstructionBlock, CALENDAR_SEMANTIC_GUARD_REPAIR } from "./weekly-prompt.js";
 import type { BusinessDna } from "../business-dna.js";
 import type {
   InstagramSummary,
@@ -398,7 +398,8 @@ Rules:
 - strategicAngle, audienceTension, and specificReference should sharpen specificity rather than sounding poetic.
 - If proof assets are unavailable, do not invent testimonials, reviews, metrics, "people love", or "real results" language.
 - Use only approved client truths and safe wording.
-- Do not use treatment, cure, guaranteed results, eco-packaging, sustainability, clinical, or unsupported claims unless explicitly supported.`;
+- Do not use treatment, cure, guaranteed results, eco-packaging, sustainability, clinical, or unsupported claims unless explicitly supported.
+${CALENDAR_SEMANTIC_GUARD_REPAIR}`;
 
 const FIELD_REPAIR_SYSTEM = `You repair only the requested fields on monthly planning skeleton posts. Return STRICT JSON only:
 {
@@ -428,7 +429,41 @@ Rules:
 - Use strategicAngle, audienceTension, specificReference, proofMode, proofSource, and claimSafetyNote only when those fields are requested.
 - Do not use fake review, testimonial, result, or customer-favorite language when proof assets are absent.
 - Use only approved client truths and safe wording.
-- Do not invent unsupported claims, testimonials, sustainability angles, or medical/wellness guarantees.`;
+- Do not invent unsupported claims, testimonials, sustainability angles, or medical/wellness guarantees.
+${CALENDAR_SEMANTIC_GUARD_REPAIR}`;
+
+const CALENDAR_POST_REPAIR_CODES = [
+  "theme_invalid",
+  "objective_invalid",
+  "hook_invalid",
+  "cta_invalid",
+  "hook_generic",
+  "unsupported_claim",
+  "proof_contract_invalid",
+  "wellness_claim_invalid",
+  "business_type_mismatch",
+] as const;
+
+const CALENDAR_FIELD_REPAIR_CODES = [
+  "theme_invalid",
+  "objective_invalid",
+  "hook_invalid",
+  "cta_invalid",
+  "hook_generic",
+  "unsupported_claim",
+  "wellness_claim_invalid",
+  "proof_contract_invalid",
+] as const;
+
+const CALENDAR_MAX_POST_REPAIR_PASSES = 2;
+const CALENDAR_MAX_FIELD_REPAIR_PASSES = 2;
+
+function isCalendarIssueRepairable(
+  issues: Array<{ code: string; field: string }>,
+  allowedCodes: readonly string[],
+): boolean {
+  return issues.length > 0 && issues.every((issue) => allowedCodes.includes(issue.code));
+}
 
 export function buildCalendarBrief(input: BuildCalendarBriefInput): CalendarBrief {
   const businessDna = input.extraction?.businessDna ?? null;
@@ -2315,19 +2350,7 @@ async function validateAndRepairCalendarPosts(
     );
   }
   const repairableFailures: RepairRequest[] = initialFailures.filter((entry) =>
-    entry.issues.every((issue) =>
-      [
-        "theme_invalid",
-        "objective_invalid",
-        "hook_invalid",
-        "cta_invalid",
-        "hook_generic",
-        "unsupported_claim",
-        "proof_contract_invalid",
-        "wellness_claim_invalid",
-        "business_type_mismatch",
-      ].includes(issue.code),
-    ),
+    isCalendarIssueRepairable(entry.issues, CALENDAR_POST_REPAIR_CODES),
   );
   const unrecoverableFailures = initialFailures.filter((entry) => !repairableFailures.includes(entry));
   if (unrecoverableFailures.length > 0) {
@@ -2395,11 +2418,40 @@ async function validateAndRepairCalendarPosts(
   const repairProvider = resolveRepairProvider(provider);
   const repairProviderInfo = repairProvider.describe?.() ?? null;
   const repairCreditsState = await readRepairCreditsState(provider);
-  const repairedByModel = await repairInvalidCalendarPosts(repairableFailures, calendarBrief, repairProvider, {
-    runMode: CALENDAR_RELIABLE_MODE,
-    creditsStateBeforeRepair: repairCreditsState,
-  });
-  let merged = workingPosts.map((post, index) => repairedByModel.get(index) ?? post);
+  let merged = workingPosts;
+  let repairedByModel = new Map<number, CalendarPost>();
+  let postRepairPassCount = 0;
+  for (let pass = 0; pass < CALENDAR_MAX_POST_REPAIR_PASSES; pass += 1) {
+    const passFailures = merged
+      .map((post, index) => ({ index, post, issues: validateCalendarPost(post, calendarBrief) }))
+      .filter((entry) => entry.issues.length > 0);
+    const passRepairable = passFailures.filter((entry) =>
+      isCalendarIssueRepairable(entry.issues, CALENDAR_POST_REPAIR_CODES),
+    );
+    if (passRepairable.length === 0) break;
+    const passRequests: RepairRequest[] = passRepairable.map((entry) => {
+      const bucketEntry = repairableFailures.find((failure) => failure.index === entry.index);
+      return {
+        index: entry.index,
+        post: entry.post,
+        issues: entry.issues,
+        targetBucket: bucketEntry?.targetBucket,
+      };
+    });
+    const passRepaired = await repairInvalidCalendarPosts(passRequests, calendarBrief, repairProvider, {
+      runMode: CALENDAR_RELIABLE_MODE,
+      creditsStateBeforeRepair: repairCreditsState,
+    });
+    postRepairPassCount += 1;
+    for (const [index, post] of passRepaired.entries()) {
+      repairedByModel.set(index, post);
+    }
+    merged = merged.map((post, index) => passRepaired.get(index) ?? post);
+    const remaining = merged
+      .map((post, index) => ({ index, issues: validateCalendarPost(post, calendarBrief) }))
+      .filter((entry) => entry.issues.length > 0);
+    if (remaining.length === 0) break;
+  }
   let finalAggregateIssues = validateCalendarAggregate(merged, calendarBrief);
   let finalFailures = merged
     .map((post, index) => ({ index, issues: validateCalendarPost(post, calendarBrief) }))
@@ -2407,25 +2459,27 @@ async function validateAndRepairCalendarPosts(
   let fieldRepairAttempted = false;
   let fieldRepairSucceeded = false;
   let fieldRepairCount = 0;
-  const fieldRepairableFailures = finalFailures.filter((entry) =>
-    entry.issues.every((issue) =>
-      ["theme_invalid", "objective_invalid", "hook_invalid", "cta_invalid", "hook_generic"].includes(issue.code),
-    ),
-  );
-  if (fieldRepairableFailures.length > 0 && fieldRepairableFailures.length <= 4) {
+  for (let pass = 0; pass < CALENDAR_MAX_FIELD_REPAIR_PASSES; pass += 1) {
+    const fieldRepairableFailures = finalFailures.filter((entry) =>
+      isCalendarIssueRepairable(entry.issues, CALENDAR_FIELD_REPAIR_CODES),
+    );
+    if (fieldRepairableFailures.length === 0) break;
     fieldRepairAttempted = true;
     const fieldFixed = await repairInvalidCalendarFields(fieldRepairableFailures, merged, calendarBrief, repairProvider, {
       runMode: CALENDAR_RELIABLE_MODE,
       creditsStateBeforeRepair: repairCreditsState,
     });
-    fieldRepairCount = fieldFixed.size;
+    fieldRepairCount += fieldFixed.size;
     if (fieldFixed.size > 0) {
       merged = merged.map((post, index) => fieldFixed.get(index) ?? post);
       finalAggregateIssues = validateCalendarAggregate(merged, calendarBrief);
       finalFailures = merged
         .map((post, index) => ({ index, issues: validateCalendarPost(post, calendarBrief) }))
         .filter((entry) => entry.issues.length > 0);
-      fieldRepairSucceeded = finalFailures.length === 0 && finalAggregateIssues.length === 0;
+    }
+    if (finalFailures.length === 0 && finalAggregateIssues.length === 0) {
+      fieldRepairSucceeded = true;
+      break;
     }
   }
   const finalSummary = summarizeValidationEntries(finalFailures);
@@ -2544,12 +2598,24 @@ ${JSON.stringify(
       2,
     )}
 
-Return repaired fields for every listed post.`;
+Return repaired fields for every listed post. You MUST return one entry per index listed above.
+${CALENDAR_SEMANTIC_GUARD_REPAIR}`;
     const repairPromptHash = hashPreview(userPrompt);
     console.info(
       `[llm-observe] calendar.repair.batch index=${Math.floor(offset / batchSize) + 1} size=${batch.length} prompt_hash=${repairPromptHash}`,
     );
-    const parsed = await getCalendarJsonWithProviderFailover<{ posts?: Array<{
+    const batchRepaired = new Map<number, CalendarPost>();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const pending = attempt === 0
+        ? batch
+        : batch.filter((entry) => !batchRepaired.has(entry.index));
+      if (pending.length === 0) break;
+      const attemptPrompt = attempt === 0
+        ? userPrompt
+        : `${userPrompt}
+
+RETRY: previous response missed indexes ${pending.map((entry) => entry.index).join(", ")}. Return repaired posts for every missing index.`;
+      const parsed = await getCalendarJsonWithProviderFailover<{ posts?: Array<{
       index?: number;
       bucket?: string;
       theme?: string;
@@ -2567,13 +2633,13 @@ Return repaired fields for every listed post.`;
       maxOutputTokens: CALENDAR_REPAIR_MAX_OUTPUT,
       messages: [
         { role: "system", content: REPAIR_POSTS_SYSTEM },
-        { role: "user", content: userPrompt },
+        { role: "user", content: attemptPrompt },
       ],
     });
 
     for (const candidate of parsed.posts ?? []) {
       const index = typeof candidate.index === "number" ? candidate.index : -1;
-      const target = batch.find((entry) => entry.index === index);
+      const target = pending.find((entry) => entry.index === index);
       if (!target) continue;
       const repairedBucket = normalizePillarForCalendar(
         candidate.bucket ?? target.targetBucket ?? target.post.pillar,
@@ -2607,6 +2673,9 @@ Return repaired fields for every listed post.`;
         },
         calendarBrief,
       ));
+      batchRepaired.set(index, repaired.get(index)!);
+    }
+    if (batchRepaired.size >= batch.length) break;
     }
   }
   return repaired;
@@ -2656,20 +2725,32 @@ ${JSON.stringify(
             proofSource: readCalendarMetadata(post.metadata).proofSource ?? null,
             claimSafetyNote: readCalendarMetadata(post.metadata).claimSafetyNote ?? null,
           },
-          invalidFields: entry.issues
-            .map((issue) => issue.field),
+          invalidFields: entry.issues.map((issue) => issue.field),
+          issueCodes: entry.issues.map((issue) => issue.code),
         };
       }),
       null,
       2,
     )}
 
-Return only the repaired requested fields for each listed post.`;
+Return only the repaired requested fields for each listed post. You MUST return one entry per index listed above.
+${CALENDAR_SEMANTIC_GUARD_REPAIR}`;
     const promptHash = hashPreview(userPrompt);
     console.info(
       `[llm-observe] calendar.field_repair.batch index=${Math.floor(offset / batchSize) + 1} size=${batch.length} prompt_hash=${promptHash}`,
     );
-    const parsed = await getCalendarJsonWithProviderFailover<{ posts?: Array<{
+    const batchRepaired = new Map<number, CalendarPost>();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const pending = attempt === 0
+        ? batch
+        : batch.filter((entry) => !batchRepaired.has(entry.index));
+      if (pending.length === 0) break;
+      const attemptPrompt = attempt === 0
+        ? userPrompt
+        : `${userPrompt}
+
+RETRY: previous response missed indexes ${pending.map((entry) => entry.index).join(", ")}. Return repaired fields for every missing index.`;
+      const parsed = await getCalendarJsonWithProviderFailover<{ posts?: Array<{
       index?: number;
       theme?: string;
       objective?: string;
@@ -2683,18 +2764,18 @@ Return only the repaired requested fields for each listed post.`;
       claimSafetyNote?: string;
     }> }>(provider, {
       contextLabel: "calendar field repair",
-      maxOutputTokens: 120,
+      maxOutputTokens: CALENDAR_REPAIR_MAX_OUTPUT,
       messages: [
         { role: "system", content: FIELD_REPAIR_SYSTEM },
-        { role: "user", content: userPrompt },
+        { role: "user", content: attemptPrompt },
       ],
     });
     for (const candidate of parsed.posts ?? []) {
       const index = typeof candidate.index === "number" ? candidate.index : -1;
-      const target = batch.find((entry) => entry.index === index);
+      const target = pending.find((entry) => entry.index === index);
       if (!target) continue;
       const post = posts[index]!;
-      repaired.set(index, structurallyNormalizeCalendarPost(
+      const normalized = structurallyNormalizeCalendarPost(
         {
           ...post,
           angle: candidate.theme ?? post.angle,
@@ -2715,7 +2796,11 @@ Return only the repaired requested fields for each listed post.`;
           },
         },
         calendarBrief,
-      ));
+      );
+      repaired.set(index, normalized);
+      batchRepaired.set(index, normalized);
+    }
+    if (batchRepaired.size >= batch.length) break;
     }
   }
   return repaired;
@@ -2985,7 +3070,7 @@ function containsPlaceholderText(value: string): boolean {
 }
 
 function containsUnsupportedClaims(value: string): boolean {
-  return /\beco(?:-|\s)?friendly\b|\bsustainab(?:le|ility)\b|\beco(?:-|\s)?packag(?:e|ing)\b|\bgreener planet\b|\bclean[-\s]?label\b|\banxiety\b|\btreat(?:s|ing|ment)?\b|\bcure\b|\bfix(?:es|ing)?\b|\bguaranteed\b|\bphysiological\b/i.test(
+  return /\beco(?:-|\s)?friendly\b|\bsustainab(?:le|ility)\b|\beco(?:-|\s)?packag(?:e|ing)\b|\bgreener planet\b|\bclean[-\s]?label\b|\banxiety\b|\btreat(?:s|ing|ment)?\b|\bcure\b|\bfix(?:es|ing)?\b|\bguaranteed\b|\bphysiological\b|\bimprov(?:e|es|ing)\s+sleep\b|\b(?:reduce|reduces|reducing)\s+stress\b|\bstress\s+relief\b|\btherapeutic\b|\bheals?\b|\bhealing\b/i.test(
     value,
   );
 }
@@ -2997,7 +3082,7 @@ function usesDisallowedProofLanguage(value: string, calendarBrief: CalendarBrief
 
 function usesUnsafeWellnessClaim(value: string, calendarBrief: CalendarBrief): boolean {
   if (calendarBrief.safety.healthClaimSafetyMode !== "wellness_beauty_softened") return false;
-  return /\bnatural stress relief\b|\bhelps calm minds\b|\bfix(?:es|ing)? sleep\b|\bsee calm results\b|\bguaranteed relaxation\b/i.test(value);
+  return /\bnatural stress relief\b|\bhelps calm minds\b|\bfix(?:es|ing)? sleep\b|\bimprov(?:e|es|ing)\s+sleep\b|\b(?:reduce|reduces|reducing)\s+stress\b|\bstress\s+relief\b|\bsee calm results\b|\bguaranteed relaxation\b|\btherapeutic\b/i.test(value);
 }
 
 function seedFromPost(post?: Pick<CalendarPost, "date" | "platform" | "format">): number {

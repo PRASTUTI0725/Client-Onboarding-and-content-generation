@@ -12,6 +12,7 @@ import {
 import {
   resolveCalendarMaxOutputTokens,
   resolveCalendarTargetInputTokens,
+  CALENDAR_WEEK_SAFE_INPUT_GROQ,
 } from "./provider-budget.js";
 import {
   buildWeeklyInstructionBlock,
@@ -32,6 +33,12 @@ export type WeeklyCompactionResult = {
   overBudget: boolean;
 };
 
+function resolveWeekCompactionTarget(providerId: string): number {
+  return providerId === "groq"
+    ? CALENDAR_WEEK_SAFE_INPUT_GROQ
+    : resolveCalendarTargetInputTokens(providerId, "week");
+}
+
 function measureWeeklyPromptInput(
   label: string,
   providerId: string,
@@ -39,13 +46,17 @@ function measureWeeklyPromptInput(
   targetCount: number,
   systemPrompt: string,
   maxOutputTokens: number,
+  compactionTier: CalendarCompactionTier = 0,
 ): PromptBudgetStats {
   const instructionBlock = buildWeeklyInstructionBlock(providerId, targetCount);
   return buildPromptBudgetStats(
     label,
     [
       { label: "system", value: systemPrompt },
-      ...buildWeeklyPromptPartsFromCompact(brief, targetCount, instructionBlock),
+      ...buildWeeklyPromptPartsFromCompact(brief, targetCount, instructionBlock, {
+        providerId,
+        compactionTier,
+      }),
     ],
     resolveCalendarTargetInputTokens(providerId, "week"),
     maxOutputTokens,
@@ -58,6 +69,7 @@ export function compactWeeklyBriefForProvider(input: {
   providerId: string;
 }): WeeklyCompactionResult {
   const providerBudgetTarget = resolveCalendarTargetInputTokens(input.providerId, "week");
+  const compactionTarget = resolveWeekCompactionTarget(input.providerId);
   const systemPrompt = resolveWeekPostsSystemPrompt(input.providerId);
   const maxOutputTokens = resolveCalendarMaxOutputTokens({
     providerId: input.providerId,
@@ -72,6 +84,7 @@ export function compactWeeklyBriefForProvider(input: {
     input.targetCount,
     systemPrompt,
     maxOutputTokens,
+    0,
   );
 
   const buildResult = (
@@ -81,7 +94,10 @@ export function compactWeeklyBriefForProvider(input: {
     afterStats: PromptBudgetStats,
   ): WeeklyCompactionResult => {
     const instructionBlock = buildWeeklyInstructionBlock(input.providerId, input.targetCount);
-    const promptParts = buildWeeklyPromptPartsFromCompact(brief, input.targetCount, instructionBlock);
+    const promptParts = buildWeeklyPromptPartsFromCompact(brief, input.targetCount, instructionBlock, {
+      providerId: input.providerId,
+      compactionTier: tier,
+    });
     const prompt = promptParts.map((part) => part.value).join("");
     return {
       brief,
@@ -98,7 +114,7 @@ export function compactWeeklyBriefForProvider(input: {
     };
   };
 
-  if (beforeStats.estimatedInputTokens <= providerBudgetTarget) {
+  if (beforeStats.estimatedInputTokens <= compactionTarget) {
     return buildResult(input.brief, 0, [], beforeStats);
   }
 
@@ -122,10 +138,11 @@ export function compactWeeklyBriefForProvider(input: {
       input.targetCount,
       systemPrompt,
       maxOutputTokens,
+      step.tier,
     );
     compactionTier = step.tier;
     trimmedFields.push(step.label);
-    if (afterStats.estimatedInputTokens <= providerBudgetTarget) {
+    if (afterStats.estimatedInputTokens <= compactionTarget) {
       return buildResult(draft, compactionTier, trimmedFields, afterStats);
     }
   }
@@ -183,9 +200,13 @@ export function buildTier3WeekBrief(input: {
     input.targetCount,
     systemPrompt,
     maxOutputTokens,
+    3,
   );
   const instructionBlock = buildWeeklyInstructionBlock(input.providerId, input.targetCount);
-  const promptParts = buildWeeklyPromptPartsFromCompact(tier3Brief, input.targetCount, instructionBlock);
+  const promptParts = buildWeeklyPromptPartsFromCompact(tier3Brief, input.targetCount, instructionBlock, {
+    providerId: input.providerId,
+    compactionTier: 3,
+  });
   return {
     brief: tier3Brief,
     beforeTokens: afterStats.estimatedInputTokens,
