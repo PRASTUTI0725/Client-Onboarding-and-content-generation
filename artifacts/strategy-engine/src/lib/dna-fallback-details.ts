@@ -35,6 +35,10 @@ export function readDnaFallbackDetails(meta: {
       fallbackReason?: string | null;
       failureStage?: string | null;
       providerAttempts?: ProviderAttemptSummary[];
+      estimatedInputTokens?: number | null;
+      maxOutputTokens?: number | null;
+      estimatedTotalTokens?: number | null;
+      compactionTier?: number | null;
     };
   };
 } | null | undefined): DnaFallbackDetails {

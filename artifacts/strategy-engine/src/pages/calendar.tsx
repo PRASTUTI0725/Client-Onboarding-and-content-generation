@@ -1237,10 +1237,6 @@ function CalendarGenerationBanner({
       weekRetryCount?: number | null;
       beforeCompactionTokens?: number | null;
       afterCompactionTokens?: number | null;
-      failedWeekIndex?: number | null;
-      cumulativeEstimatedGroqTokens?: number | null;
-      delayMsApplied?: number | null;
-      weekRetryCount?: number | null;
       codePath?: string | null;
       requestedProvider?: string | null;
       resolvedProvider?: string | null;
@@ -1263,6 +1259,7 @@ function CalendarGenerationBanner({
     plannerBudget?: Record<string, unknown> | null;
     weeklyBriefHashes?: Array<Record<string, unknown>> | null;
     weekConcurrency?: number | null;
+    weekStaggerMs?: number | null;
     calendarGenerationTrace?: Record<string, unknown> | null;
     codePath?: string | null;
   } | null;

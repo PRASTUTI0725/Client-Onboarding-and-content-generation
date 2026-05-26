@@ -35,9 +35,16 @@ export const pool = new Pool({
 
 pool.on("error", (err) => {
   // Prevent idle pg-pool connection resets from taking down the API process.
+  const errorCode =
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    typeof (err as { code?: unknown }).code === "string"
+      ? (err as { code: string }).code
+      : undefined;
   console.error("[db] pooled connection error", {
     message: err.message,
-    code: err.code,
+    code: errorCode,
     name: err.name,
   });
 });
