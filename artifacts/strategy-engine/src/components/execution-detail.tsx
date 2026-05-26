@@ -90,18 +90,18 @@ export function ExecutionDetail({ detail }: Props) {
   if (detail.formatKind === "static" && detail.staticExecution) {
     return (
       <div className="grid gap-3 md:grid-cols-2" data-testid="post-detail-static-execution">
-        <DetailCard label="Headline" accent>
+        <DetailCard label={detail.isPinterestPin ? "Pin headline" : "Headline"} accent>
           <p className="text-sm leading-relaxed text-foreground/90">
             {detail.staticExecution.headline}
           </p>
         </DetailCard>
-        <DetailCard label="Visual direction">
+        <DetailCard label={detail.isPinterestPin ? "Pin visual direction" : "Visual direction"}>
           <p className="text-sm leading-relaxed text-foreground/85">
             {detail.staticExecution.visualDirection}
           </p>
         </DetailCard>
         <div className="md:col-span-2">
-          <DetailCard label="Posting caption">
+          <DetailCard label={detail.isPinterestPin ? "Pin description" : "Posting caption"}>
             <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground/85">
               {detail.staticExecution.caption}
             </p>

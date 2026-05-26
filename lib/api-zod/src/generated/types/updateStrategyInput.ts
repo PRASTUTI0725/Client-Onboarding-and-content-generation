@@ -11,5 +11,6 @@ import type { UpdateStrategyInputStructuredStrategy } from "./updateStrategyInpu
 export interface UpdateStrategyInput {
   strategyDocument?: string;
   structuredStrategy?: UpdateStrategyInputStructuredStrategy;
+  templateType?: string;
   status?: UpdateStrategyInputStatus;
 }

@@ -11,12 +11,16 @@
     "moduleResolution": "bundler",
     "types": ["node", "vite/client"],
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@workspace/research-brief": ["../../lib/research-brief/src/index.ts"]
     }
   },
   "references": [
     {
       "path": "../../lib/api-client-react"
+    },
+    {
+      "path": "../../lib/research-brief"
     }
   ]
 }

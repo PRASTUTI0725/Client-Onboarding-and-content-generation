@@ -3,6 +3,7 @@ type AnyRecord = Record<string, unknown>;
 export interface BuildPostDetailInput {
   format: string;
   platform: string;
+  activePlatforms?: string[] | null;
   pillar: string;
   objective: string;
   hook: string;
@@ -17,24 +18,37 @@ export interface BuildPostDetailInput {
 }
 
 export interface BuildPostDetailResult {
-  caption: string;
-  hashtags: string[];
+  caption: string | null;
+  hashtags: string[] | null;
   execution: Record<string, unknown>;
 }
 
-export function buildPostDetailPayload(input: BuildPostDetailInput): BuildPostDetailResult {
+export interface BuildPostDetailOptions {
+  includeCopy?: boolean;
+}
+
+export function buildPostDetailPayload(
+  input: BuildPostDetailInput,
+  options: BuildPostDetailOptions = {},
+): BuildPostDetailResult {
+  const includeCopy = options.includeCopy !== false;
   const execution = asRecord(input.execution);
   const formatKind = detectFormatKind(input.format);
-  const caption = normalizeCaption(input, execution);
-  const hashtagGroups = normalizeHashtagGroups(input, execution);
-  const flatHashtags = [
-    ...hashtagGroups.niche,
-    ...hashtagGroups.problem,
-    ...hashtagGroups.broad,
-  ];
+  const caption = includeCopy ? normalizeCaption(input, execution) : null;
+  const hashtagGroups = includeCopy ? normalizeHashtagGroups(input, execution) : null;
+  const flatHashtags = hashtagGroups
+    ? [
+        ...hashtagGroups.niche,
+        ...hashtagGroups.problem,
+        ...hashtagGroups.broad,
+      ]
+    : null;
 
   const detail: Record<string, unknown> = {
     format_style: readString(execution.format_style) ?? input.format,
+    ...(Array.isArray(input.activePlatforms) && input.activePlatforms.length > 0
+      ? { active_platforms: input.activePlatforms }
+      : {}),
     production_effort:
       normalizeProductionEffort(readString(execution.production_effort)) ??
       inferProductionEffort(input.priority, formatKind),
@@ -42,15 +56,23 @@ export function buildPostDetailPayload(input: BuildPostDetailInput): BuildPostDe
     shoot_type: readString(execution.shoot_type) ?? inferShootType(formatKind),
     caption: {
       structure: ["hook", "context", "value", "cta"],
-      text: caption,
+      ...(caption ? { text: caption } : {}),
     },
-    hashtags: hashtagGroups,
     conversion_path: normalizeConversionPath(input, execution),
-    repurpose_plan: normalizeRepurposePlan(input.platform, input.format, formatKind, execution),
+    repurpose_plan: normalizeRepurposePlan(
+      input.platform,
+      input.format,
+      formatKind,
+      execution,
+      input.activePlatforms,
+    ),
     timeline: normalizeTimeline(execution),
     dependencies: normalizeDependencies(formatKind, execution),
     feedback_structure: normalizeFeedbackStructure(formatKind, execution),
   };
+  if (hashtagGroups) {
+    detail.hashtags = hashtagGroups;
+  }
 
   if (formatKind === "reel") {
     detail.reel_execution = normalizeReelExecution(input, execution);
@@ -62,7 +84,7 @@ export function buildPostDetailPayload(input: BuildPostDetailInput): BuildPostDe
     detail.story_execution = normalizeStoryExecution(input, execution);
   }
   if (formatKind === "static") {
-    detail.static_execution = normalizeStaticExecution(input, execution, caption);
+    detail.static_execution = normalizeStaticExecution(input, execution, caption ?? "");
   }
 
   return {
@@ -163,76 +185,96 @@ function normalizeRepurposePlan(
   format: string,
   formatKind: FormatKind,
   execution: AnyRecord,
+  activePlatforms?: string[] | null,
 ): string[] {
   const plan = readStringArray(execution.repurpose_plan);
   if (plan.length > 0) return plan;
   const explicitTargets = readStringArray(execution.repurpose_targets);
   if (explicitTargets.length > 0) {
-    return explicitTargets.map((target) => `Repurpose this ${format} for ${target}.`);
+    return explicitTargets
+      .filter((target) => isAllowedRepurposeTarget(target, platform, activePlatforms, execution))
+      .map((target) => `Repurpose this ${format} for ${target}.`);
   }
-  const platformPlan = defaultRepurposeTargets(platform, format);
+  const platformPlan = defaultRepurposeTargets(platform, format, activePlatforms, execution);
   if (platformPlan.length > 0) return platformPlan;
 
   if (formatKind === "reel") {
     return [
       "Turn the hook and strongest proof beat into a 3-frame story set with poll + DM CTA.",
       "Pull the spoken breakdown into a 6-slide carousel for saves and shares.",
-      "Cut the proof segment into a short paid ad variation for retargeting warm viewers.",
+      "Cut the proof segment into a short organic story or reel variation for warm followers.",
     ];
   }
   if (formatKind === "carousel") {
     return [
       "Turn each slide headline into a talking-point reel with matching on-screen text.",
       "Use slides 1, 3, and 6 as a story sequence with a question sticker on the middle frame.",
-      "Adapt the problem + solution slides into retargeting ad creative for high-intent visitors.",
+      "Adapt the problem + solution slides into an organic follow-up post for high-intent viewers.",
     ];
   }
   if (formatKind === "story") {
     return [
       "Turn the best-performing frame into a static feed post with the same hook.",
-      "Expand the proof frame into a short reel using testimonial clips or voiceover.",
+      "Expand the reassurance or FAQ frame into a short reel using product shots or voiceover.",
       "Reuse the poll/question responses to shape a follow-up conversion carousel.",
     ];
   }
   return [
     "Use the headline as the opening frame of a story sequence with a direct response sticker.",
     "Expand the caption into a short talking-head reel with the same promise and CTA.",
-    "Reuse the visual and headline in paid retargeting creative for warm audiences.",
+    "Reuse the visual and headline in an organic reminder post for warm audiences.",
   ];
 }
 
-function defaultRepurposeTargets(platform: string, format: string): string[] {
+function defaultRepurposeTargets(
+  platform: string,
+  format: string,
+  activePlatforms?: string[] | null,
+  execution?: AnyRecord,
+): string[] {
   const normalizedPlatform = platform.trim().toLowerCase();
   const normalizedFormat = format.trim();
+  const scopedPlatforms = resolveScopedPlatforms(platform, activePlatforms, execution);
+  const peerPlatforms = scopedPlatforms.filter((candidate) => candidate !== platform);
+
   if (normalizedPlatform.includes("instagram")) {
-    return [
-      `Turn this ${normalizedFormat} into a LinkedIn carousel with the same core lesson.`,
-      "Pull the strongest proof beat into an X thread that points to the next step.",
+    const out = [
+      "Turn the hook into a 3-frame Instagram story sequence with a reply or DM prompt.",
+      format.toLowerCase().includes("reel")
+        ? "Adapt the strongest beat into an Instagram carousel with save-friendly text slides."
+        : "Expand the core idea into an Instagram reel with quick product or ritual b-roll.",
     ];
-  }
-  if (normalizedPlatform.includes("linkedin")) {
-    return [
-      `Adapt the core idea into an Instagram carousel that feels lighter and more swipe-friendly.`,
-      "Turn the sharpest point into an X text post or thread for more reach.",
-    ];
-  }
-  if (normalizedPlatform === "x" || normalizedPlatform.includes("twitter")) {
-    return [
-      "Expand the best point into a LinkedIn text post with more context and proof.",
-      "Convert the hook into an Instagram story sequence with a reply CTA.",
-    ];
+    if (peerPlatforms.includes("Pinterest")) {
+      out.push(
+        normalizedFormat.toLowerCase().includes("reel")
+          ? "Adapt the main takeaway into a Pinterest video pin with a save-first headline."
+          : "Rework the core idea into a Pinterest static pin with a vertical save-friendly layout.",
+      );
+    }
+    return out.slice(0, 3);
   }
   if (normalizedPlatform.includes("pinterest")) {
-    return [
-      "Reuse the visual direction in an Instagram static or carousel for saves and shares.",
-      "Turn the takeaway into a LinkedIn carousel or PDF guide.",
+    const out = [
+      "Turn the pin headline into a second saveable Pinterest variation with a new visual angle.",
     ];
+    if (peerPlatforms.includes("Instagram")) {
+      out.push(
+        normalizedFormat.toLowerCase().includes("video")
+          ? "Adapt this video pin into an Instagram reel with the same ritual or product takeaway."
+          : "Turn this pin into an Instagram carousel or static post with the same core theme.",
+      );
+      out.push("Use the strongest pin insight as an Instagram story set with a reply CTA.");
+    }
+    return out.slice(0, 3);
+  }
+  if (normalizedPlatform.includes("linkedin")) {
+    return ["Adapt this idea into a shorter LinkedIn follow-up post that sharpens the takeaway."];
+  }
+  if (normalizedPlatform === "x" || normalizedPlatform.includes("twitter")) {
+    return ["Extend the strongest point into a short follow-up thread or image post."];
   }
   if (normalizedPlatform.includes("youtube")) {
-    return [
-      "Cut the strongest moment into an Instagram reel or story teaser.",
-      "Turn the lesson into a LinkedIn text post or carousel recap.",
-    ];
+    return ["Cut the strongest moment into a shorter teaser or recap variation on YouTube."];
   }
   return [];
 }
@@ -270,17 +312,21 @@ function normalizeReelExecution(input: BuildPostDetailInput, execution: AnyRecor
   const reel = asRecord(execution.reel_execution);
   const legacyBeats = readStringArray(execution.beats);
   const flow = readStringArray(reel.flow);
+  const isPinterestVideoPin =
+    input.platform.trim().toLowerCase().includes("pinterest") || input.format.trim().toLowerCase().includes("video pin");
 
   return {
     hook_line: readString(reel.hook_line) ?? readString(execution.hook_2s) ?? input.hook,
-    flow: flow.length > 0 ? flow : ["problem", "insight", "breakdown", "proof", "cta"],
+    flow: flow.length > 0 ? flow : isPinterestVideoPin ? ["hook", "benefit", "ritual", "proof", "cta"] : ["problem", "insight", "breakdown", "proof", "cta"],
     script:
       readString(reel.script) ??
       buildFallbackReelScript(input, legacyBeats, readString(execution.pattern_interrupt)),
     visual_direction:
       readString(reel.visual_direction) ??
       readString(execution.visual_direction) ??
-      "Open on the founder or product in use, cut to close-ups that demonstrate the promise, then show one proof or result moment before the CTA frame.",
+      (isPinterestVideoPin
+        ? "Open with the product or ritual setup in a vertical frame, use clean text overlays for 2-3 benefit points, cut to close-ups of the product in use, and end on a save-worthy CTA card."
+        : "Open on the product or ritual in use, cut to close-ups that demonstrate the promise, then show one reassurance or proof moment before the CTA frame."),
     editing_style:
       readString(reel.editing_style) ??
       buildEditingStyle(execution),
@@ -303,7 +349,7 @@ function normalizeCarouselExecution(input: BuildPostDetailInput, execution: AnyR
   return {
     slides: [
       { slide: 1, type: "hook", text: input.hook },
-      { slide: 2, type: "problem", text: `Why the current approach keeps ${input.objective.toLowerCase()} harder than it needs to be.` },
+      { slide: 2, type: "problem", text: "Name the exact friction, hesitation, or belief that keeps the audience stuck." },
       { slide: 3, type: "insight", text: trimSentence(input.strategicIntent || "Introduce the smarter angle that reframes the problem.") },
       { slide: 4, type: "example", text: trimSentence(input.expectedReason || "Show one practical example or proof point that makes the insight believable.") },
       { slide: 5, type: "solution", text: `Show the concrete solution, process, or product move that makes the audience say, "This is what I should do next."` },
@@ -339,7 +385,7 @@ function normalizeStoryExecution(input: BuildPostDetailInput, execution: AnyReco
       {
         frame: 3,
         type: "proof",
-        text: trimSentence(input.expectedReason || "Add one proof line, mini result, or credibility signal."),
+        text: trimSentence(input.expectedReason || "Add one reassurance line, buyer question, or credibility signal."),
       },
       {
         frame: 4,
@@ -416,7 +462,7 @@ function inferDuration(formatKind: FormatKind): string {
 }
 
 function inferShootType(formatKind: FormatKind): string {
-  if (formatKind === "reel") return "Founder-led talking head with supporting b-roll";
+  if (formatKind === "reel") return "Product-led vertical video with ritual shots, text overlays, and supporting b-roll";
   if (formatKind === "story") return "Fast mobile-first capture with direct response overlays";
   if (formatKind === "carousel") return "Design-led narrative using screenshots, proof, and clean text slides";
   if (formatKind === "static") return "Single strong hero visual with premium art direction";
@@ -559,4 +605,43 @@ function readStringArray(value: unknown): string[] {
 
 function readNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function resolveScopedPlatforms(
+  platform: string,
+  activePlatforms?: string[] | null,
+  execution?: AnyRecord,
+): string[] {
+  const source = Array.isArray(activePlatforms) && activePlatforms.length > 0
+    ? activePlatforms
+    : readStringArray(execution?.active_platforms);
+  const normalized = Array.from(
+    new Set(source.map((value) => normalizePlatformName(value)).filter(Boolean)),
+  );
+  if (normalized.length === 0) return [normalizePlatformName(platform)];
+  if (!normalized.includes(normalizePlatformName(platform))) {
+    normalized.unshift(normalizePlatformName(platform));
+  }
+  return normalized;
+}
+
+function isAllowedRepurposeTarget(
+  target: string,
+  platform: string,
+  activePlatforms?: string[] | null,
+  execution?: AnyRecord,
+): boolean {
+  const scopedPlatforms = resolveScopedPlatforms(platform, activePlatforms, execution);
+  const targetPlatform = normalizePlatformName(target.split("-")[0] ?? "");
+  return scopedPlatforms.includes(targetPlatform);
+}
+
+function normalizePlatformName(value: string): string {
+  const raw = value.trim().toLowerCase();
+  if (raw === "x" || raw.includes("twitter")) return "X";
+  if (raw.includes("linkedin")) return "LinkedIn";
+  if (raw.includes("pinterest")) return "Pinterest";
+  if (raw.includes("youtube")) return "YouTube";
+  if (raw.includes("instagram")) return "Instagram";
+  return value.trim();
 }

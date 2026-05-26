@@ -5,6 +5,8 @@ let aiFallbackUsed = false;
 let lastDebugAiFailure: Record<string, unknown> | null = null;
 let latestAiUsage: Record<string, unknown> | null = null;
 let latestOpenRouterCredits: Record<string, unknown> | null = null;
+let latestProviderAttempts: Record<string, unknown>[] = [];
+let lastFailureStage: string | null = null;
 
 export function recordDebugAiFailure(f: Record<string, unknown>) {
   lastDebugAiFailure = f;
@@ -31,6 +33,22 @@ export function setLatestOpenRouterCredits(credits: Record<string, unknown> | nu
 
 export function getLatestOpenRouterCredits(): Record<string, unknown> | null {
   return latestOpenRouterCredits;
+}
+
+export function setLatestProviderAttempts(attempts: Record<string, unknown>[]) {
+  latestProviderAttempts = attempts.map((attempt) => ({ ...attempt }));
+}
+
+export function getLatestProviderAttempts(): Record<string, unknown>[] {
+  return latestProviderAttempts.map((attempt) => ({ ...attempt }));
+}
+
+export function setLastFailureStage(stage: string | null) {
+  lastFailureStage = stage;
+}
+
+export function getLastFailureStage(): string | null {
+  return lastFailureStage;
 }
 
 export function markFallbackUsed() {

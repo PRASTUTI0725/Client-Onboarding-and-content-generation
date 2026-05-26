@@ -54,6 +54,7 @@ export default defineConfig(({ mode }) => {
       alias: {
         "@": path.resolve(import.meta.dirname, "src"),
         "@assets": path.resolve(import.meta.dirname, "..", "..", "attached_assets"),
+        "@workspace/research-brief": path.resolve(import.meta.dirname, "..", "..", "lib", "research-brief", "src", "index.ts"),
       },
       dedupe: ["react", "react-dom"],
     },

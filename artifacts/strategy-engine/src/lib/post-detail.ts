@@ -12,10 +12,14 @@ export interface PostDetailSource {
   expectedMetric?: string | null;
   expectedReason?: string | null;
   execution?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
 }
 
 export interface NormalizedPostDetail {
   formatKind: "reel" | "carousel" | "story" | "static" | "other";
+  isSkeletonPlan: boolean;
+  isPinterestPin: boolean;
+  theme: string;
   overview: Array<{ label: string; value: string }>;
   decision: {
     whyThisExists: string;
@@ -64,20 +68,27 @@ type AnyRecord = Record<string, unknown>;
 export function normalizePostDetail(post: PostDetailSource): NormalizedPostDetail {
   const execution = asRecord(post.execution);
   const formatKind = detectFormatKind(post.format);
+  const isSkeletonPlan = readString(execution.planning_stage) === "monthly_skeleton";
+  const isPinterestPin = post.platform.toLowerCase().includes("pinterest");
+  const theme = readTheme(post);
   const caption = normalizeCaption(post, execution);
   const hashtags = normalizeHashtags(post, execution);
   const timeline = normalizeTimeline(execution);
 
   return {
     formatKind,
+    isSkeletonPlan,
+    isPinterestPin,
+    theme,
     overview: [
       { label: "Format style", value: readString(execution.format_style) ?? post.format },
       {
         label: "Production effort",
         value: readString(execution.production_effort) ?? inferProductionEffort(formatKind),
       },
-      { label: "Duration", value: readString(execution.duration) ?? inferDuration(formatKind) },
+      { label: primaryMetricLabel(formatKind), value: readString(execution.duration) ?? inferDuration(formatKind) },
       { label: "Shoot type", value: readString(execution.shoot_type) ?? inferShootType(formatKind) },
+      { label: "Theme", value: theme },
     ],
     decision: {
       whyThisExists:
@@ -114,6 +125,17 @@ function detectFormatKind(format: string): NormalizedPostDetail["formatKind"] {
 
 function normalizeCaption(post: PostDetailSource, execution: AnyRecord) {
   const captionRecord = asRecord(execution.caption);
+  if (readString(execution.planning_stage) === "monthly_skeleton") {
+    return {
+      structure: ["hook", "topic", "objective", "cta"],
+      text: [
+        `Hook: ${post.hook || "Not set yet"}`,
+        `Topic: ${post.angle || "Not set yet"}`,
+        `Objective: ${post.objective || "Not set yet"}`,
+        `CTA direction: ${post.cta || "Not set yet"}`,
+      ].join("\n\n"),
+    };
+  }
   const text =
     readString(captionRecord.text) ??
     readString(post.caption) ??
@@ -125,7 +147,24 @@ function normalizeCaption(post: PostDetailSource, execution: AnyRecord) {
   };
 }
 
+function readTheme(post: PostDetailSource): string {
+  const metadata = asRecord(post.metadata);
+  return (
+    readString(metadata.theme) ??
+    readString(post.angle) ??
+    readString(post.objective) ??
+    "Theme unavailable"
+  );
+}
+
 function normalizeHashtags(post: PostDetailSource, execution: AnyRecord) {
+  if (readString(execution.planning_stage) === "monthly_skeleton") {
+    return {
+      niche: [],
+      problem: [],
+      broad: [],
+    };
+  }
   const groups = asRecord(execution.hashtags);
   const niche = readStringArray(groups.niche);
   const problem = readStringArray(groups.problem);
@@ -170,23 +209,26 @@ function normalizeRepurposePlan(
   const plan = readStringArray(execution.repurpose_plan);
   if (plan.length > 0) return plan;
   const explicitTargets = readStringArray(execution.repurpose_targets);
+  const activePlatforms = resolveActivePlatforms(platform, execution);
   if (explicitTargets.length > 0) {
-    return explicitTargets.map((target) => `Repurpose this ${format} for ${target}.`);
+    return explicitTargets
+      .filter((target) => activePlatforms.includes(normalizePlatformName(target.split("-")[0] ?? "")))
+      .map((target) => `Repurpose this ${format} for ${target}.`);
   }
-  const platformPlan = defaultRepurposeTargets(platform, format);
+  const platformPlan = defaultRepurposeTargets(platform, format, activePlatforms);
   if (platformPlan.length > 0) return platformPlan;
   if (formatKind === "reel") {
     return [
       "Break the hook and proof beat into a 3-frame story sequence.",
       "Turn the spoken points into a save-friendly carousel.",
-      "Cut the proof section into a warm-audience ad variation.",
+      "Cut the proof section into an organic warm-audience story or reel variation.",
     ];
   }
   if (formatKind === "carousel") {
     return [
       "Turn each slide headline into a talking-point reel outline.",
       "Use the strongest two slides as story frames with a response sticker.",
-      "Reuse problem/solution slides in retargeting ads.",
+      "Reuse problem/solution slides in an organic follow-up post.",
     ];
   }
   if (formatKind === "story") {
@@ -199,42 +241,52 @@ function normalizeRepurposePlan(
   return [
     "Turn the headline into a short story hook with a direct response sticker.",
     "Expand the caption into a short talking-head reel.",
-    "Reuse the visual in warm-audience ad creative.",
+    "Reuse the visual in an organic warm-audience reminder post.",
   ];
 }
 
-function defaultRepurposeTargets(platform: string, format: string): string[] {
+function defaultRepurposeTargets(platform: string, format: string, activePlatforms: string[]): string[] {
   const normalizedPlatform = platform.trim().toLowerCase();
   const normalizedFormat = format.trim();
   if (normalizedPlatform.includes("instagram")) {
-    return [
-      `Turn this ${normalizedFormat} into a LinkedIn carousel with the same core lesson.`,
-      "Pull the strongest proof beat into an X thread that points to the next step.",
+    const out = [
+      "Turn the hook into a 3-frame Instagram story sequence with a reply CTA.",
+      normalizedFormat.toLowerCase().includes("reel")
+        ? "Adapt the main takeaway into an Instagram carousel with save-friendly text slides."
+        : "Expand the core idea into an Instagram reel with product or ritual visuals.",
     ];
+    if (activePlatforms.includes("Pinterest")) {
+      out.push(
+        normalizedFormat.toLowerCase().includes("reel")
+          ? "Adapt the strongest beat into a Pinterest video pin with a save-worthy headline."
+          : "Rework the core idea into a Pinterest static pin with a vertical save-friendly layout.",
+      );
+    }
+    return out.slice(0, 3);
   }
-  if (normalizedPlatform.includes("linkedin")) {
-    return [
-      "Adapt the same idea into an Instagram carousel that feels lighter and more swipeable.",
-      "Turn the sharpest point into an X text post or thread for reach.",
-    ];
+  if (normalizedPlatform.includes("pinterest")) {
+    const out = ["Create a second saveable Pinterest variation with a new visual angle."];
+    if (activePlatforms.includes("Instagram")) {
+      out.push(
+        normalizedFormat.toLowerCase().includes("video")
+          ? "Adapt this video pin into an Instagram reel with the same ritual or product takeaway."
+          : "Turn this pin into an Instagram carousel or static post with the same core theme.",
+      );
+      out.push("Use the main pin idea as an Instagram story set with a reply CTA.");
+    }
+    return out.slice(0, 3);
   }
   if (normalizedPlatform === "x" || normalizedPlatform.includes("twitter")) {
     return [
-      "Expand the best point into a LinkedIn text post with more context and proof.",
-      "Convert the hook into an Instagram story sequence with a reply CTA.",
+      "Expand the strongest point into a short follow-up thread or image post.",
+      "Reuse the hook in another X-native variation aimed at replies or bookmarks.",
     ];
   }
-  if (normalizedPlatform.includes("pinterest")) {
-    return [
-      "Reuse the visual direction in an Instagram static or carousel for saves and shares.",
-      "Turn the takeaway into a LinkedIn carousel or PDF guide.",
-    ];
+  if (normalizedPlatform.includes("linkedin")) {
+    return ["Adapt the same idea into a shorter LinkedIn follow-up post with a sharper takeaway."];
   }
   if (normalizedPlatform.includes("youtube")) {
-    return [
-      "Cut the strongest moment into an Instagram reel or story teaser.",
-      "Turn the lesson into a LinkedIn text post or carousel recap.",
-    ];
+    return ["Cut the strongest moment into a shorter teaser or recap variation on YouTube."];
   }
   return [];
 }
@@ -281,11 +333,16 @@ function normalizeFeedback(
 
 function normalizeReelExecution(post: PostDetailSource, execution: AnyRecord) {
   const reel = asRecord(execution.reel_execution);
+  const isPinterestVideoPin =
+    post.platform.toLowerCase().includes("pinterest") &&
+    post.format.toLowerCase().includes("video pin");
   return {
     hookLine: readString(reel.hook_line) ?? readString(execution.hook_2s) ?? post.hook,
     flow: readStringArray(reel.flow).length > 0
       ? readStringArray(reel.flow)
-      : ["problem", "insight", "breakdown", "proof", "cta"],
+      : isPinterestVideoPin
+        ? ["hook", "ritual idea", "product detail", "save or click"]
+        : ["problem", "insight", "breakdown", "proof", "cta"],
     script:
       readString(reel.script) ??
       [
@@ -299,7 +356,9 @@ function normalizeReelExecution(post: PostDetailSource, execution: AnyRecord) {
     visualDirection:
       readString(reel.visual_direction) ??
       readString(execution.visual_direction) ??
-      "Open on the founder/product in use, move into detail shots that prove the claim, and finish on a direct CTA frame.",
+      (isPinterestVideoPin
+        ? "Use a vertical pin-safe visual flow: quick hook text, calming ritual visual, product detail close-up, then a save or click CTA."
+        : "Open on the founder/product in use, move into detail shots that prove the claim, and finish on a direct CTA frame."),
     editingStyle:
       readString(reel.editing_style) ??
       [
@@ -385,6 +444,9 @@ function normalizeStaticExecution(
   caption: string,
 ) {
   const staticExecution = asRecord(execution.static_execution);
+  const isPinterestStaticPin =
+    post.platform.toLowerCase().includes("pinterest") &&
+    post.format.toLowerCase().includes("pin");
   return {
     headline:
       readString(staticExecution.headline) ??
@@ -393,7 +455,9 @@ function normalizeStaticExecution(
     visualDirection:
       readString(staticExecution.visual_direction) ??
       readString(execution.visual_idea) ??
-      "Use one premium focal visual with clear hierarchy so the promise lands instantly.",
+      (isPinterestStaticPin
+        ? "Design a vertical 2:3 pin with a clear headline, premium ritual visual, and save-friendly text hierarchy."
+        : "Use one premium focal visual with clear hierarchy so the promise lands instantly."),
     caption: readString(staticExecution.caption) ?? caption,
   };
 }
@@ -446,6 +510,13 @@ function inferDuration(formatKind: NormalizedPostDetail["formatKind"]): string {
   if (formatKind === "carousel") return "6 slides";
   if (formatKind === "story") return "4 frames";
   return "Single post";
+}
+
+function primaryMetricLabel(formatKind: NormalizedPostDetail["formatKind"]): string {
+  if (formatKind === "carousel") return "Slide count";
+  if (formatKind === "story") return "Frame count";
+  if (formatKind === "static") return "Asset type";
+  return "Duration";
 }
 
 function inferShootType(formatKind: NormalizedPostDetail["formatKind"]): string {
@@ -543,4 +614,23 @@ function readStringArray(value: unknown): string[] {
 
 function readNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function resolveActivePlatforms(platform: string, execution: AnyRecord): string[] {
+  const active = readStringArray(execution.active_platforms)
+    .map((value) => normalizePlatformName(value))
+    .filter(Boolean);
+  if (active.length === 0) return [normalizePlatformName(platform)];
+  if (!active.includes(normalizePlatformName(platform))) active.unshift(normalizePlatformName(platform));
+  return Array.from(new Set(active));
+}
+
+function normalizePlatformName(value: string): string {
+  const raw = value.trim().toLowerCase();
+  if (raw === "x" || raw.includes("twitter")) return "X";
+  if (raw.includes("linkedin")) return "LinkedIn";
+  if (raw.includes("pinterest")) return "Pinterest";
+  if (raw.includes("youtube")) return "YouTube";
+  if (raw.includes("instagram")) return "Instagram";
+  return value.trim();
 }

@@ -217,6 +217,7 @@ export const UpdateStrategyParams = zod.object({
 export const UpdateStrategyBody = zod.object({
   strategyDocument: zod.string().optional(),
   structuredStrategy: zod.record(zod.string(), zod.unknown()).optional(),
+  templateType: zod.string().optional(),
   status: zod.enum(["draft", "approved"]).optional(),
 });
 
@@ -423,6 +424,10 @@ export const GenerateCalendarBody = zod.object({
     .describe(
       "Free-text notes\/constraints from the strategist for this month.",
     ),
+  regenerate: zod
+    .boolean()
+    .optional()
+    .describe("When true, explicitly replace the existing calendar for this month."),
 });
 
 export const GenerateCalendarResponse = zod.object({

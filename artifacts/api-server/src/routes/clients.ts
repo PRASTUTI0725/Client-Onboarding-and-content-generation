@@ -1,4 +1,5 @@
 import { Router, type IRouter } from "express";
+import { compactImportedResearchForDna } from "@workspace/research-brief";
 import { db, clientsTable, onboardingProfilesTable, strategiesTable, plannersTable } from "@workspace/db";
 import { eq, desc, sql } from "drizzle-orm";
 import {
@@ -13,9 +14,10 @@ import {
   buildStrategySummary,
   type StrategyDetailLevel,
 } from "../lib/strategy/generate.js";
+import { getStrictJsonWithRetry } from "../lib/llm/json-retry.js";
 import { selectTemplate, type TemplateType } from "../lib/strategy/templates.js";
 import { createHash, randomUUID } from "node:crypto";
-import { markAIFallbackUsed, markFallbackUsed } from "../lib/runtime-mode.js";
+import { clearAIFallbackUsed, getLastFailureStage, markAIFallbackUsed, markFallbackUsed, setLastFailureStage } from "../lib/runtime-mode.js";
 import { isDbUnavailableError } from "../lib/db-unavailable.js";
 import multer from "multer";
 import {
@@ -25,6 +27,7 @@ import {
   shouldUseRealAI,
 } from "../lib/llm/request-provider.js";
 import type { LLMProvider } from "../lib/llm/types.js";
+import { FallbackProvider } from "../lib/llm/fallback-provider.js";
 import {
   fetchInstagramSummary,
   fetchWebsiteSummary,
@@ -37,7 +40,40 @@ import {
   extractSowTextWithMetadata,
   inferOperationalDefaultsFromSowText,
 } from "../lib/sow-pdf-extract.js";
-import { type BusinessDna, buildBusinessDnaFromPublicSignals } from "../lib/business-dna.js";
+import {
+  type BusinessDna,
+  type BusinessDnaDiagnosticEvent,
+  buildBusinessDnaFromPublicSignals,
+  createEmptyBusinessDna,
+} from "../lib/business-dna.js";
+import {
+  BusinessDnaPromptBudgetError,
+  generateBusinessDnaWithLlm,
+  toBusinessDnaPromptBudgetDiagnostics,
+  type BusinessDnaGeneratorInput,
+} from "../lib/business-dna/generate.js";
+import { BUSINESS_DNA_REBUILD_TIMEOUT_MS } from "../lib/business-dna/constants.js";
+import {
+  buildBusinessDnaRepairInstructionLines,
+  buildBusinessDnaRepairPromptInput,
+  validateBusinessDnaSemantics,
+  validateBusinessDnaStructure,
+} from "../lib/business-dna/validate.js";
+import { generateJtaWithLlm, type JtaGeneratorInput } from "../lib/jta/generate.js";
+import {
+  buildProofConstraintsFromResearchContext,
+  compactImportedResearchForJta,
+  countJtaResearchContextFields,
+  type JtaProofConstraints,
+} from "../lib/jta/compact-research-context.js";
+import {
+  buildJtaRepairInstructionLines,
+  buildJtaRepairPromptInput,
+  validateJtaSemantics,
+  validateJtaStructure,
+} from "../lib/jta/validate.js";
+import { resolveClientFacingBrandName, sanitizeClientFacingText } from "../lib/client-display-name.js";
+import { classifyBusinessType } from "../lib/business-type/classify.js";
 import { assessSowPdfMismatch } from "../lib/sow-pdf-mismatch.js";
 import { extractPdfText } from "../lib/pdf-text.js";
 import { buildOptimizedSowContext } from "../lib/sow-context.js";
@@ -60,8 +96,29 @@ import {
   STRATEGY_V1_OPTIONAL_PLACEHOLDERS,
   STRATEGY_V1_REQUIRED_PLACEHOLDERS,
 } from "../lib/prompts/template.js";
+import {
+  getBusinessDnaRequirementError,
+  getCurrentJtaDraftRequirementError,
+  getBusinessDnaWorkflowState,
+  getJtaRequirementError,
+  getJtaWorkflowState,
+  readApprovedSnapshotRecord,
+} from "../lib/workflow-approval.js";
+import { z } from "zod";
 
 const router: IRouter = Router();
+
+function resolveConcreteTemplateType(
+  enriched: Record<string, unknown> | null | undefined,
+  requestedTemplateType?: string | null,
+): TemplateType {
+  const normalizedRequestedTemplate =
+    typeof requestedTemplateType === "string" && requestedTemplateType.trim().length > 0
+      ? requestedTemplateType.trim()
+      : null;
+  return selectTemplate(enriched ?? {}, normalizedRequestedTemplate);
+}
+
 type MemoryClient = {
   id: string;
   name: string;
@@ -80,6 +137,8 @@ type MemoryOnboarding = {
     websiteUrl: string;
     instagramHandle: string;
     oneLineDescription: string;
+    instagram?: StructuredInstagramInput;
+    instagramSummaryNotes?: string;
   };
   enrichedData: unknown;
 };
@@ -95,6 +154,239 @@ type MemoryStrategy = {
   createdAt: string;
   updatedAt: string;
 };
+
+type StrategyPatchResponse = {
+  patch?: {
+    sectionKey?: string;
+    sectionValue?: string;
+    meta?: Record<string, unknown>;
+  };
+};
+
+type StructuredInstagramInput = {
+  handle: string;
+  bio: string;
+  offerSummary: string;
+  recentCaptionSnippets: string[];
+  recurringTopics: string[];
+  additionalInstagramNotes?: string;
+  ctaPatterns?: string[];
+  proofSignals?: string[];
+  followerCount?: string;
+  category?: string;
+  visualStyleNotes?: string;
+};
+
+type ApprovedContextSnapshot = {
+  id: string;
+  createdAt: string;
+  sourceContext: "approved_snapshot";
+  templateType: string;
+  client: {
+    id: string;
+    name: string;
+    websiteUrl: string | null;
+    instagramHandle: string | null;
+    oneLineDescription: string | null;
+  };
+  sow: {
+    industry: string;
+    targetAudience: string;
+    understandingOfRequirements: string;
+    strategyLaunchPlanning: string;
+    contentCreation: string;
+    scopeOfWork: string;
+    platforms: string[];
+    monthlyPosts: Record<string, number>;
+    contentMix: Record<string, number>;
+    deliverables: string[];
+    toneByPlatform: Record<string, string>;
+    instagram?: StructuredInstagramInput;
+    normalizedSections?: Record<string, string>;
+    approval?: { approved?: boolean; approvedAt?: string | null };
+  };
+  provenance: {
+    website: "extracted" | "missing";
+    instagram: "extracted" | "missing";
+    oneLineDescription: "extracted" | "missing";
+    sow: "extracted";
+    template: "extracted";
+    generatedAt: string;
+  };
+};
+
+type RunMetaInput = {
+  clientId: string;
+  snapshotId: string | null;
+  taskType: "business_dna" | "strategy_bootstrap" | "strategy_generate" | "calendar_generate";
+  provider: string;
+  model: string;
+  fallbackUsed: boolean;
+  sourceContext: "draft" | "approved_snapshot";
+  timestamp?: string;
+  generationMode?: "heuristic" | "llm" | "fallback" | "deterministic";
+  validation?: {
+    status: "not_run" | "passed" | "warning" | "failed";
+    note?: string;
+    issues?: string[];
+  };
+  inputSources?: Record<string, unknown>;
+  diagnostics?: Record<string, unknown>;
+};
+
+type ArtifactApprovalMeta = {
+  approved: boolean;
+  approvedAt?: string | null;
+  approvedSnapshotId?: string | null;
+  approvalVersion?: string;
+};
+
+type BusinessDnaArtifactMeta = {
+  businessDnaVersion?: string;
+  businessDnaInputVersion?: string;
+  generationMode?: "llm" | "heuristic_fallback" | "heuristic" | "fallback";
+  validationStatus?: "passed" | "warning" | "failed" | "not_run";
+  validationIssues?: string[];
+  provider?: string;
+  model?: string;
+  fallbackReason?: string;
+  fallbackSource?: "business_dna_heuristic";
+  generatedAt?: string;
+  snapshotId?: string | null;
+  currentSnapshotId?: string | null;
+  stale?: boolean;
+  latestRun?: ReturnType<typeof buildRunMeta>;
+  approval?: ArtifactApprovalMeta;
+  manualEdits?: Record<string, { editedAt: string; source: string }>;
+  businessType?: {
+    primary?: string;
+    confidence?: string;
+  };
+};
+
+type StrategyArtifactMeta = {
+  latestRun?: ReturnType<typeof buildRunMeta>;
+  snapshotId?: string | null;
+  snapshotState?: "fresh" | "stale";
+  currentSnapshotId?: string | null;
+  staleAt?: string;
+  jtaVersion?: string;
+  jtaInputVersion?: string;
+  generationMode?: "llm" | "deterministic_fallback" | "deterministic" | "fallback";
+  validationStatus?: "passed" | "warning" | "failed" | "not_run";
+  validationIssues?: string[];
+  provider?: string;
+  model?: string;
+  fallbackReason?: string;
+  fallbackSource?: "bootstrap_deterministic";
+  generatedAt?: string;
+  approval?: ArtifactApprovalMeta;
+  businessType?: {
+    primary?: string;
+    confidence?: string;
+  };
+};
+
+const EDITABLE_BUSINESS_DNA_FIELDS = {
+  purpose: "text",
+  mission: "text",
+  vision: "text",
+  "personalityTraits": "list",
+  "toneOfVoice.style": "list",
+  "toneOfVoice.dos": "list",
+  "toneOfVoice.donts": "list",
+  "toneOfVoice.samplePhrases": "list",
+  "targetAudience.segments": "list",
+  "targetAudience.demographics": "list",
+  "targetAudience.psychographics": "list",
+  "targetAudience.geographies": "list",
+  "targetAudience.pains": "list",
+  "targetAudience.desires": "list",
+  "targetAudience.objections": "list",
+  "positioning.category": "text",
+  "positioning.valueProposition": "text",
+  "positioning.differentiators": "list",
+  "positioning.competitorReferences": "list",
+  "positioning.marketAngle": "text",
+  "positioning.reasonToBelieve": "list",
+  "offers.primaryOffers": "list",
+  "offers.pricingSignals": "list",
+  "offers.transformationPromise": "text",
+  "offers.urgencyStyle": "text",
+  "contentStrategy.contentPillars": "list",
+  "contentStrategy.themes": "list",
+  "contentStrategy.hooksThatFitBrand": "list",
+  "contentStrategy.topicsToAvoid": "list",
+  "contentStrategy.trustSignalsToRepeat": "list",
+} as const satisfies Record<string, "text" | "list">;
+
+type EditableBusinessDnaFieldPath = keyof typeof EDITABLE_BUSINESS_DNA_FIELDS;
+
+function isEditableBusinessDnaFieldPath(path: string): path is EditableBusinessDnaFieldPath {
+  return path in EDITABLE_BUSINESS_DNA_FIELDS;
+}
+
+function normalizeBusinessDnaPatchValue(path: string, value: unknown): string | string[] {
+  const mode = EDITABLE_BUSINESS_DNA_FIELDS[path as EditableBusinessDnaFieldPath];
+  if (mode === "list") {
+    if (Array.isArray(value)) {
+      return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+    }
+    return String(value ?? "")
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return String(value ?? "").trim();
+}
+
+function clonePlainRecord<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function applyNestedPatch(target: Record<string, unknown>, path: string, value: unknown): Record<string, unknown> {
+  const segments = path.split(".").filter(Boolean);
+  if (segments.length === 0) return target;
+  const next = clonePlainRecord(target);
+  let cursor: Record<string, unknown> = next;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index]!;
+    const existing = cursor[segment];
+    cursor[segment] =
+      existing && typeof existing === "object" && !Array.isArray(existing)
+        ? { ...(existing as Record<string, unknown>) }
+        : {};
+    cursor = cursor[segment] as Record<string, unknown>;
+  }
+  cursor[segments[segments.length - 1]!] = value;
+  return next;
+}
+
+function extractApprovedBusinessDnaValidationContext(
+  approvedSnapshot: ApprovedContextSnapshot,
+  snapshotInput: ReturnType<typeof buildGenerationInputsFromSnapshot>,
+  brandName: string,
+  clientName: string,
+  businessTypePrimary: string,
+) {
+  const approvedSowRecord = approvedSnapshot.sow as Record<string, unknown>;
+  return {
+    approvedSowRecord,
+    snapshotInput,
+    brandName,
+    clientName,
+    businessTypePrimary,
+  };
+}
+
+const PLACEHOLDER_PATTERNS: RegExp[] = [
+  /^\s*e\.g\./i,
+  /^\s*for example\b/i,
+  /^\s*paste the\b/i,
+  /^\s*short list of recurring outputs/i,
+  /^\s*how should instagram sound\??/i,
+  /^\s*e\.g\.\s*1[×x]\s*monthly\b/i,
+];
 
 const memoryClients = new Map<string, MemoryClient>();
 const memoryOnboarding = new Map<string, MemoryOnboarding>();
@@ -151,6 +443,31 @@ function elapsedMs(startedAt: number): number {
   return Date.now() - startedAt;
 }
 
+const BUSINESS_DNA_REBUILD_TIMEOUT_REASON = "business_dna_rebuild_timeout";
+const BUSINESS_DNA_REBUILD_REQ_ABORTED_REASON = "business_dna_rebuild_req_aborted";
+const BUSINESS_DNA_REBUILD_REQ_CLOSED_REASON = "business_dna_rebuild_req_closed";
+const BUSINESS_DNA_REBUILD_RES_CLOSED_REASON = "business_dna_rebuild_res_closed";
+
+function createAbortError(reason?: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === "string" && reason ? reason : "Operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isTimeoutAbortReason(reason: unknown): boolean {
+  return reason === BUSINESS_DNA_REBUILD_TIMEOUT_REASON;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw createAbortError(signal.reason);
+}
+
 function mergeEnrichedProvenance(
   enrichedData: Record<string, unknown> | null | undefined,
   patch: Record<string, unknown>,
@@ -168,7 +485,7 @@ function mergeEnrichedProvenance(
 }
 
 function isValidBusinessDna(value: unknown): value is BusinessDna {
-  return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
+  return validateBusinessDnaStructure(value).ok;
 }
 
 function hashPdfBuffer(buffer: Buffer): string {
@@ -1027,7 +1344,6 @@ router.post("/clients", async (req, res) => {
   const startedAt = Date.now();
   const body = CreateClientBody.parse(req.body);
   const requestSizeBytes = estimateRequestBytes(body);
-  const backgroundDnaQueuedAt = new Date().toISOString();
   const hasAutoDnaContext = Boolean(
     body.websiteUrl.trim() || body.instagramHandle.trim() || body.oneLineDescription.trim(),
   );
@@ -1038,19 +1354,12 @@ router.post("/clients", async (req, res) => {
     oneLineDescription: body.oneLineDescription,
   };
   const pendingEnrichedData = mergeEnrichedProvenance(null, {
-    dnaBackgroundStatus: hasAutoDnaContext ? "pending" : "idle",
-    ...(hasAutoDnaContext ? { dnaBackgroundQueuedAt: backgroundDnaQueuedAt } : {}),
-    dnaBackgroundMode: "lightweight",
+    dnaBackgroundStatus: hasAutoDnaContext ? "locked_pending_sow_approval" : "idle",
+    dnaBackgroundMode: "approval_gated",
+    dnaBackgroundNote: hasAutoDnaContext
+      ? "Approve SOW to generate final Business DNA and Jump-to-Action."
+      : "Add website, Instagram, or a business summary to enable Business DNA after SOW approval.",
   });
-  const useLightweightProvider = hasAutoDnaContext && shouldUseRealAI(req);
-  let lightweightProvider: LLMProvider | null = null;
-  if (useLightweightProvider) {
-    try {
-      lightweightProvider = getRequestLLMProvider(req);
-    } catch (err) {
-      req.log.warn({ err }, "Lightweight Business DNA provider unavailable; falling back to public-signal enrichment");
-    }
-  }
   try {
     const [client] = await db
       .insert(clientsTable)
@@ -1079,164 +1388,10 @@ router.post("/clients", async (req, res) => {
     );
     res.status(201).json(serializeClient(client));
     if (onboardingProfile && hasAutoDnaContext) {
-      void (async () => {
-        const enrichStart = Date.now();
-        let finalBackgroundStatus = "pending";
-        try {
-          console.log("=== BUSINESS DNA TASK START ===");
-          console.log("Raw inputs:", {
-            website: body.websiteUrl,
-            instagram: body.instagramHandle,
-            rawInput: createRaw,
-          });
-          console.log("Background provider env availability:", {
-            groq: Boolean(process.env.GROQ_API_KEY?.trim()),
-            openrouter: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
-            gemini: Boolean(process.env.GEMINI_API_KEY?.trim()),
-            openaiBaseUrl: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL?.trim() || null,
-          });
-          req.log.info(
-            {
-              clientId: client.id,
-              clientName: body.name,
-              websiteUrl: body.websiteUrl,
-              instagramHandle: body.instagramHandle,
-              queuedAt: backgroundDnaQueuedAt,
-            },
-            "Background Business DNA job started",
-          );
-          const { businessDna, lightweightProviderLabel } = await withTimeout(
-            (async () => {
-              let enrichedProfile: Record<string, unknown> | null = null;
-              let providerLabel: string | null = null;
-              if (lightweightProvider) {
-                console.log("Step 3: Calling enrich() with provider...");
-                req.log.info({ clientId: client.id }, "Background Business DNA: lightweight provider step started");
-                try {
-                  const providerInfo = lightweightProvider.describe?.() ?? {
-                    provider: lightweightProvider.id,
-                    model: "default",
-                  };
-                  providerLabel = `${providerInfo.provider}:${providerInfo.model}`;
-                  console.log("Provider used:", providerLabel);
-                  const enriched = await enrich(
-                    {
-                      name: body.name,
-                      websiteUrl: body.websiteUrl,
-                      instagramHandle: body.instagramHandle,
-                      oneLineDescription: body.oneLineDescription,
-                    },
-                    lightweightProvider,
-                  );
-                  enrichedProfile = enriched as Record<string, unknown>;
-                  console.log("Enrich result:", enriched);
-                  req.log.info(
-                    { clientId: client.id, provider: providerLabel },
-                    "Background Business DNA: lightweight provider step completed",
-                  );
-                } catch (providerErr) {
-                  console.log("Provider used:", providerLabel ?? lightweightProvider.id);
-                  console.log(
-                    "Enrich result:",
-                    providerErr instanceof Error ? `${providerErr.name}: ${providerErr.message}` : providerErr,
-                  );
-                  req.log.warn(
-                    { clientId: client.id, providerErr },
-                    "Background Business DNA: lightweight provider step failed; using public signals only",
-                  );
-                }
-              } else {
-                console.log("Step 3: Calling enrich() with provider...");
-                console.log("Provider used:", null);
-                console.log("Enrich result:", "SKIPPED_NO_PROVIDER");
-                req.log.info({ clientId: client.id }, "Background Business DNA: no lightweight provider, using public signals only");
-              }
-              console.log("Step 4: Calling buildBusinessDnaFromPublicSignals...");
-              console.log("Public signals input:", {
-                name: body.name,
-                websiteUrl: body.websiteUrl,
-                instagramHandle: body.instagramHandle,
-                oneLineDescription: body.oneLineDescription || null,
-                instagramSummaryNotes: null,
-                enrichedProfile,
-              });
-              req.log.info({ clientId: client.id }, "Background Business DNA: public-signal build started");
-              const builtBusinessDna = await buildBusinessDnaFromPublicSignals({
-                name: body.name,
-                websiteUrl: body.websiteUrl,
-                instagramHandle: body.instagramHandle,
-                oneLineDescription: body.oneLineDescription || null,
-                instagramSummaryNotes: null,
-                enrichedProfile,
-                skipInstagramFetch: true,
-              });
-              if (!isValidBusinessDna(builtBusinessDna)) {
-                throw new Error("Business DNA builder returned an empty payload");
-              }
-              console.log("Final businessDna shape:", Object.keys(builtBusinessDna));
-              req.log.info(
-                { clientId: client.id, keys: Object.keys(builtBusinessDna) },
-                "Background Business DNA: public-signal build completed",
-              );
-              return { businessDna: builtBusinessDna, lightweightProviderLabel: providerLabel };
-            })(),
-            90_000,
-            `background business dna client=${client.id}`,
-          );
-          console.log("Step 5: Saving to onboarding...");
-          req.log.info({ clientId: client.id }, "Background Business DNA: saving final payload");
-          await db
-            .update(onboardingProfilesTable)
-            .set({
-              enrichedData: mergeEnrichedProvenance(
-                {
-                  ...((onboardingProfile.enrichedData as Record<string, unknown> | null | undefined) ?? {}),
-                  businessDna,
-                },
-                {
-                  dnaBackgroundStatus: "ready",
-                  dnaBackgroundCompletedAt: new Date().toISOString(),
-                  dnaBackgroundProvider: lightweightProviderLabel ?? "public-signals",
-                },
-              ),
-              updatedAt: new Date(),
-            })
-            .where(eq(onboardingProfilesTable.id, onboardingProfile.id));
-          finalBackgroundStatus = "ready";
-          console.log("=== TASK COMPLETE: " + finalBackgroundStatus + " ===");
-          req.log.info(
-            {
-              clientId: client.id,
-              durationMs: Date.now() - enrichStart,
-              provider: lightweightProviderLabel ?? "public-signals",
-            },
-            "Deferred founder onboarding DNA enrichment completed",
-          );
-        } catch (enrichErr) {
-          finalBackgroundStatus = "failed";
-          console.log("=== TASK COMPLETE: " + finalBackgroundStatus + " ===");
-          console.log(
-            "Business DNA task error:",
-            enrichErr instanceof Error ? `${enrichErr.name}: ${enrichErr.message}` : enrichErr,
-          );
-          req.log.error({ clientId: client.id, enrichErr }, "Background Business DNA job failed");
-          await db
-            .update(onboardingProfilesTable)
-            .set({
-              enrichedData: mergeEnrichedProvenance(
-                (onboardingProfile.enrichedData as Record<string, unknown> | null | undefined) ?? {},
-                {
-                  dnaBackgroundStatus: "failed",
-                  dnaBackgroundFailedAt: new Date().toISOString(),
-                },
-              ),
-              updatedAt: new Date(),
-            })
-            .where(eq(onboardingProfilesTable.id, onboardingProfile.id))
-            .catch(() => undefined);
-          req.log.warn({ clientId: client.id, enrichErr }, "Deferred founder onboarding DNA enrichment failed");
-        }
-      })();
+      req.log.info(
+        { clientId: client.id, sourceContext: "draft" },
+        "Business DNA generation deferred until SOW approval",
+      );
     }
   } catch (err) {
     if (!isDbUnavailableError(err)) {
@@ -1268,162 +1423,10 @@ router.post("/clients", async (req, res) => {
     );
     res.status(201).json(memoryClient);
     if (hasAutoDnaContext) {
-      void (async () => {
-      const enrichStart = Date.now();
-      let finalBackgroundStatus = "pending";
-      try {
-        console.log("=== BUSINESS DNA TASK START ===");
-        console.log("Raw inputs:", {
-          website: body.websiteUrl,
-          instagram: body.instagramHandle,
-          rawInput: createRaw,
-        });
-        console.log("Background provider env availability:", {
-          groq: Boolean(process.env.GROQ_API_KEY?.trim()),
-          openrouter: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
-          gemini: Boolean(process.env.GEMINI_API_KEY?.trim()),
-          openaiBaseUrl: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL?.trim() || null,
-        });
-        req.log.info(
-          {
-            clientId: id,
-            clientName: body.name,
-            websiteUrl: body.websiteUrl,
-            instagramHandle: body.instagramHandle,
-            queuedAt: backgroundDnaQueuedAt,
-          },
-          "Background Business DNA job started (memory fallback)",
-        );
-        const { businessDna, lightweightProviderLabel } = await withTimeout(
-          (async () => {
-            let enrichedProfile: Record<string, unknown> | null = null;
-            let providerLabel: string | null = null;
-            if (lightweightProvider) {
-              console.log("Step 3: Calling enrich() with provider...");
-              req.log.info({ clientId: id }, "Background Business DNA: lightweight provider step started (memory fallback)");
-              try {
-                const providerInfo = lightweightProvider.describe?.() ?? {
-                  provider: lightweightProvider.id,
-                  model: "default",
-                };
-                providerLabel = `${providerInfo.provider}:${providerInfo.model}`;
-                console.log("Provider used:", providerLabel);
-                const enriched = await enrich(
-                  {
-                    name: body.name,
-                    websiteUrl: body.websiteUrl,
-                    instagramHandle: body.instagramHandle,
-                    oneLineDescription: body.oneLineDescription,
-                  },
-                  lightweightProvider,
-                );
-                enrichedProfile = enriched as Record<string, unknown>;
-                console.log("Enrich result:", enriched);
-                req.log.info(
-                  { clientId: id, provider: providerLabel },
-                  "Background Business DNA: lightweight provider step completed (memory fallback)",
-                );
-              } catch (providerErr) {
-                console.log("Provider used:", providerLabel ?? lightweightProvider.id);
-                console.log(
-                  "Enrich result:",
-                  providerErr instanceof Error ? `${providerErr.name}: ${providerErr.message}` : providerErr,
-                );
-                req.log.warn(
-                  { clientId: id, providerErr },
-                  "Background Business DNA: lightweight provider step failed; using public signals only (memory fallback)",
-                );
-              }
-            } else {
-              console.log("Step 3: Calling enrich() with provider...");
-              console.log("Provider used:", null);
-              console.log("Enrich result:", "SKIPPED_NO_PROVIDER");
-              req.log.info({ clientId: id }, "Background Business DNA: no lightweight provider, using public signals only (memory fallback)");
-            }
-            console.log("Step 4: Calling buildBusinessDnaFromPublicSignals...");
-            console.log("Public signals input:", {
-              name: body.name,
-              websiteUrl: body.websiteUrl,
-              instagramHandle: body.instagramHandle,
-              oneLineDescription: body.oneLineDescription || null,
-              instagramSummaryNotes: null,
-              enrichedProfile,
-            });
-            req.log.info({ clientId: id }, "Background Business DNA: public-signal build started (memory fallback)");
-            const builtBusinessDna = await buildBusinessDnaFromPublicSignals({
-              name: body.name,
-              websiteUrl: body.websiteUrl,
-              instagramHandle: body.instagramHandle,
-              oneLineDescription: body.oneLineDescription || null,
-              instagramSummaryNotes: null,
-              enrichedProfile,
-              skipInstagramFetch: true,
-            });
-            if (!isValidBusinessDna(builtBusinessDna)) {
-              throw new Error("Business DNA builder returned an empty payload");
-            }
-            console.log("Final businessDna shape:", Object.keys(builtBusinessDna));
-            req.log.info(
-              { clientId: id, keys: Object.keys(builtBusinessDna) },
-              "Background Business DNA: public-signal build completed (memory fallback)",
-            );
-            return { businessDna: builtBusinessDna, lightweightProviderLabel: providerLabel };
-          })(),
-          90_000,
-          `background business dna memory client=${id}`,
-        );
-        console.log("Step 5: Saving to onboarding...");
-        req.log.info({ clientId: id }, "Background Business DNA: saving final payload (memory fallback)");
-        const existing = memoryOnboarding.get(id);
-        if (!existing) return;
-        memoryOnboarding.set(id, {
-          ...existing,
-          enrichedData: mergeEnrichedProvenance(
-            {
-              ...((existing.enrichedData as Record<string, unknown> | null | undefined) ?? {}),
-              businessDna,
-            },
-            {
-              dnaBackgroundStatus: "ready",
-              dnaBackgroundCompletedAt: new Date().toISOString(),
-              dnaBackgroundProvider: lightweightProviderLabel ?? "public-signals",
-            },
-          ),
-        });
-        finalBackgroundStatus = "ready";
-        console.log("=== TASK COMPLETE: " + finalBackgroundStatus + " ===");
-        req.log.info(
-          {
-            clientId: id,
-            durationMs: Date.now() - enrichStart,
-            provider: lightweightProviderLabel ?? "public-signals",
-          },
-          "Deferred in-memory founder onboarding DNA enrichment completed",
-        );
-      } catch (enrichErr) {
-        finalBackgroundStatus = "failed";
-        console.log("=== TASK COMPLETE: " + finalBackgroundStatus + " ===");
-        console.log(
-          "Business DNA task error:",
-          enrichErr instanceof Error ? `${enrichErr.name}: ${enrichErr.message}` : enrichErr,
-        );
-        req.log.error({ clientId: id, enrichErr }, "Background Business DNA job failed (memory fallback)");
-        const existing = memoryOnboarding.get(id);
-        if (existing) {
-          memoryOnboarding.set(id, {
-            ...existing,
-            enrichedData: mergeEnrichedProvenance(
-              (existing.enrichedData as Record<string, unknown> | null | undefined) ?? {},
-              {
-                dnaBackgroundStatus: "failed",
-                dnaBackgroundFailedAt: new Date().toISOString(),
-              },
-            ),
-          });
-        }
-        req.log.warn({ clientId: id, enrichErr }, "Deferred in-memory founder onboarding DNA enrichment failed");
-      }
-      })();
+      req.log.info(
+        { clientId: id, sourceContext: "draft", fallbackReason: "db_unavailable" },
+        "Business DNA generation deferred until SOW approval (memory fallback)",
+      );
     }
   }
 });
@@ -1633,7 +1636,11 @@ router.post("/clients/onboard", (req, _res, next) => {
     },
   };
 
-  const enrichedPayload: Record<string, unknown> = {};
+  const enrichedPayload: Record<string, unknown> = mergeEnrichedProvenance(null, {
+    dnaBackgroundStatus: "locked_pending_sow_approval",
+    dnaBackgroundMode: "approval_gated",
+    dnaBackgroundNote: "Approve SOW to generate final Business DNA and Jump-to-Action.",
+  });
   const dbWriteStartedAt = Date.now();
 
   try {
@@ -1689,29 +1696,7 @@ router.post("/clients/onboard", (req, _res, next) => {
       },
       pdfMismatch: pdfCheck,
     });
-    void (async () => {
-      const enrichStart = Date.now();
-      try {
-        const businessDna = await buildBusinessDnaFromPublicSignals({
-          name,
-          websiteUrl,
-          instagramHandle,
-          oneLineDescription: oneLineDescription || null,
-          instagramSummaryNotes: null,
-          sowSections: { understandingOfRequirements: uorFinal, scopeOfWork: sowFinal },
-        });
-        await db
-          .update(onboardingProfilesTable)
-          .set({ enrichedData: { businessDna }, updatedAt: new Date() })
-          .where(eq(onboardingProfilesTable.clientId, client.id));
-        req.log.info(
-          { clientId: client.id, durationMs: Date.now() - enrichStart },
-          "Deferred onboarding DNA enrichment completed",
-        );
-      } catch (enrichErr) {
-        req.log.warn({ clientId: client.id, enrichErr }, "Deferred onboarding DNA enrichment failed");
-      }
-    })();
+    req.log.info({ clientId: client.id, sourceContext: "draft" }, "Business DNA generation deferred until SOW approval");
   } catch (err) {
     if (!isDbUnavailableError(err)) {
       throw err;
@@ -1768,31 +1753,10 @@ router.post("/clients/onboard", (req, _res, next) => {
       },
       pdfMismatch: pdfCheck,
     });
-    void (async () => {
-      const enrichStart = Date.now();
-      try {
-        const businessDna = await buildBusinessDnaFromPublicSignals({
-          name,
-          websiteUrl,
-          instagramHandle,
-          oneLineDescription: oneLineDescription || null,
-          instagramSummaryNotes: null,
-          sowSections: { understandingOfRequirements: uorFinal, scopeOfWork: sowFinal },
-        });
-        const existing = memoryOnboarding.get(id);
-        if (!existing) return;
-        memoryOnboarding.set(id, {
-          ...existing,
-          enrichedData: { ...(existing.enrichedData as Record<string, unknown> | null | undefined), businessDna },
-        });
-        req.log.info(
-          { clientId: id, durationMs: Date.now() - enrichStart },
-          "Deferred in-memory onboarding DNA enrichment completed",
-        );
-      } catch (enrichErr) {
-        req.log.warn({ clientId: id, enrichErr }, "Deferred in-memory onboarding DNA enrichment failed");
-      }
-    })();
+    req.log.info(
+      { clientId: id, sourceContext: "draft", fallbackReason: "db_unavailable" },
+      "Business DNA generation deferred until SOW approval (memory fallback)",
+    );
   }
   } catch (onboardErr) {
     if (res.headersSent) return;
@@ -1876,6 +1840,47 @@ router.get("/clients/:clientId", async (req, res) => {
 
 router.post("/clients/:clientId/onboarding/business-dna/rebuild", async (req, res) => {
   const { clientId } = req.params;
+  const rebuildRequestId = randomUUID().slice(0, 8);
+  const startedAt = Date.now();
+  const rebuildAbortController = new AbortController();
+  let rebuildFinished = false;
+  const logDiagnostic = (
+    step: string,
+    detail: Record<string, unknown> = {},
+    level: "info" | "warn" | "error" = "info",
+  ) => {
+    req.log[level](
+      {
+        clientId: clientId ?? null,
+        rebuildRequestId,
+        step,
+        elapsedMs: elapsedMs(startedAt),
+        ...detail,
+      },
+      "Business DNA rebuild diagnostic",
+    );
+  };
+  const emitBuildDiagnostic = (event: BusinessDnaDiagnosticEvent) => {
+    logDiagnostic(`${event.step}_${event.phase}`, event.detail ?? {});
+  };
+  const abortRebuild = (reason: string, level: "warn" | "error" = "warn") => {
+    if (rebuildFinished || rebuildAbortController.signal.aborted) return;
+    rebuildAbortController.abort(reason);
+    logDiagnostic("request_cancelled", { reason }, level);
+  };
+  const rebuildTimeout = setTimeout(() => {
+    abortRebuild(BUSINESS_DNA_REBUILD_TIMEOUT_REASON, "error");
+  }, BUSINESS_DNA_REBUILD_TIMEOUT_MS);
+  req.once("aborted", () => abortRebuild(BUSINESS_DNA_REBUILD_REQ_ABORTED_REASON));
+  res.once("close", () => {
+    if (!rebuildFinished) abortRebuild(BUSINESS_DNA_REBUILD_RES_CLOSED_REASON);
+  });
+  res.once("finish", () => {
+    rebuildFinished = true;
+    clearTimeout(rebuildTimeout);
+    logDiagnostic("response_sent", { statusCode: res.statusCode });
+  });
+  logDiagnostic("request_start");
   if (!clientId) {
     res.status(400).json({ error: "clientId required" });
     return;
@@ -1903,41 +1908,284 @@ router.post("/clients/:clientId/onboarding/business-dna/rebuild", async (req, re
     const existingBusinessDna =
       (existingEnriched.businessDna as Partial<BusinessDna> | null | undefined) ?? null;
     const sow = (client.sow as Record<string, unknown> | null | undefined) ?? null;
-    const normalizedSections = getStrategyRelevantNormalizedSowSections(sow);
-    const sowSections = buildStrategyDnaSowSections(sow, normalizedSections);
-    const businessDna = await buildBusinessDnaFromPublicSignals({
-      name: String(raw.name ?? client.name ?? ""),
-      websiteUrl: String(raw.websiteUrl ?? client.website ?? ""),
-      instagramHandle: String(raw.instagramHandle ?? client.instagramHandle ?? ""),
-      oneLineDescription: String(raw.oneLineDescription ?? client.oneLineDescription ?? ""),
-      instagramSummaryNotes:
-        typeof raw.instagramSummaryNotes === "string" ? raw.instagramSummaryNotes : null,
-      existing: existingBusinessDna,
-      enrichedProfile: existingEnriched,
-      sowSections,
+    const approvedSnapshot = readApprovedSnapshot(sow);
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate final Business DNA and Jump-to-Action." });
+      return;
+    }
+    logDiagnostic("snapshot_load", {
+      snapshotId: approvedSnapshot.id,
+      sourceContext: approvedSnapshot.sourceContext,
     });
+    const snapshotInput = buildGenerationInputsFromSnapshot(approvedSnapshot, raw);
+    const approvedSowRecord = approvedSnapshot.sow as Record<string, unknown>;
+    const businessType = classifyBusinessType({
+      brandName: snapshotInput.name,
+      clientName: client.name,
+      oneLineDescription: snapshotInput.oneLineDescription,
+      industry: approvedSowRecord.industry,
+      targetAudience: approvedSowRecord.targetAudience,
+      websiteText: [snapshotInput.websiteUrl, snapshotInput.oneLineDescription].filter(Boolean).join(" "),
+      instagramBio: snapshotInput.instagram?.bio,
+      offerSummary: snapshotInput.instagram?.offerSummary,
+    });
+    const useRealAI = shouldUseRealAI(req);
+    const aiHeaderDiagnostics = buildAiHeaderDiagnostics(req);
+    let resolvedProvider: LLMProvider | null = null;
+    let providerInfo = { provider: "public-signals", model: "n/a" };
+    if (useRealAI) {
+      try {
+        resolvedProvider = getRequestLLMProvider(req);
+        providerInfo = resolvedProvider.describe?.() ?? { provider: resolvedProvider.id, model: "default" };
+      } catch (error) {
+        providerInfo = { provider: "fallback", model: "business_dna_heuristic" };
+        req.log.warn({ clientId, err: error }, "Business DNA rebuild falling back because no AI provider was available");
+      }
+    }
+    let fallbackBusinessDna: BusinessDna;
+    try {
+      fallbackBusinessDna = await buildBusinessDnaFromPublicSignals({
+        name: snapshotInput.name,
+        websiteUrl: snapshotInput.websiteUrl,
+        instagramHandle: snapshotInput.instagramHandle,
+        structuredInstagram: snapshotInput.instagram,
+        oneLineDescription: snapshotInput.oneLineDescription || null,
+        instagramSummaryNotes: snapshotInput.instagramSummaryNotes || null,
+        existing: existingBusinessDna,
+        enrichedProfile: existingEnriched,
+        sowSections: snapshotInput.sowSections,
+        skipInstagramFetch: true,
+        diagnostic: emitBuildDiagnostic,
+        abortSignal: rebuildAbortController.signal,
+      });
+    } catch (error) {
+      if (rebuildAbortController.signal.aborted && isTimeoutAbortReason(rebuildAbortController.signal.reason)) {
+        logDiagnostic("request_timeout", { reason: rebuildAbortController.signal.reason }, "error");
+        res.status(504).json({ error: "Business DNA rebuild timed out while fetching public signals" });
+        return;
+      }
+      if (isAbortError(error) || rebuildAbortController.signal.aborted) {
+        logDiagnostic("request_aborted", { reason: rebuildAbortController.signal.reason ?? String(error) });
+        return;
+      }
+      throw error;
+    }
+    throwIfAborted(rebuildAbortController.signal);
+    logDiagnostic("instagram_skip_applied", {
+      source: fallbackBusinessDna.mcp.instagram.source ?? null,
+      classification: fallbackBusinessDna.platformSignals.instagram.status?.classification ?? null,
+    });
+    const generatorInput = buildApprovedBusinessDnaGeneratorInput({
+      approvedSnapshot,
+      snapshotInput,
+      clientName: client.name,
+      businessType: {
+        primary: businessType.primary,
+        confidence: businessType.confidence,
+      },
+      websiteSummary: summarizeWebsiteForBusinessDnaInput(fallbackBusinessDna),
+      importedResearchBrief:
+        (raw.importedResearchBrief as Record<string, unknown> | undefined) ?? null,
+    });
+    if (shouldLogProvenance()) {
+      req.log.info(
+        {
+          clientId,
+          clientName: client.name,
+          businessType: businessType.primary,
+          artifactStage: "business_dna",
+          approvedSnapshotId: approvedSnapshot.id,
+          sourceSnippet: {
+            sow: previewText(generatorInput.sow, 300),
+            website: previewText(generatorInput.website, 220),
+            instagram: previewText(generatorInput.instagram, 220),
+          },
+          promptInput: previewJson(generatorInput),
+        },
+        "Business DNA provenance source",
+      );
+    }
+    let businessDna = fallbackBusinessDna;
+    let fallbackUsed = true;
+    let fallbackReason = "AI generation unavailable; heuristic Business DNA fallback was used.";
+    let repairAttempted = false;
+    let repairSucceeded = false;
+    let promptBudgetDiagnostics: Record<string, unknown> = {};
+    if (resolvedProvider) {
+      try {
+        const generated = await generateBusinessDnaWithLlm({
+          provider: resolvedProvider,
+          input: generatorInput,
+          baseBusinessDna: fallbackBusinessDna,
+        });
+        throwIfAborted(rebuildAbortController.signal);
+        promptBudgetDiagnostics = toBusinessDnaPromptBudgetDiagnostics(generated.promptBudget);
+        const generatedAssessment = evaluateBusinessDnaCandidate(generated.businessDna, {
+          approvedSowRecord,
+          snapshotInput,
+          brandName: snapshotInput.name,
+          clientName: client.name,
+          businessTypePrimary: businessType.primary,
+        });
+        if (generatedAssessment.validationStatus === "failed") {
+          repairAttempted = true;
+          const repaired = await generateBusinessDnaWithLlm({
+            provider: resolvedProvider,
+            input: generatorInput,
+            baseBusinessDna: fallbackBusinessDna,
+            repairIssues: buildBusinessDnaRepairInstructionLines({
+              ok: generatedAssessment.validationStatus !== "failed",
+              status: generatedAssessment.validationStatus,
+              issues: generatedAssessment.validationIssues,
+              issueDetails: generatedAssessment.validationIssueDetails,
+            }),
+            existingDraft: generated.businessDna,
+          });
+          throwIfAborted(rebuildAbortController.signal);
+          promptBudgetDiagnostics = toBusinessDnaPromptBudgetDiagnostics(repaired.promptBudget);
+          const repairedAssessment = evaluateBusinessDnaCandidate(repaired.businessDna, {
+            approvedSowRecord,
+            snapshotInput,
+            brandName: snapshotInput.name,
+            clientName: client.name,
+            businessTypePrimary: businessType.primary,
+          });
+          if (repairedAssessment.validationStatus !== "failed") {
+            businessDna = repaired.businessDna;
+            fallbackUsed = false;
+            fallbackReason = "";
+            repairSucceeded = true;
+            providerInfo = {
+              provider: repaired.provider ?? providerInfo.provider,
+              model: repaired.model ?? providerInfo.model,
+            };
+          } else {
+            setLastFailureStage("validation_failed_after_response");
+            fallbackReason = `LLM Business DNA failed validation after repair: ${repairedAssessment.validationIssues.join("; ")}`;
+          }
+        } else {
+          businessDna = generated.businessDna;
+          fallbackUsed = false;
+          fallbackReason = "";
+          providerInfo = {
+            provider: generated.provider ?? providerInfo.provider,
+            model: generated.model ?? providerInfo.model,
+          };
+        }
+      } catch (error) {
+        if (error instanceof BusinessDnaPromptBudgetError) {
+          promptBudgetDiagnostics = toBusinessDnaPromptBudgetDiagnostics(error.promptBudget);
+          setLastFailureStage("prompt_budget_exceeded");
+        } else {
+          setLastFailureStage("fallback_used");
+        }
+        fallbackReason = error instanceof Error ? error.message : String(error);
+        req.log.warn({ clientId, err: error }, "Business DNA rebuild fell back to heuristic output");
+      }
+    }
+    if (fallbackUsed && useRealAI) markAIFallbackUsed();
+    if (!fallbackUsed) clearAIFallbackUsed();
+    const { validationIssues, validationIssueDetails, validationStatus } = evaluateBusinessDnaCandidate(businessDna, {
+      approvedSowRecord,
+      snapshotInput,
+      brandName: snapshotInput.name,
+      clientName: client.name,
+      businessTypePrimary: businessType.primary,
+    });
+    const validationNote =
+      validationIssues.length > 0
+        ? buildBusinessDnaRepairPromptInput({
+            ok: validationStatus !== "failed",
+            status: validationStatus,
+            issues: validationIssues,
+            issueDetails: validationIssueDetails,
+          })
+        : fallbackUsed
+          ? fallbackReason
+          : "Business DNA validation passed.";
+    const runMeta = buildRunMeta({
+      clientId,
+      snapshotId: approvedSnapshot.id,
+      taskType: "business_dna",
+      provider: providerInfo.provider,
+      model: providerInfo.model,
+      fallbackUsed,
+      sourceContext: "approved_snapshot",
+      generationMode: fallbackUsed ? "heuristic" : "llm",
+      validation: {
+        status: validationStatus,
+        note: validationNote,
+        issues: validationIssues,
+      },
+      inputSources: buildBusinessDnaInputSourceSummary({
+        sourceContext: "approved_snapshot",
+        websiteUrl: snapshotInput.websiteUrl,
+        instagramHandle: snapshotInput.instagramHandle,
+        structuredInstagram: snapshotInput.instagram,
+        instagramSummaryNotes: snapshotInput.instagramSummaryNotes,
+        sowSections: snapshotInput.sowSections,
+        skipInstagramFetch: true,
+        strategyType: approvedSnapshot.templateType ?? null,
+      }),
+      diagnostics: {
+        ...aiHeaderDiagnostics,
+        ...promptBudgetDiagnostics,
+        ...buildProviderDiagnostics(resolvedProvider, {
+          repairAttempted,
+          repairSucceeded,
+          fallbackReason: fallbackUsed ? fallbackReason : null,
+        }),
+      },
+    });
+    req.log.info({ clientId, trace: runMeta }, "Business DNA rebuild trace prepared");
+    if (shouldLogProvenance()) {
+      req.log.info(
+        {
+          clientId,
+          clientName: client.name,
+          businessType: businessType.primary,
+          artifactStage: "business_dna",
+          contentSource: fallbackUsed ? "heuristic_fallback" : "llm",
+          helper_modified_content_fields: fallbackUsed ? "yes" : "no",
+          helperNames: fallbackUsed ? ["buildBusinessDnaFromPublicSignals"] : [],
+          finalArtifact: previewJson(businessDna),
+        },
+        "Business DNA provenance final",
+      );
+    }
 
+    const rebuiltArtifact = annotateBusinessDnaArtifact(
+      {
+        ...existingEnriched,
+        businessDna: businessDna as unknown as Record<string, unknown>,
+      },
+      runMeta,
+      approvedSnapshot.id,
+      false,
+      businessType,
+    );
     const nextEnriched = {
-      ...existingEnriched,
-      businessDna,
+      ...rebuiltArtifact,
       __provenance: {
-        ...(typeof existingEnriched.__provenance === "object" && existingEnriched.__provenance !== null
-          ? (existingEnriched.__provenance as Record<string, unknown>)
-          : {}),
+        ...((rebuiltArtifact.__provenance as Record<string, unknown> | undefined) ?? {}),
         dnaRebuiltFromUiAt: new Date().toISOString(),
+        sourceContext: "approved_snapshot",
       },
     };
 
+    logDiagnostic("save_start", { profileId: profile.id });
     const [updated] = await db
       .update(onboardingProfilesTable)
       .set({ enrichedData: nextEnriched, updatedAt: new Date() })
       .where(eq(onboardingProfilesTable.id, profile.id))
       .returning();
+    throwIfAborted(rebuildAbortController.signal);
 
     if (!updated) {
       res.status(500).json({ error: "Failed to rebuild business DNA" });
       return;
     }
+    logDiagnostic("save_end", { profileId: updated.id });
 
     req.log.info({ clientId }, "Business DNA rebuilt from workspace");
     res.json({
@@ -1962,30 +2210,241 @@ router.post("/clients/:clientId/onboarding/business-dna/rebuild", async (req, re
     const existingBusinessDna =
       (existingEnriched.businessDna as Partial<BusinessDna> | null | undefined) ?? null;
     const sow = (client.sow as Record<string, unknown> | null | undefined) ?? null;
-    const normalizedSections = getStrategyRelevantNormalizedSowSections(sow);
-    const sowSections = buildStrategyDnaSowSections(sow, normalizedSections);
-    const businessDna = await buildBusinessDnaFromPublicSignals({
-      name: String(raw.name ?? client.name ?? ""),
-      websiteUrl: String(raw.websiteUrl ?? client.website ?? ""),
-      instagramHandle: String(raw.instagramHandle ?? client.instagramHandle ?? ""),
-      oneLineDescription: String(raw.oneLineDescription ?? client.oneLineDescription ?? ""),
-      instagramSummaryNotes:
-        typeof raw.instagramSummaryNotes === "string" ? raw.instagramSummaryNotes : null,
-      existing: existingBusinessDna,
-      enrichedProfile: existingEnriched,
-      sowSections,
+    const approvedSnapshot = readApprovedSnapshot(sow);
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate final Business DNA and Jump-to-Action." });
+      return;
+    }
+    logDiagnostic("snapshot_load", {
+      snapshotId: approvedSnapshot.id,
+      sourceContext: approvedSnapshot.sourceContext,
+      persistence: "memory_fallback",
     });
+    const snapshotInput = buildGenerationInputsFromSnapshot(approvedSnapshot, raw);
+    const approvedSowRecord = approvedSnapshot.sow as Record<string, unknown>;
+    const businessType = classifyBusinessType({
+      brandName: snapshotInput.name,
+      clientName: client.name,
+      oneLineDescription: snapshotInput.oneLineDescription,
+      industry: approvedSowRecord.industry,
+      targetAudience: approvedSowRecord.targetAudience,
+      websiteText: [snapshotInput.websiteUrl, snapshotInput.oneLineDescription].filter(Boolean).join(" "),
+      instagramBio: snapshotInput.instagram?.bio,
+      offerSummary: snapshotInput.instagram?.offerSummary,
+    });
+    const aiHeaderDiagnostics = buildAiHeaderDiagnostics(req);
+    let resolvedProvider: LLMProvider | null = null;
+    let providerInfo = { provider: "public-signals", model: "n/a" };
+    if (shouldUseRealAI(req)) {
+      try {
+        resolvedProvider = getRequestLLMProvider(req);
+        providerInfo = resolvedProvider.describe?.() ?? { provider: resolvedProvider.id, model: "default" };
+      } catch (error) {
+        providerInfo = { provider: "fallback", model: "business_dna_heuristic" };
+        req.log.warn({ clientId, err: error, persistence: "memory_fallback" }, "Business DNA rebuild falling back because no AI provider was available");
+      }
+    }
+    let fallbackBusinessDna: BusinessDna;
+    try {
+      fallbackBusinessDna = await buildBusinessDnaFromPublicSignals({
+        name: snapshotInput.name,
+        websiteUrl: snapshotInput.websiteUrl,
+        instagramHandle: snapshotInput.instagramHandle,
+        structuredInstagram: snapshotInput.instagram,
+        oneLineDescription: snapshotInput.oneLineDescription || null,
+        instagramSummaryNotes: snapshotInput.instagramSummaryNotes || null,
+        existing: existingBusinessDna,
+        enrichedProfile: existingEnriched,
+        sowSections: snapshotInput.sowSections,
+        skipInstagramFetch: true,
+        diagnostic: emitBuildDiagnostic,
+        abortSignal: rebuildAbortController.signal,
+      });
+    } catch (error) {
+      if (rebuildAbortController.signal.aborted && isTimeoutAbortReason(rebuildAbortController.signal.reason)) {
+        logDiagnostic("request_timeout", { reason: rebuildAbortController.signal.reason }, "error");
+        res.status(504).json({ error: "Business DNA rebuild timed out while fetching public signals" });
+        return;
+      }
+      if (isAbortError(error) || rebuildAbortController.signal.aborted) {
+        logDiagnostic("request_aborted", { reason: rebuildAbortController.signal.reason ?? String(error) });
+        return;
+      }
+      throw error;
+    }
+    throwIfAborted(rebuildAbortController.signal);
+    logDiagnostic("instagram_skip_applied", {
+      source: fallbackBusinessDna.mcp.instagram.source ?? null,
+      classification: fallbackBusinessDna.platformSignals.instagram.status?.classification ?? null,
+      persistence: "memory_fallback",
+    });
+    const generatorInput = buildApprovedBusinessDnaGeneratorInput({
+      approvedSnapshot,
+      snapshotInput,
+      clientName: client.name,
+      businessType: {
+        primary: businessType.primary,
+        confidence: businessType.confidence,
+      },
+      websiteSummary: summarizeWebsiteForBusinessDnaInput(fallbackBusinessDna),
+      importedResearchBrief:
+        (raw.importedResearchBrief as Record<string, unknown> | undefined) ?? null,
+    });
+    let businessDna = fallbackBusinessDna;
+    let fallbackUsed = true;
+    let fallbackReason = "AI generation unavailable; heuristic Business DNA fallback was used.";
+    let repairAttempted = false;
+    let repairSucceeded = false;
+    let promptBudgetDiagnostics: Record<string, unknown> = {};
+    if (resolvedProvider) {
+      try {
+        const generated = await generateBusinessDnaWithLlm({
+          provider: resolvedProvider,
+          input: generatorInput,
+          baseBusinessDna: fallbackBusinessDna,
+        });
+        throwIfAborted(rebuildAbortController.signal);
+        promptBudgetDiagnostics = toBusinessDnaPromptBudgetDiagnostics(generated.promptBudget);
+        const generatedAssessment = evaluateBusinessDnaCandidate(generated.businessDna, {
+          approvedSowRecord,
+          snapshotInput,
+          brandName: snapshotInput.name,
+          clientName: client.name,
+          businessTypePrimary: businessType.primary,
+        });
+        if (generatedAssessment.validationStatus === "failed") {
+          repairAttempted = true;
+          const repaired = await generateBusinessDnaWithLlm({
+            provider: resolvedProvider,
+            input: generatorInput,
+            baseBusinessDna: fallbackBusinessDna,
+            repairIssues: buildBusinessDnaRepairInstructionLines({
+              ok: generatedAssessment.validationStatus !== "failed",
+              status: generatedAssessment.validationStatus,
+              issues: generatedAssessment.validationIssues,
+              issueDetails: generatedAssessment.validationIssueDetails,
+            }),
+            existingDraft: generated.businessDna,
+          });
+          throwIfAborted(rebuildAbortController.signal);
+          promptBudgetDiagnostics = toBusinessDnaPromptBudgetDiagnostics(repaired.promptBudget);
+          const repairedAssessment = evaluateBusinessDnaCandidate(repaired.businessDna, {
+            approvedSowRecord,
+            snapshotInput,
+            brandName: snapshotInput.name,
+            clientName: client.name,
+            businessTypePrimary: businessType.primary,
+          });
+          if (repairedAssessment.validationStatus !== "failed") {
+            businessDna = repaired.businessDna;
+            fallbackUsed = false;
+            fallbackReason = "";
+            repairSucceeded = true;
+            providerInfo = {
+              provider: repaired.provider ?? providerInfo.provider,
+              model: repaired.model ?? providerInfo.model,
+            };
+          } else {
+            setLastFailureStage("validation_failed_after_response");
+            fallbackReason = `LLM Business DNA failed validation after repair: ${repairedAssessment.validationIssues.join("; ")}`;
+          }
+        } else {
+          businessDna = generated.businessDna;
+          fallbackUsed = false;
+          fallbackReason = "";
+          providerInfo = {
+            provider: generated.provider ?? providerInfo.provider,
+            model: generated.model ?? providerInfo.model,
+          };
+        }
+      } catch (error) {
+        if (error instanceof BusinessDnaPromptBudgetError) {
+          promptBudgetDiagnostics = toBusinessDnaPromptBudgetDiagnostics(error.promptBudget);
+          setLastFailureStage("prompt_budget_exceeded");
+        } else {
+          setLastFailureStage("fallback_used");
+        }
+        fallbackReason = error instanceof Error ? error.message : String(error);
+        req.log.warn({ clientId, err: error, persistence: "memory_fallback" }, "Business DNA rebuild fell back to heuristic output");
+      }
+    }
+    if (fallbackUsed && shouldUseRealAI(req)) markAIFallbackUsed();
+    if (!fallbackUsed) clearAIFallbackUsed();
+    const { validationIssues, validationIssueDetails, validationStatus } = evaluateBusinessDnaCandidate(businessDna, {
+      approvedSowRecord,
+      snapshotInput,
+      brandName: snapshotInput.name,
+      clientName: client.name,
+      businessTypePrimary: businessType.primary,
+    });
+    const validationNote =
+      validationIssues.length > 0
+        ? buildBusinessDnaRepairPromptInput({
+            ok: validationStatus !== "failed",
+            status: validationStatus,
+            issues: validationIssues,
+            issueDetails: validationIssueDetails,
+          })
+        : fallbackUsed
+          ? fallbackReason
+          : "Business DNA validation passed.";
+    const runMeta = buildRunMeta({
+      clientId,
+      snapshotId: approvedSnapshot.id,
+      taskType: "business_dna",
+      provider: providerInfo.provider,
+      model: providerInfo.model,
+      fallbackUsed,
+      sourceContext: "approved_snapshot",
+      generationMode: fallbackUsed ? "heuristic" : "llm",
+      validation: {
+        status: validationStatus,
+        note: validationNote,
+        issues: validationIssues,
+      },
+      inputSources: buildBusinessDnaInputSourceSummary({
+        sourceContext: "approved_snapshot",
+        websiteUrl: snapshotInput.websiteUrl,
+        instagramHandle: snapshotInput.instagramHandle,
+        structuredInstagram: snapshotInput.instagram,
+        instagramSummaryNotes: snapshotInput.instagramSummaryNotes,
+        sowSections: snapshotInput.sowSections,
+        skipInstagramFetch: true,
+        strategyType: approvedSnapshot.templateType ?? null,
+      }),
+      diagnostics: {
+        ...aiHeaderDiagnostics,
+        ...promptBudgetDiagnostics,
+        ...buildProviderDiagnostics(resolvedProvider, {
+          repairAttempted,
+          repairSucceeded,
+          fallbackReason: fallbackUsed ? fallbackReason : null,
+        }),
+      },
+    });
+    req.log.info({ clientId, trace: runMeta, persistence: "memory_fallback" }, "Business DNA rebuild trace prepared");
+    const rebuiltArtifact = annotateBusinessDnaArtifact(
+      {
+        ...existingEnriched,
+        businessDna: businessDna as unknown as Record<string, unknown>,
+      },
+      runMeta,
+      approvedSnapshot.id,
+      false,
+      businessType,
+    );
     const nextEnriched = {
-      ...existingEnriched,
-      businessDna,
+      ...rebuiltArtifact,
       __provenance: {
-        ...(typeof existingEnriched.__provenance === "object" && existingEnriched.__provenance !== null
-          ? (existingEnriched.__provenance as Record<string, unknown>)
-          : {}),
+        ...((rebuiltArtifact.__provenance as Record<string, unknown> | undefined) ?? {}),
         dnaRebuiltFromUiAt: new Date().toISOString(),
+        sourceContext: "approved_snapshot",
       },
     };
+    logDiagnostic("save_start", { profileId: existing.id, persistence: "memory_fallback" });
     memoryOnboarding.set(clientId, { ...existing, enrichedData: nextEnriched });
+    throwIfAborted(rebuildAbortController.signal);
+    logDiagnostic("save_end", { profileId: existing.id, persistence: "memory_fallback" });
     req.log.info({ clientId }, "Business DNA rebuilt from workspace (memory fallback)");
     res.json({
       id: existing.id,
@@ -2008,21 +2467,45 @@ router.patch("/clients/:clientId/onboarding", async (req, res) => {
   }
   const body = req.body as {
     businessDna?: Record<string, unknown>;
+    businessDnaPatch?: { path?: string; value?: unknown };
     /** Ops: manual Instagram context when public fetch / MCP is empty */
     instagramSummaryNotes?: string;
+    instagram?: StructuredInstagramInput;
     rebuildBusinessDna?: boolean;
+    importedResearchBrief?: Record<string, unknown>;
   };
+  const businessDnaPatchPath =
+    typeof body?.businessDnaPatch?.path === "string" ? body.businessDnaPatch.path.trim() : "";
+  const hasBusinessDnaPatch = businessDnaPatchPath.length > 0;
   if (
     !body ||
-    (body.businessDna == null && body.instagramSummaryNotes == null && body.rebuildBusinessDna !== true) ||
+    (body.businessDna == null &&
+      body.businessDnaPatch == null &&
+      body.instagramSummaryNotes == null &&
+      body.instagram == null &&
+      body.importedResearchBrief == null &&
+      body.rebuildBusinessDna !== true) ||
+    (body.businessDna != null && body.businessDnaPatch != null) ||
     (body.businessDna != null && typeof body.businessDna !== "object") ||
+    (body.businessDnaPatch != null &&
+      (typeof body.businessDnaPatch !== "object" || body.businessDnaPatch === null || Array.isArray(body.businessDnaPatch))) ||
     (body.instagramSummaryNotes != null && typeof body.instagramSummaryNotes !== "string") ||
+    (body.instagram != null &&
+      (typeof body.instagram !== "object" || body.instagram === null || Array.isArray(body.instagram))) ||
+    (body.importedResearchBrief != null &&
+      (typeof body.importedResearchBrief !== "object" ||
+        body.importedResearchBrief === null ||
+        Array.isArray(body.importedResearchBrief))) ||
     (body.rebuildBusinessDna != null && body.rebuildBusinessDna !== true)
   ) {
     res.status(400).json({
       error:
-        "Send businessDna (object), instagramSummaryNotes (string), and/or rebuildBusinessDna: true.",
+        "Send businessDna (object), businessDnaPatch ({ path, value }), instagram (object), instagramSummaryNotes (string), importedResearchBrief (object), and/or rebuildBusinessDna: true.",
     });
+    return;
+  }
+  if (hasBusinessDnaPatch && !isEditableBusinessDnaFieldPath(businessDnaPatchPath)) {
+    res.status(400).json({ error: "Unsupported Business DNA field path" });
     return;
   }
 
@@ -2045,41 +2528,213 @@ router.patch("/clients/:clientId/onboarding", async (req, res) => {
 
     const current = (profile.enrichedData as Record<string, unknown> | null) ?? {};
     const currentRaw = (profile.rawInput as Record<string, unknown> | null) ?? {};
-    const normalizedSections = getStrategyRelevantNormalizedSowSections(
+    const approvedSnapshot = readApprovedSnapshot(
       (client.sow as Record<string, unknown> | null | undefined) ?? null,
     );
+    if (body.rebuildBusinessDna === true && !approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate final Business DNA and Jump-to-Action." });
+      return;
+    }
+    const snapshotInput = approvedSnapshot
+      ? buildGenerationInputsFromSnapshot(approvedSnapshot, currentRaw)
+      : null;
+    const bodyInstagram = cleanStructuredInstagram(body.instagram);
+    const preferredInstagram = pickPreferredInstagramInput(
+      snapshotInput?.instagram,
+      readStructuredInstagramFromUnknown(currentRaw.instagram),
+      bodyInstagram,
+    );
+    const nextRawInstagram = bodyInstagram ?? readStructuredInstagramFromUnknown(currentRaw.instagram);
+    const preferredInstagramNotes =
+      deriveInstagramSummaryNotesFromStructuredInstagram(preferredInstagram) ||
+      snapshotInput?.instagramSummaryNotes ||
+      (typeof body.instagramSummaryNotes === "string"
+        ? body.instagramSummaryNotes.trim()
+        : typeof currentRaw.instagramSummaryNotes === "string"
+          ? currentRaw.instagramSummaryNotes
+          : null);
+    if (hasBusinessDnaPatch && !approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW before editing Business DNA fields." });
+      return;
+    }
     const rebuiltBusinessDna =
       body.rebuildBusinessDna === true
         ? await buildBusinessDnaFromPublicSignals({
-            name: String(currentRaw.name ?? client.name ?? ""),
-            websiteUrl: String(currentRaw.websiteUrl ?? client.website ?? ""),
-            instagramHandle: String(currentRaw.instagramHandle ?? client.instagramHandle ?? ""),
-            oneLineDescription: String(
-              currentRaw.oneLineDescription ?? client.oneLineDescription ?? "",
-            ),
-            instagramSummaryNotes:
-              typeof body.instagramSummaryNotes === "string"
-                ? body.instagramSummaryNotes.trim()
-                : typeof currentRaw.instagramSummaryNotes === "string"
-                  ? currentRaw.instagramSummaryNotes
-                  : null,
+            name: snapshotInput?.name ?? String(currentRaw.name ?? client.name ?? ""),
+            websiteUrl: snapshotInput?.websiteUrl ?? String(currentRaw.websiteUrl ?? client.website ?? ""),
+            instagramHandle:
+              snapshotInput?.instagramHandle ??
+              preferredInstagram?.handle ??
+              String(currentRaw.instagramHandle ?? client.instagramHandle ?? ""),
+            oneLineDescription:
+              snapshotInput?.oneLineDescription ??
+              String(currentRaw.oneLineDescription ?? client.oneLineDescription ?? ""),
+            structuredInstagram: preferredInstagram,
+            instagramSummaryNotes: preferredInstagramNotes,
             existing:
               ((current.businessDna as Partial<BusinessDna> | null | undefined) ?? null),
             enrichedProfile: current,
-            sowSections: buildStrategyDnaSowSections(
-              (client.sow as Record<string, unknown> | null | undefined) ?? null,
-              normalizedSections,
-            ),
+            sowSections:
+              snapshotInput?.sowSections ??
+              buildStrategyDnaSowSections(
+                (client.sow as Record<string, unknown> | null | undefined) ?? null,
+                getStrategyRelevantNormalizedSowSections(
+                  (client.sow as Record<string, unknown> | null | undefined) ?? null,
+                ),
+              ),
           })
         : null;
-    const nextRaw: MemoryOnboarding["rawInput"] & { instagramSummaryNotes?: string } = {
+    const approvedSowRecord = (approvedSnapshot?.sow as Record<string, unknown> | undefined) ?? undefined;
+    const businessType =
+      approvedSnapshot != null
+        ? classifyBusinessType({
+            brandName: snapshotInput?.name ?? String(currentRaw.name ?? client.name ?? ""),
+            clientName: client.name,
+            oneLineDescription:
+              snapshotInput?.oneLineDescription ??
+              String(currentRaw.oneLineDescription ?? client.oneLineDescription ?? ""),
+            industry: approvedSowRecord?.industry,
+            targetAudience: approvedSowRecord?.targetAudience,
+            websiteText:
+              snapshotInput?.websiteUrl ??
+              String(currentRaw.websiteUrl ?? client.website ?? ""),
+            instagramBio: preferredInstagram?.bio,
+            offerSummary: preferredInstagram?.offerSummary,
+          })
+        : null;
+    const dnaValidation =
+      approvedSnapshot && rebuiltBusinessDna
+        ? (() => {
+            const structural = validateBusinessDnaStructure(rebuiltBusinessDna);
+            const semantic = validateBusinessDnaSemantics(rebuiltBusinessDna, {
+              strategyLaunchPlanning:
+                typeof approvedSowRecord?.strategyLaunchPlanning === "string"
+                  ? approvedSowRecord.strategyLaunchPlanning
+                  : null,
+              scopeOfWork: typeof approvedSowRecord?.scopeOfWork === "string" ? approvedSowRecord.scopeOfWork : null,
+              recentCaptionSnippets: preferredInstagram?.recentCaptionSnippets ?? [],
+              proofSignals: preferredInstagram?.proofSignals ?? [],
+              brandName: snapshotInput?.name ?? String(currentRaw.name ?? client.name ?? ""),
+              clientName: client.name,
+              businessTypePrimary: businessType?.primary ?? null,
+            });
+            const issues = mergeValidationIssues(structural.issues, semantic.issues);
+            const status: NonNullable<RunMetaInput["validation"]>["status"] =
+              structural.status === "failed"
+                ? "failed"
+                : semantic.status === "warning"
+                  ? "warning"
+                  : "passed";
+            return { status, issues, issueDetails: [...structural.issueDetails, ...semantic.issueDetails] };
+          })()
+        : null;
+    const patchedBusinessDnaCandidate =
+      hasBusinessDnaPatch
+        ? (() => {
+            const currentBusinessDna =
+              ((current.businessDna as Record<string, unknown> | null | undefined) ?? null);
+            if (!isValidBusinessDna(currentBusinessDna)) {
+              return null;
+            }
+            return applyNestedPatch(
+              currentBusinessDna,
+              businessDnaPatchPath,
+              normalizeBusinessDnaPatchValue(businessDnaPatchPath, body.businessDnaPatch?.value),
+            ) as BusinessDna;
+          })()
+        : null;
+    if (hasBusinessDnaPatch && !patchedBusinessDnaCandidate) {
+      res.status(400).json({ error: "Business DNA is not ready yet" });
+      return;
+    }
+    const patchedBusinessDnaValidation =
+      approvedSnapshot && patchedBusinessDnaCandidate
+        ? evaluateBusinessDnaCandidate(
+            patchedBusinessDnaCandidate,
+            extractApprovedBusinessDnaValidationContext(
+              approvedSnapshot,
+              snapshotInput ?? buildGenerationInputsFromSnapshot(approvedSnapshot, currentRaw),
+              snapshotInput?.name ?? String(currentRaw.name ?? client.name ?? ""),
+              client.name,
+              businessType?.primary ?? "unknown",
+            ),
+          )
+        : null;
+    const runMeta = approvedSnapshot
+      ? buildRunMeta({
+          clientId,
+          snapshotId: approvedSnapshot.id,
+          taskType: "business_dna",
+          provider: shouldUseRealAI(req)
+            ? (() => {
+                try {
+                  const provider = getRequestLLMProvider(req);
+                  return provider.describe?.().provider ?? provider.id;
+                } catch {
+                  return "public-signals";
+                }
+              })()
+            : "public-signals",
+          model: shouldUseRealAI(req)
+            ? (() => {
+                try {
+                  const provider = getRequestLLMProvider(req);
+                  return provider.describe?.().model ?? "default";
+                } catch {
+                  return "n/a";
+                }
+              })()
+            : "n/a",
+          fallbackUsed: false,
+          sourceContext: "approved_snapshot",
+          generationMode: "heuristic",
+          validation: dnaValidation
+            ? {
+                status: dnaValidation.status,
+                note:
+                  dnaValidation.issues.length > 0
+                    ? buildBusinessDnaRepairPromptInput({
+                        ok: dnaValidation.status !== "failed",
+                        status: dnaValidation.status,
+                        issues: dnaValidation.issues,
+                        issueDetails: dnaValidation.issueDetails,
+                      })
+                    : "Business DNA validation scaffolding passed.",
+                issues: dnaValidation.issues,
+              }
+            : {
+                status: "not_run",
+                note: "Business DNA rebuild was not requested in this onboarding update.",
+              },
+          inputSources: buildBusinessDnaInputSourceSummary({
+            sourceContext: "approved_snapshot",
+            websiteUrl: snapshotInput?.websiteUrl ?? String(currentRaw.websiteUrl ?? client.website ?? ""),
+            instagramHandle:
+              snapshotInput?.instagramHandle ??
+              preferredInstagram?.handle ??
+              String(currentRaw.instagramHandle ?? client.instagramHandle ?? ""),
+            structuredInstagram: preferredInstagram,
+            instagramSummaryNotes: preferredInstagramNotes,
+            sowSections: snapshotInput?.sowSections,
+            strategyType: approvedSnapshot.templateType ?? null,
+          }),
+        })
+      : null;
+    if (runMeta) {
+      req.log.info({ clientId, trace: runMeta }, "Business DNA onboarding patch trace prepared");
+    }
+    const nextRaw: MemoryOnboarding["rawInput"] & { instagramSummaryNotes?: string; importedResearchBrief?: Record<string, unknown> } = {
       name: String(currentRaw.name ?? ""),
       websiteUrl: String(currentRaw.websiteUrl ?? ""),
-      instagramHandle: String(currentRaw.instagramHandle ?? ""),
+      instagramHandle: nextRawInstagram?.handle ?? String(currentRaw.instagramHandle ?? ""),
       oneLineDescription: String(currentRaw.oneLineDescription ?? ""),
-      ...(body.instagramSummaryNotes != null
-        ? { instagramSummaryNotes: body.instagramSummaryNotes.trim() }
+      ...(nextRawInstagram ? { instagram: nextRawInstagram } : {}),
+      ...(bodyInstagram
+        ? { instagramSummaryNotes: deriveInstagramSummaryNotesFromStructuredInstagram(bodyInstagram) || preferredInstagramNotes || "" }
+        : preferredInstagramNotes
+        ? { instagramSummaryNotes: preferredInstagramNotes }
         : {}),
+      ...(body.importedResearchBrief != null ? { importedResearchBrief: body.importedResearchBrief } : {}),
     };
     const nextEnriched: Record<string, unknown> = {
       ...current,
@@ -2094,16 +2749,72 @@ router.patch("/clients/:clientId/onboarding", async (req, res) => {
             },
           }
         : {}),
+      ...(patchedBusinessDnaCandidate != null
+        ? (() => {
+            const currentBusinessDna =
+              ((current.businessDna as Record<string, unknown> | null | undefined) ?? {}) as Record<string, unknown>;
+            const currentMeta =
+              (((currentBusinessDna.__meta as BusinessDnaArtifactMeta | undefined) ?? undefined) as BusinessDnaArtifactMeta | undefined);
+            const editedAt = new Date().toISOString();
+            const approvalMeta =
+              patchedBusinessDnaValidation?.validationStatus === "failed"
+                ? defaultApprovalMeta(approvedSnapshot?.id ?? null)
+                : (currentMeta?.approval ?? defaultApprovalMeta(approvedSnapshot?.id ?? null));
+            return {
+              businessDna: {
+                ...patchedBusinessDnaCandidate,
+                __meta: {
+                  ...(currentMeta ?? {}),
+                  snapshotId: approvedSnapshot?.id ?? currentMeta?.snapshotId ?? null,
+                  currentSnapshotId: approvedSnapshot?.id ?? currentMeta?.currentSnapshotId ?? null,
+                  stale: false,
+                  approval: approvalMeta,
+                  validationStatus: patchedBusinessDnaValidation?.validationStatus ?? currentMeta?.validationStatus ?? "not_run",
+                  validationIssues: patchedBusinessDnaValidation?.validationIssues ?? currentMeta?.validationIssues ?? [],
+                  manualEdits: {
+                    ...((currentMeta?.manualEdits ?? {}) as Record<string, { editedAt: string; source: string }>),
+                    [businessDnaPatchPath]: {
+                      editedAt,
+                      source: "workspace_field_edit",
+                    },
+                  },
+                } satisfies BusinessDnaArtifactMeta,
+              },
+              __provenance: {
+                ...(typeof current.__provenance === "object" && current.__provenance !== null
+                  ? (current.__provenance as Record<string, unknown>)
+                  : {}),
+                dnaEditedFromUiAt: editedAt,
+              },
+            };
+          })()
+        : {}),
       ...(rebuiltBusinessDna != null
-        ? {
-            businessDna: rebuiltBusinessDna,
-            __provenance: {
-              ...(typeof current.__provenance === "object" && current.__provenance !== null
-                ? (current.__provenance as Record<string, unknown>)
-                : {}),
-              dnaRebuiltFromUiAt: new Date().toISOString(),
-            },
-          }
+        ? (() => {
+            const rebuiltArtifact = runMeta
+              ? annotateBusinessDnaArtifact(
+                  {
+                    ...current,
+                    businessDna: rebuiltBusinessDna as unknown as Record<string, unknown>,
+                  },
+                  runMeta,
+                  approvedSnapshot?.id ?? null,
+                  false,
+                  businessType,
+                )
+              : {
+                  ...current,
+                  businessDna: rebuiltBusinessDna as unknown as Record<string, unknown>,
+                };
+            return {
+              businessDna: rebuiltArtifact.businessDna,
+              __provenance: {
+                ...((rebuiltArtifact.__provenance as Record<string, unknown> | undefined) ?? {}),
+                dnaRebuiltFromUiAt: new Date().toISOString(),
+                ...(runMeta ? { sourceContext: "approved_snapshot" } : {}),
+              },
+            };
+          })()
         : {}),
     };
 
@@ -2121,12 +2832,36 @@ router.patch("/clients/:clientId/onboarding", async (req, res) => {
       res.status(500).json({ error: "Failed to update onboarding profile" });
       return;
     }
+    let jtaMarkedStale = false;
+    if (patchedBusinessDnaCandidate && approvedSnapshot) {
+      const [latestStrategy] = await db
+        .select()
+        .from(strategiesTable)
+        .where(eq(strategiesTable.clientId, clientId))
+        .orderBy(desc(strategiesTable.version))
+        .limit(1);
+      if (latestStrategy) {
+        await db
+          .update(strategiesTable)
+          .set({
+            structuredStrategy: markStructuredArtifactStale(
+              (latestStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? {},
+              approvedSnapshot.id,
+            ),
+            status: "draft",
+            updatedAt: new Date(),
+          })
+          .where(eq(strategiesTable.id, latestStrategy.id));
+        jtaMarkedStale = true;
+      }
+    }
 
     res.json({
       id: updated.id,
       clientId: updated.clientId,
       rawInput: updated.rawInput,
       enrichedData: nextEnriched,
+      jtaMarkedStale,
     });
   } catch (err) {
     if (!isDbUnavailableError(err)) {
@@ -2141,35 +2876,187 @@ router.patch("/clients/:clientId/onboarding", async (req, res) => {
     }
     const current = (existing.enrichedData as Record<string, unknown> | null) ?? {};
     const currentRaw = (existing.rawInput as Record<string, unknown> | null) ?? {};
-    const normalizedSections = getStrategyRelevantNormalizedSowSections(
+    const approvedSnapshot = readApprovedSnapshot(
       (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
     );
+    if (body.rebuildBusinessDna === true && !approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate final Business DNA and Jump-to-Action." });
+      return;
+    }
+    const snapshotInput = approvedSnapshot
+      ? buildGenerationInputsFromSnapshot(approvedSnapshot, currentRaw)
+      : null;
+    const bodyInstagram = cleanStructuredInstagram(body.instagram);
+    const preferredInstagram = pickPreferredInstagramInput(
+      snapshotInput?.instagram,
+      readStructuredInstagramFromUnknown(currentRaw.instagram),
+      bodyInstagram,
+    );
+    const nextRawInstagram = bodyInstagram ?? readStructuredInstagramFromUnknown(currentRaw.instagram);
+    const preferredInstagramNotes =
+      deriveInstagramSummaryNotesFromStructuredInstagram(preferredInstagram) ||
+      snapshotInput?.instagramSummaryNotes ||
+      (typeof body.instagramSummaryNotes === "string"
+        ? body.instagramSummaryNotes.trim()
+        : typeof currentRaw.instagramSummaryNotes === "string"
+          ? currentRaw.instagramSummaryNotes
+          : null);
+    if (hasBusinessDnaPatch && !approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW before editing Business DNA fields." });
+      return;
+    }
     const rebuiltBusinessDna =
       body.rebuildBusinessDna === true
         ? await buildBusinessDnaFromPublicSignals({
-            name: String(currentRaw.name ?? existing.rawInput.name ?? ""),
-            websiteUrl: String(currentRaw.websiteUrl ?? existing.rawInput.websiteUrl ?? ""),
-            instagramHandle: String(
-              currentRaw.instagramHandle ?? existing.rawInput.instagramHandle ?? "",
-            ),
-            oneLineDescription: String(
-              currentRaw.oneLineDescription ?? existing.rawInput.oneLineDescription ?? "",
-            ),
-            instagramSummaryNotes:
-              typeof body.instagramSummaryNotes === "string"
-                ? body.instagramSummaryNotes.trim()
-                : typeof currentRaw.instagramSummaryNotes === "string"
-                  ? currentRaw.instagramSummaryNotes
-                  : null,
+            name: snapshotInput?.name ?? String(currentRaw.name ?? existing.rawInput.name ?? ""),
+            websiteUrl:
+              snapshotInput?.websiteUrl ?? String(currentRaw.websiteUrl ?? existing.rawInput.websiteUrl ?? ""),
+            instagramHandle:
+              snapshotInput?.instagramHandle ??
+              preferredInstagram?.handle ??
+              String(currentRaw.instagramHandle ?? existing.rawInput.instagramHandle ?? ""),
+            oneLineDescription:
+              snapshotInput?.oneLineDescription ??
+              String(currentRaw.oneLineDescription ?? existing.rawInput.oneLineDescription ?? ""),
+            structuredInstagram: preferredInstagram,
+            instagramSummaryNotes: preferredInstagramNotes,
             existing:
               ((current.businessDna as Partial<BusinessDna> | null | undefined) ?? null),
             enrichedProfile: current,
-            sowSections: buildStrategyDnaSowSections(
-              (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
-              normalizedSections,
-            ),
+            sowSections:
+              snapshotInput?.sowSections ??
+              buildStrategyDnaSowSections(
+                (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+                getStrategyRelevantNormalizedSowSections(
+                  (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+                ),
+              ),
           })
         : null;
+    const approvedSowRecord = (approvedSnapshot?.sow as Record<string, unknown> | undefined) ?? undefined;
+    const businessType =
+      approvedSnapshot != null
+        ? classifyBusinessType({
+            brandName: snapshotInput?.name ?? String(currentRaw.name ?? memoryClient.name ?? ""),
+            clientName: memoryClient.name,
+            oneLineDescription:
+              snapshotInput?.oneLineDescription ??
+              String(currentRaw.oneLineDescription ?? memoryClient.oneLineDescription ?? ""),
+            industry: approvedSowRecord?.industry,
+            targetAudience: approvedSowRecord?.targetAudience,
+            websiteText:
+              snapshotInput?.websiteUrl ??
+              String(currentRaw.websiteUrl ?? memoryClient.website ?? ""),
+            instagramBio: preferredInstagram?.bio,
+            offerSummary: preferredInstagram?.offerSummary,
+          })
+        : null;
+    const dnaValidation =
+      approvedSnapshot && rebuiltBusinessDna
+        ? (() => {
+            const structural = validateBusinessDnaStructure(rebuiltBusinessDna);
+            const semantic = validateBusinessDnaSemantics(rebuiltBusinessDna, {
+              strategyLaunchPlanning:
+                typeof approvedSowRecord?.strategyLaunchPlanning === "string"
+                  ? approvedSowRecord.strategyLaunchPlanning
+                  : null,
+              scopeOfWork: typeof approvedSowRecord?.scopeOfWork === "string" ? approvedSowRecord.scopeOfWork : null,
+              recentCaptionSnippets: preferredInstagram?.recentCaptionSnippets ?? [],
+              proofSignals: preferredInstagram?.proofSignals ?? [],
+              brandName: snapshotInput?.name ?? String(currentRaw.name ?? memoryClient.name ?? ""),
+              clientName: memoryClient.name,
+              businessTypePrimary: businessType?.primary ?? null,
+            });
+            const issues = mergeValidationIssues(structural.issues, semantic.issues);
+            const status: NonNullable<RunMetaInput["validation"]>["status"] =
+              structural.status === "failed"
+                ? "failed"
+                : semantic.status === "warning"
+                  ? "warning"
+                  : "passed";
+            return { status, issues, issueDetails: [...structural.issueDetails, ...semantic.issueDetails] };
+          })()
+        : null;
+    const patchedBusinessDnaCandidate =
+      hasBusinessDnaPatch
+        ? (() => {
+            const currentBusinessDna =
+              ((current.businessDna as Record<string, unknown> | null | undefined) ?? null);
+            if (!isValidBusinessDna(currentBusinessDna)) {
+              return null;
+            }
+            return applyNestedPatch(
+              currentBusinessDna,
+              businessDnaPatchPath,
+              normalizeBusinessDnaPatchValue(businessDnaPatchPath, body.businessDnaPatch?.value),
+            ) as BusinessDna;
+          })()
+        : null;
+    if (hasBusinessDnaPatch && !patchedBusinessDnaCandidate) {
+      res.status(400).json({ error: "Business DNA is not ready yet" });
+      return;
+    }
+    const patchedBusinessDnaValidation =
+      approvedSnapshot && patchedBusinessDnaCandidate
+        ? evaluateBusinessDnaCandidate(
+            patchedBusinessDnaCandidate,
+            extractApprovedBusinessDnaValidationContext(
+              approvedSnapshot,
+              snapshotInput ?? buildGenerationInputsFromSnapshot(approvedSnapshot, currentRaw),
+              snapshotInput?.name ?? String(currentRaw.name ?? memoryClient.name ?? ""),
+              memoryClient.name,
+              businessType?.primary ?? "unknown",
+            ),
+          )
+        : null;
+    const runMeta = approvedSnapshot
+      ? buildRunMeta({
+          clientId,
+          snapshotId: approvedSnapshot.id,
+          taskType: "business_dna",
+          provider: "public-signals",
+          model: "n/a",
+          fallbackUsed: false,
+          sourceContext: "approved_snapshot",
+          generationMode: "heuristic",
+          validation: dnaValidation
+            ? {
+                status: dnaValidation.status,
+                note:
+                  dnaValidation.issues.length > 0
+                    ? buildBusinessDnaRepairPromptInput({
+                        ok: dnaValidation.status !== "failed",
+                        status: dnaValidation.status,
+                        issues: dnaValidation.issues,
+                        issueDetails: dnaValidation.issueDetails,
+                      })
+                    : "Business DNA validation scaffolding passed.",
+                issues: dnaValidation.issues,
+              }
+            : {
+                status: "not_run",
+                note: "Business DNA rebuild was not requested in this onboarding update.",
+              },
+          inputSources: buildBusinessDnaInputSourceSummary({
+            sourceContext: "approved_snapshot",
+            websiteUrl: snapshotInput?.websiteUrl ?? String(currentRaw.websiteUrl ?? existing.rawInput.websiteUrl ?? ""),
+            instagramHandle:
+              snapshotInput?.instagramHandle ??
+              preferredInstagram?.handle ??
+              String(currentRaw.instagramHandle ?? existing.rawInput.instagramHandle ?? ""),
+            structuredInstagram: preferredInstagram,
+            instagramSummaryNotes: preferredInstagramNotes,
+            sowSections: snapshotInput?.sowSections,
+            strategyType: approvedSnapshot.templateType ?? null,
+          }),
+        })
+      : null;
+    if (runMeta) {
+      req.log.info(
+        { clientId, trace: runMeta, persistence: "memory_fallback" },
+        "Business DNA onboarding patch trace prepared",
+      );
+    }
     const nextEnriched: Record<string, unknown> = {
       ...current,
       ...(body.businessDna != null
@@ -2183,35 +3070,114 @@ router.patch("/clients/:clientId/onboarding", async (req, res) => {
             },
           }
         : {}),
+      ...(patchedBusinessDnaCandidate != null
+        ? (() => {
+            const currentBusinessDna =
+              ((current.businessDna as Record<string, unknown> | null | undefined) ?? {}) as Record<string, unknown>;
+            const currentMeta =
+              (((currentBusinessDna.__meta as BusinessDnaArtifactMeta | undefined) ?? undefined) as BusinessDnaArtifactMeta | undefined);
+            const editedAt = new Date().toISOString();
+            const approvalMeta =
+              patchedBusinessDnaValidation?.validationStatus === "failed"
+                ? defaultApprovalMeta(approvedSnapshot?.id ?? null)
+                : (currentMeta?.approval ?? defaultApprovalMeta(approvedSnapshot?.id ?? null));
+            return {
+              businessDna: {
+                ...patchedBusinessDnaCandidate,
+                __meta: {
+                  ...(currentMeta ?? {}),
+                  snapshotId: approvedSnapshot?.id ?? currentMeta?.snapshotId ?? null,
+                  currentSnapshotId: approvedSnapshot?.id ?? currentMeta?.currentSnapshotId ?? null,
+                  stale: false,
+                  approval: approvalMeta,
+                  validationStatus: patchedBusinessDnaValidation?.validationStatus ?? currentMeta?.validationStatus ?? "not_run",
+                  validationIssues: patchedBusinessDnaValidation?.validationIssues ?? currentMeta?.validationIssues ?? [],
+                  manualEdits: {
+                    ...((currentMeta?.manualEdits ?? {}) as Record<string, { editedAt: string; source: string }>),
+                    [businessDnaPatchPath]: {
+                      editedAt,
+                      source: "workspace_field_edit",
+                    },
+                  },
+                } satisfies BusinessDnaArtifactMeta,
+              },
+              __provenance: {
+                ...(typeof current.__provenance === "object" && current.__provenance !== null
+                  ? (current.__provenance as Record<string, unknown>)
+                  : {}),
+                dnaEditedFromUiAt: editedAt,
+              },
+            };
+          })()
+        : {}),
       ...(rebuiltBusinessDna != null
-        ? {
-            businessDna: rebuiltBusinessDna,
-            __provenance: {
-              ...(typeof current.__provenance === "object" && current.__provenance !== null
-                ? (current.__provenance as Record<string, unknown>)
-                : {}),
-              dnaRebuiltFromUiAt: new Date().toISOString(),
-            },
-          }
+        ? (() => {
+            const rebuiltArtifact = runMeta
+              ? annotateBusinessDnaArtifact(
+                  {
+                    ...current,
+                    businessDna: rebuiltBusinessDna as unknown as Record<string, unknown>,
+                  },
+                  runMeta,
+                  approvedSnapshot?.id ?? null,
+                  false,
+                  businessType,
+                )
+              : {
+                  ...current,
+                  businessDna: rebuiltBusinessDna as unknown as Record<string, unknown>,
+                };
+            return {
+              businessDna: rebuiltArtifact.businessDna,
+              __provenance: {
+                ...((rebuiltArtifact.__provenance as Record<string, unknown> | undefined) ?? {}),
+                dnaRebuiltFromUiAt: new Date().toISOString(),
+                ...(runMeta ? { sourceContext: "approved_snapshot" } : {}),
+              },
+            };
+          })()
         : {}),
     };
-    const nextRaw: MemoryOnboarding["rawInput"] & { instagramSummaryNotes?: string } = {
+    const nextRaw: MemoryOnboarding["rawInput"] & { instagramSummaryNotes?: string; importedResearchBrief?: Record<string, unknown> } = {
       name: String(currentRaw.name ?? existing.rawInput.name),
       websiteUrl: String(currentRaw.websiteUrl ?? existing.rawInput.websiteUrl),
-      instagramHandle: String(currentRaw.instagramHandle ?? existing.rawInput.instagramHandle),
+      instagramHandle:
+        nextRawInstagram?.handle ??
+        String(currentRaw.instagramHandle ?? existing.rawInput.instagramHandle),
       oneLineDescription: String(
         currentRaw.oneLineDescription ?? existing.rawInput.oneLineDescription,
       ),
-      ...(body.instagramSummaryNotes != null
-        ? { instagramSummaryNotes: body.instagramSummaryNotes.trim() }
+      ...(nextRawInstagram ? { instagram: nextRawInstagram } : {}),
+      ...(bodyInstagram
+        ? { instagramSummaryNotes: deriveInstagramSummaryNotesFromStructuredInstagram(bodyInstagram) || preferredInstagramNotes || "" }
+        : preferredInstagramNotes
+        ? { instagramSummaryNotes: preferredInstagramNotes }
         : {}),
+      ...(body.importedResearchBrief != null ? { importedResearchBrief: body.importedResearchBrief } : {}),
     };
+    let jtaMarkedStale = false;
+    if (patchedBusinessDnaCandidate && approvedSnapshot) {
+      const latestStrategy = memoryStrategies.get(clientId);
+      if (latestStrategy) {
+        memoryStrategies.set(clientId, {
+          ...latestStrategy,
+          structuredStrategy: markStructuredArtifactStale(
+            (latestStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? {},
+            approvedSnapshot.id,
+          ),
+          status: "draft",
+          updatedAt: new Date().toISOString(),
+        });
+        jtaMarkedStale = true;
+      }
+    }
     memoryOnboarding.set(clientId, { ...existing, enrichedData: nextEnriched, rawInput: nextRaw });
     res.json({
       id: existing.id,
       clientId: existing.clientId,
       rawInput: nextRaw,
       enrichedData: nextEnriched,
+      jtaMarkedStale,
     });
   }
 });
@@ -2320,9 +3286,83 @@ router.put("/clients/:clientId/sow", async (req, res) => {
   const sanitizedBody = sanitizeSowPayload(body);
 
   try {
+    const [existingClient] = await db.select().from(clientsTable).where(eq(clientsTable.id, clientId));
+    if (!existingClient) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const [latestStrategy] = await db
+      .select()
+      .from(strategiesTable)
+      .where(eq(strategiesTable.clientId, clientId))
+      .orderBy(desc(strategiesTable.version))
+      .limit(1);
+    const [latestPlanner] = await db
+      .select()
+      .from(plannersTable)
+      .where(eq(plannersTable.clientId, clientId))
+      .orderBy(desc(plannersTable.createdAt))
+      .limit(1);
+    const [latestProfile] = await db
+      .select()
+      .from(onboardingProfilesTable)
+      .where(eq(onboardingProfilesTable.clientId, clientId))
+      .orderBy(desc(onboardingProfilesTable.createdAt))
+      .limit(1);
+    const nextInstagram = cleanStructuredInstagram(sanitizedBody.instagram);
+    const clientBasics = (body.clientBasics as Record<string, unknown> | undefined) ?? undefined;
+    const syncedClientName =
+      (typeof clientBasics?.name === "string" && clientBasics.name.trim()) || existingClient.name;
+    const syncedWebsite =
+      (typeof clientBasics?.website === "string" && clientBasics.website.trim()) ||
+      stripPlaceholderText(existingClient.website) ||
+      null;
+    const currentRaw = (latestProfile?.rawInput as Record<string, unknown> | null | undefined) ?? null;
+    const syncedInstagramHandle =
+      nextInstagram?.handle ||
+      (typeof clientBasics?.instagramHandle === "string" ? clientBasics.instagramHandle.trim() : "") ||
+      stripPlaceholderText(existingClient.instagramHandle) ||
+      null;
+    const syncedOneLineDescription =
+      (typeof clientBasics?.oneLineDescription === "string" && clientBasics.oneLineDescription.trim()) ||
+      stripPlaceholderText(existingClient.oneLineDescription) ||
+      stripPlaceholderText(currentRaw?.oneLineDescription) ||
+      null;
+    const previousSnapshot = readApprovedSnapshot(
+      (existingClient.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    const templateForSnapshot =
+      latestStrategy?.templateType ?? previousSnapshot?.templateType ?? "brand_building";
+    const nextSnapshot =
+      ((sanitizedBody.approval as { approved?: boolean } | undefined)?.approved ?? false)
+        ? buildApprovedContextSnapshot({
+            clientId,
+            clientName: syncedClientName,
+            websiteUrl: syncedWebsite,
+            instagramHandle: syncedInstagramHandle,
+            oneLineDescription: syncedOneLineDescription,
+            sow: sanitizedBody,
+            templateType: templateForSnapshot,
+            previousSnapshot,
+          })
+        : null;
+    const snapshotChanged = nextSnapshot?.id !== previousSnapshot?.id;
+    const staleAfterSave = Boolean(nextSnapshot && previousSnapshot && snapshotChanged);
+    const nextSow = stampArtifactState(
+      sanitizedBody,
+      nextSnapshot,
+      staleAfterSave,
+      staleAfterSave ? "approved_context_changed" : undefined,
+    );
     const [updated] = await db
       .update(clientsTable)
-      .set({ sow: sanitizedBody })
+      .set({
+        name: syncedClientName,
+        website: syncedWebsite,
+        sow: nextSow,
+        instagramHandle: syncedInstagramHandle,
+        oneLineDescription: syncedOneLineDescription,
+      })
       .where(eq(clientsTable.id, clientId))
       .returning();
 
@@ -2330,8 +3370,68 @@ router.put("/clients/:clientId/sow", async (req, res) => {
       res.status(404).json({ error: "Client not found" });
       return;
     }
+    if (latestProfile) {
+      const currentDerivedInstagramNotes =
+        typeof currentRaw?.instagramSummaryNotes === "string" ? currentRaw.instagramSummaryNotes : "";
+      const nextRawInput = {
+        ...currentRaw,
+        ...(syncedWebsite ? { websiteUrl: syncedWebsite } : {}),
+        ...(syncedClientName ? { name: syncedClientName } : {}),
+        ...(nextInstagram ? { instagram: nextInstagram } : {}),
+        ...(nextInstagram
+          ? { instagramSummaryNotes: deriveInstagramSummaryNotesFromStructuredInstagram(nextInstagram) }
+          : currentDerivedInstagramNotes
+            ? { instagramSummaryNotes: currentDerivedInstagramNotes }
+            : {}),
+      };
+      await db
+        .update(onboardingProfilesTable)
+        .set({
+          rawInput: nextRawInput,
+          ...(snapshotChanged && nextSnapshot
+            ? {
+                enrichedData: markBusinessDnaStale(
+                  (latestProfile.enrichedData as Record<string, unknown> | null | undefined) ?? null,
+                  nextSnapshot.id,
+                ),
+              }
+            : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(onboardingProfilesTable.id, latestProfile.id));
+    }
+    if (snapshotChanged && nextSnapshot) {
+      if (latestStrategy) {
+        await db
+          .update(strategiesTable)
+          .set({
+            structuredStrategy: markStructuredArtifactStale(
+              (latestStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? {},
+              nextSnapshot.id,
+            ),
+            updatedAt: new Date(),
+          })
+          .where(eq(strategiesTable.id, latestStrategy.id));
+      }
+      if (latestPlanner) {
+        await db
+          .update(plannersTable)
+          .set({
+            metadata: markPlannerArtifactStale(
+              (latestPlanner.metadata as Record<string, unknown> | null | undefined) ?? null,
+              nextSnapshot.id,
+            ),
+          })
+          .where(eq(plannersTable.id, latestPlanner.id));
+      }
+    }
     req.log.info(
-      { requestSizeBytes, responseTimeMs: elapsedMs(startedAt) },
+      {
+        requestSizeBytes,
+        responseTimeMs: elapsedMs(startedAt),
+        snapshotId: nextSnapshot?.id ?? null,
+        snapshotChanged,
+      },
       "SOW save telemetry",
     );
     res.json(serializeClient(updated));
@@ -2345,15 +3445,377 @@ router.put("/clients/:clientId/sow", async (req, res) => {
       res.status(404).json({ error: "Client not found" });
       return;
     }
+    const latestProfile = memoryOnboarding.get(clientId);
+    const nextInstagram = cleanStructuredInstagram(sanitizedBody.instagram);
+    const currentRaw = (latestProfile?.rawInput as Record<string, unknown> | null | undefined) ?? null;
+    const syncedInstagramHandle =
+      nextInstagram?.handle || stripPlaceholderText(existing.instagramHandle) || null;
+    const syncedOneLineDescription =
+      stripPlaceholderText(existing.oneLineDescription) ||
+      stripPlaceholderText(currentRaw?.oneLineDescription) ||
+      null;
     const updated: MemoryClient = {
       ...existing,
-      sow: sanitizedBody,
+      instagramHandle: syncedInstagramHandle,
+      oneLineDescription: syncedOneLineDescription,
+      sow: stampArtifactState(
+        sanitizedBody,
+        ((sanitizedBody.approval as { approved?: boolean } | undefined)?.approved ?? false)
+          ? buildApprovedContextSnapshot({
+              clientId,
+              clientName: existing.name,
+              websiteUrl: existing.website,
+              instagramHandle: syncedInstagramHandle,
+              oneLineDescription: syncedOneLineDescription,
+              sow: sanitizedBody,
+              templateType:
+                memoryStrategies.get(clientId)?.templateType ??
+                readApprovedSnapshot((existing.sow as Record<string, unknown> | null | undefined) ?? null)?.templateType ??
+                "brand_building",
+              previousSnapshot: readApprovedSnapshot(
+                (existing.sow as Record<string, unknown> | null | undefined) ?? null,
+              ),
+            })
+          : null,
+        Boolean(
+          ((sanitizedBody.approval as { approved?: boolean } | undefined)?.approved ?? false) &&
+            readApprovedSnapshot((existing.sow as Record<string, unknown> | null | undefined) ?? null),
+        ),
+        ((sanitizedBody.approval as { approved?: boolean } | undefined)?.approved ?? false) &&
+        readApprovedSnapshot((existing.sow as Record<string, unknown> | null | undefined) ?? null)
+          ? "approved_context_changed"
+          : undefined,
+      ),
     };
     memoryClients.set(clientId, updated);
+    const nextSnapshot = readApprovedSnapshot((updated.sow as Record<string, unknown> | null | undefined) ?? null);
+    const previousSnapshot = readApprovedSnapshot((existing.sow as Record<string, unknown> | null | undefined) ?? null);
+    if (latestProfile) {
+      memoryOnboarding.set(clientId, {
+        ...latestProfile,
+        rawInput: {
+          ...latestProfile.rawInput,
+          ...(nextInstagram ? { instagram: nextInstagram } : {}),
+          ...(nextInstagram
+            ? { instagramSummaryNotes: deriveInstagramSummaryNotesFromStructuredInstagram(nextInstagram) }
+            : {}),
+        },
+      });
+    }
+    if (nextSnapshot?.id !== previousSnapshot?.id && nextSnapshot) {
+      const staleProfile = memoryOnboarding.get(clientId);
+      if (staleProfile) {
+        memoryOnboarding.set(clientId, {
+          ...staleProfile,
+          enrichedData: markBusinessDnaStale(
+            (staleProfile.enrichedData as Record<string, unknown> | null | undefined) ?? null,
+            nextSnapshot.id,
+          ),
+        });
+      }
+      const latestStrategy = memoryStrategies.get(clientId);
+      if (latestStrategy) {
+        memoryStrategies.set(clientId, {
+          ...latestStrategy,
+          structuredStrategy: markStructuredArtifactStale(
+            (latestStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? {},
+            nextSnapshot.id,
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
     req.log.info(
-      { requestSizeBytes, responseTimeMs: elapsedMs(startedAt), fallbackReason: "db_unavailable" },
+      {
+        requestSizeBytes,
+        responseTimeMs: elapsedMs(startedAt),
+        fallbackReason: "db_unavailable",
+        snapshotId: nextSnapshot?.id ?? null,
+      },
       "SOW save telemetry",
     );
+    res.json(updated);
+  }
+});
+
+router.post("/clients/:clientId/onboarding/business-dna/approve", async (req, res) => {
+  const { clientId } = req.params;
+  if (!clientId) {
+    res.status(400).json({ error: "clientId required" });
+    return;
+  }
+
+  try {
+    const [client] = await db.select().from(clientsTable).where(eq(clientsTable.id, clientId));
+    if (!client) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW before approving Business DNA." });
+      return;
+    }
+
+    const [profile] = await db
+      .select()
+      .from(onboardingProfilesTable)
+      .where(eq(onboardingProfilesTable.clientId, clientId))
+      .orderBy(desc(onboardingProfilesTable.createdAt))
+      .limit(1);
+    if (!profile) {
+      res.status(404).json({ error: "Onboarding profile not found" });
+      return;
+    }
+
+    const enrichedData = (profile.enrichedData as Record<string, unknown> | null | undefined) ?? {};
+    const businessDna = (enrichedData.businessDna as Record<string, unknown> | null | undefined) ?? null;
+    if (!isValidBusinessDna(businessDna)) {
+      res.status(400).json({ error: "Business DNA is not ready yet" });
+      return;
+    }
+    const currentMeta =
+      ((((businessDna as unknown as Record<string, unknown>).__meta as BusinessDnaArtifactMeta | undefined) ?? undefined));
+    if (currentMeta?.validationStatus === "failed") {
+      res.status(400).json({ error: "Business DNA failed validation and cannot be approved yet" });
+      return;
+    }
+
+    const approval = {
+      approved: true,
+      approvedAt: new Date().toISOString(),
+      approvedSnapshotId: approvedSnapshot.id,
+      approvalVersion: "v1" as const,
+    };
+    const nextBusinessDna = {
+      ...businessDna,
+      __meta: {
+        ...((currentMeta ?? {}) as BusinessDnaArtifactMeta),
+        approval,
+      } satisfies BusinessDnaArtifactMeta,
+    };
+    const nextEnriched = {
+      ...enrichedData,
+      businessDna: nextBusinessDna,
+    };
+
+    const [updated] = await db
+      .update(onboardingProfilesTable)
+      .set({ enrichedData: nextEnriched, updatedAt: new Date() })
+      .where(eq(onboardingProfilesTable.id, profile.id))
+      .returning();
+
+    if (!updated) {
+      res.status(500).json({ error: "Failed to approve Business DNA" });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      businessDna: nextBusinessDna,
+    });
+  } catch (err) {
+    if (!isDbUnavailableError(err)) {
+      throw err;
+    }
+    markFallbackUsed();
+    const client = memoryClients.get(clientId);
+    const profile = memoryOnboarding.get(clientId);
+    if (!client || !profile) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW before approving Business DNA." });
+      return;
+    }
+    const enrichedData = (profile.enrichedData as Record<string, unknown> | null | undefined) ?? {};
+    const businessDna = (enrichedData.businessDna as Record<string, unknown> | null | undefined) ?? null;
+    if (!isValidBusinessDna(businessDna)) {
+      res.status(400).json({ error: "Business DNA is not ready yet" });
+      return;
+    }
+    const currentMeta =
+      ((((businessDna as unknown as Record<string, unknown>).__meta as BusinessDnaArtifactMeta | undefined) ?? undefined));
+    if (currentMeta?.validationStatus === "failed") {
+      res.status(400).json({ error: "Business DNA failed validation and cannot be approved yet" });
+      return;
+    }
+    const approval = {
+      approved: true,
+      approvedAt: new Date().toISOString(),
+      approvedSnapshotId: approvedSnapshot.id,
+      approvalVersion: "v1" as const,
+    };
+    const nextBusinessDna = {
+      ...businessDna,
+      __meta: {
+        ...((currentMeta ?? {}) as BusinessDnaArtifactMeta),
+        approval,
+      } satisfies BusinessDnaArtifactMeta,
+    };
+    memoryOnboarding.set(clientId, {
+      ...profile,
+      enrichedData: {
+        ...enrichedData,
+        businessDna: nextBusinessDna,
+      },
+    });
+    res.json({
+      ok: true,
+      businessDna: nextBusinessDna,
+    });
+  }
+});
+
+router.patch("/clients/:clientId/template", async (req, res) => {
+  const { clientId } = req.params;
+  const templateType =
+    typeof (req.body as { templateType?: unknown } | null | undefined)?.templateType === "string"
+      ? String((req.body as { templateType: string }).templateType).trim()
+      : "";
+  if (!clientId || !templateType) {
+    res.status(400).json({ error: "clientId and templateType required" });
+    return;
+  }
+
+  try {
+    const [client] = await db.select().from(clientsTable).where(eq(clientsTable.id, clientId));
+    if (!client) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const sow = ((client.sow as Record<string, unknown> | null | undefined) ?? {}) as Record<string, unknown>;
+    const currentSnapshot = readApprovedSnapshot(sow);
+    const nextSow = {
+      ...sow,
+      __templatePreference: templateType,
+    } as Record<string, unknown>;
+    let snapshotChanged = false;
+    let nextSnapshot = currentSnapshot;
+    if (currentSnapshot) {
+      nextSnapshot = buildApprovedContextSnapshot({
+        clientId,
+        clientName: client.name,
+        websiteUrl: client.website,
+        instagramHandle: client.instagramHandle,
+        oneLineDescription: client.oneLineDescription,
+        sow: nextSow,
+        templateType,
+        previousSnapshot: currentSnapshot,
+      });
+      snapshotChanged = nextSnapshot.id !== currentSnapshot.id;
+      nextSow.__approvedContextSnapshot = nextSnapshot;
+      nextSow.__artifactState = {
+        snapshotId: nextSnapshot.id,
+        stale: snapshotChanged,
+        reason: snapshotChanged ? "template_changed_after_approval" : null,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    const [updated] = await db
+      .update(clientsTable)
+      .set({ sow: nextSow })
+      .where(eq(clientsTable.id, clientId))
+      .returning();
+    if (!updated) {
+      res.status(500).json({ error: "Failed to save template preference" });
+      return;
+    }
+    if (snapshotChanged && nextSnapshot) {
+      const [latestStrategy] = await db
+        .select()
+        .from(strategiesTable)
+        .where(eq(strategiesTable.clientId, clientId))
+        .orderBy(desc(strategiesTable.version))
+        .limit(1);
+      const [latestPlanner] = await db
+        .select()
+        .from(plannersTable)
+        .where(eq(plannersTable.clientId, clientId))
+        .orderBy(desc(plannersTable.createdAt))
+        .limit(1);
+      if (latestStrategy) {
+        await db
+          .update(strategiesTable)
+          .set({
+            structuredStrategy: markStructuredArtifactStale(
+              (latestStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? {},
+              nextSnapshot.id,
+            ),
+            updatedAt: new Date(),
+          })
+          .where(eq(strategiesTable.id, latestStrategy.id));
+      }
+      if (latestPlanner) {
+        await db
+          .update(plannersTable)
+          .set({
+            metadata: markPlannerArtifactStale(
+              (latestPlanner.metadata as Record<string, unknown> | null | undefined) ?? null,
+              nextSnapshot.id,
+            ),
+          })
+          .where(eq(plannersTable.id, latestPlanner.id));
+      }
+    }
+    res.json(serializeClient(updated));
+  } catch (err) {
+    if (!isDbUnavailableError(err)) throw err;
+    markFallbackUsed();
+    const client = memoryClients.get(clientId);
+    if (!client) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const sow = ((client.sow as Record<string, unknown> | null | undefined) ?? {}) as Record<string, unknown>;
+    const currentSnapshot = readApprovedSnapshot(sow);
+    const nextSow = {
+      ...sow,
+      __templatePreference: templateType,
+    } as Record<string, unknown>;
+    let nextSnapshot = currentSnapshot;
+    let snapshotChanged = false;
+    if (currentSnapshot) {
+      nextSnapshot = buildApprovedContextSnapshot({
+        clientId,
+        clientName: client.name,
+        websiteUrl: client.website,
+        instagramHandle: client.instagramHandle,
+        oneLineDescription: client.oneLineDescription,
+        sow: nextSow,
+        templateType,
+        previousSnapshot: currentSnapshot,
+      });
+      snapshotChanged = nextSnapshot.id !== currentSnapshot.id;
+      nextSow.__approvedContextSnapshot = nextSnapshot;
+      nextSow.__artifactState = {
+        snapshotId: nextSnapshot.id,
+        stale: snapshotChanged,
+        reason: snapshotChanged ? "template_changed_after_approval" : null,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    const updated = { ...client, sow: nextSow };
+    memoryClients.set(clientId, updated);
+    if (snapshotChanged && nextSnapshot) {
+      const latestStrategy = memoryStrategies.get(clientId);
+      if (latestStrategy) {
+        memoryStrategies.set(clientId, {
+          ...latestStrategy,
+          structuredStrategy: markStructuredArtifactStale(
+            (latestStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? {},
+            nextSnapshot.id,
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
     res.json(updated);
   }
 });
@@ -2789,6 +4251,13 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
       });
       return;
     }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate final Business DNA and Jump-to-Action." });
+      return;
+    }
 
     const [profile] = await db
       .select()
@@ -2801,6 +4270,38 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
       res.status(400).json({ error: "No onboarding profile found" });
       return;
     }
+
+    const [currentStrategyForApproval] = await db
+      .select()
+      .from(strategiesTable)
+      .where(eq(strategiesTable.clientId, clientId))
+      .orderBy(desc(strategiesTable.version))
+      .limit(1);
+
+    const enrichedProfileData =
+      ((profile.enrichedData as Record<string, unknown> | null | undefined) ?? {});
+    const businessDnaApprovalError = getBusinessDnaApprovalRequirementError(
+      enrichedProfileData,
+      approvedSnapshot.id,
+      "generating the full strategy",
+    );
+    if (businessDnaApprovalError) {
+      res.status(400).json({ error: businessDnaApprovalError });
+      return;
+    }
+    const jtaApprovalError = getJtaApprovalRequirementError(
+      (currentStrategyForApproval?.structuredStrategy as Record<string, unknown> | null | undefined) ?? null,
+      approvedSnapshot.id,
+      "generating the full strategy",
+    );
+    if (jtaApprovalError) {
+      res.status(400).json({ error: jtaApprovalError });
+      return;
+    }
+    const approvedJtaStructured = readApprovedJtaFromStructured(
+      (currentStrategyForApproval?.structuredStrategy as Record<string, unknown> | null | undefined) ?? null,
+      approvedSnapshot.id,
+    );
 
     const useRealAI = shouldUseRealAI(req);
     let resolvedStrategyLlm: LLMProvider | null = null;
@@ -2821,12 +4322,17 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
       }
     }
 
-    const raw = profile.rawInput as {
-      name: string;
-      websiteUrl: string;
-      instagramHandle: string;
-      oneLineDescription: string;
-      instagramSummaryNotes?: string;
+    const rawInput = (profile.rawInput as Record<string, unknown> | null | undefined) ?? {};
+    const snapshotInput = buildGenerationInputsFromSnapshot(approvedSnapshot, rawInput);
+    const raw = {
+      name: snapshotInput.name,
+      websiteUrl: snapshotInput.websiteUrl,
+      instagramHandle: snapshotInput.instagramHandle,
+      oneLineDescription: snapshotInput.oneLineDescription,
+      ...(snapshotInput.instagram ? { instagram: snapshotInput.instagram } : {}),
+      ...(snapshotInput.instagramSummaryNotes
+        ? { instagramSummaryNotes: snapshotInput.instagramSummaryNotes }
+        : {}),
     };
 
     const businessDna =
@@ -2835,7 +4341,7 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
     const mcpAvailable = isMcpAvailable(mcpConfig);
     const strategyMcpInput = {
       clientId,
-      templateType: body.templateType ?? null,
+      templateType: approvedSnapshot.templateType ?? null,
       raw: raw as Record<string, unknown>,
       enriched: (profile.enrichedData ?? {}) as Record<string, unknown>,
       businessDna: (businessDna as Record<string, unknown> | null | undefined) ?? null,
@@ -2853,26 +4359,77 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
     }
     const sowRec = (client.sow as Record<string, unknown> | null | undefined) ?? null;
     const normalizedStrategySections = getStrategyRelevantNormalizedSowSections(sowRec);
-    const strategyDnaSections = buildStrategyDnaSowSections(sowRec, normalizedStrategySections);
-    const currentBusinessDna = await buildBusinessDnaFromPublicSignals({
-      name: raw.name,
-      websiteUrl: raw.websiteUrl,
-      instagramHandle: raw.instagramHandle,
-      oneLineDescription: raw.oneLineDescription || null,
-      instagramSummaryNotes: typeof raw.instagramSummaryNotes === "string" ? raw.instagramSummaryNotes : null,
-      existing: businessDna,
-      enrichedProfile: {
-        ...((profile.enrichedData as Record<string, unknown> | null | undefined) ?? {}),
-        ...(mcpStrategy.enriched.enriched as Record<string, unknown>),
+    const strategyDnaSections = snapshotInput.sowSections;
+    const approvedBusinessDnaForStrategy = readApprovedBusinessDnaFromEnriched(
+      ((profile.enrichedData as Record<string, unknown> | null | undefined) ?? {}),
+      approvedSnapshot.id,
+    );
+    const currentBusinessDna =
+      approvedBusinessDnaForStrategy ??
+      (await buildBusinessDnaFromPublicSignals({
+        name: raw.name,
+        websiteUrl: raw.websiteUrl,
+        instagramHandle: raw.instagramHandle,
+        structuredInstagram: readStructuredInstagramFromUnknown(raw.instagram),
+        oneLineDescription: raw.oneLineDescription || null,
+        instagramSummaryNotes: typeof raw.instagramSummaryNotes === "string" ? raw.instagramSummaryNotes : null,
+        existing: businessDna,
+        enrichedProfile: {
+          ...((profile.enrichedData as Record<string, unknown> | null | undefined) ?? {}),
+          ...(mcpStrategy.enriched.enriched as Record<string, unknown>),
+        },
+        mcpData:
+          ((mcpStrategy.enriched.enriched as Record<string, unknown>).mcp as Record<string, unknown> | null | undefined) ??
+          null,
+        sowSections: {
+          understandingOfRequirements: strategyDnaSections.understandingOfRequirements,
+          scopeOfWork: strategyDnaSections.scopeOfWork,
+        },
+      }));
+    const currentProviderInfo = resolvedStrategyLlm?.describe?.() ?? {
+      provider: useRealAI ? "provider_pending" : "demo",
+      model: useRealAI ? "provider_pending" : "deterministic",
+    };
+    const approvedBusinessDnaMeta = approvedBusinessDnaForStrategy
+      ? (((approvedBusinessDnaForStrategy as unknown as Record<string, unknown>).__meta as BusinessDnaArtifactMeta | undefined) ??
+        undefined)
+      : undefined;
+    const businessDnaRunMeta = buildRunMeta({
+      clientId,
+      snapshotId: approvedSnapshot.id,
+      taskType: "business_dna",
+      provider: approvedBusinessDnaMeta?.provider ?? currentProviderInfo.provider,
+      model: approvedBusinessDnaMeta?.model ?? currentProviderInfo.model,
+      fallbackUsed: approvedBusinessDnaForStrategy ? approvedBusinessDnaMeta?.generationMode !== "llm" : false,
+      sourceContext: "approved_snapshot",
+      generationMode:
+        approvedBusinessDnaForStrategy && approvedBusinessDnaMeta?.generationMode === "llm"
+          ? "llm"
+          : "heuristic",
+      validation: {
+        status: approvedBusinessDnaMeta?.validationStatus ?? "not_run",
+        note:
+          approvedBusinessDnaForStrategy
+            ? approvedBusinessDnaMeta?.fallbackReason ?? "Using approved Business DNA artifact for strategy generation."
+            : "Phase 1 placeholder - Business DNA semantic validation not wired yet.",
+        issues: approvedBusinessDnaMeta?.validationIssues ?? [],
       },
-      mcpData:
-        ((mcpStrategy.enriched.enriched as Record<string, unknown>).mcp as Record<string, unknown> | null | undefined) ??
-        null,
-      sowSections: {
-        understandingOfRequirements: strategyDnaSections.understandingOfRequirements,
-        scopeOfWork: strategyDnaSections.scopeOfWork,
-      },
+      inputSources: buildBusinessDnaInputSourceSummary({
+        sourceContext: "approved_snapshot",
+        websiteUrl: raw.websiteUrl,
+        instagramHandle: raw.instagramHandle,
+        structuredInstagram: readStructuredInstagramFromUnknown(raw.instagram),
+        instagramSummaryNotes: typeof raw.instagramSummaryNotes === "string" ? raw.instagramSummaryNotes : null,
+        sowSections: strategyDnaSections,
+        mcpDataPresent:
+          Boolean(
+            ((mcpStrategy.enriched.enriched as Record<string, unknown>).mcp as Record<string, unknown> | null | undefined) ??
+              null,
+          ),
+        strategyType: approvedSnapshot.templateType ?? null,
+      }),
     });
+    req.log.info({ clientId, trace: businessDnaRunMeta }, "Business DNA pre-strategy trace prepared");
     req.log.info(
       {
         available: mcpAvailable,
@@ -2895,14 +4452,29 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
           ? (mcpStrategy as { toolResultSummary?: Record<string, unknown> | null }).toolResultSummary ?? null
           : null,
     });
+    const refreshedBusinessDnaArtifact = approvedBusinessDnaForStrategy
+      ? {
+          ...((profile.enrichedData as Record<string, unknown> | null) ?? {}),
+          businessDna: currentBusinessDna as unknown as Record<string, unknown>,
+        }
+      : annotateBusinessDnaArtifact(
+          {
+            ...((profile.enrichedData as Record<string, unknown> | null) ?? {}),
+            businessDna: currentBusinessDna as unknown as Record<string, unknown>,
+          },
+          businessDnaRunMeta,
+          approvedSnapshot.id,
+          false,
+        );
     const preLlmEnriched: Record<string, unknown> = {
-      ...((profile.enrichedData as Record<string, unknown> | null) ?? {}),
-      businessDna: currentBusinessDna as unknown as Record<string, unknown>,
+      ...refreshedBusinessDnaArtifact,
       __provenance: {
+        ...((refreshedBusinessDnaArtifact.__provenance as Record<string, unknown> | undefined) ?? {}),
         mcp: mcpProv,
         phase: "pre-llm",
         savedAt: new Date().toISOString(),
         websiteMcp: currentBusinessDna.mcp?.website ?? null,
+        sourceContext: "approved_snapshot",
       },
     };
     const sowOptimization = buildOptimizedSowContext({
@@ -2935,9 +4507,12 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
       .where(eq(strategiesTable.clientId, clientId))
       .orderBy(desc(strategiesTable.version))
       .limit(1);
-    const selectedTemplate = (body.templateType ?? "brand_building") as string;
+    const selectedTemplate = resolveConcreteTemplateType(
+      preLlmEnriched as Record<string, unknown>,
+      body.templateType ?? approvedSnapshot.templateType ?? null,
+    );
     const requestedDetail = req.header("x-strategy-detail")?.trim().toLowerCase();
-    const detailLevel: StrategyDetailLevel = requestedDetail === "full" ? "full" : "core";
+    const detailLevel: StrategyDetailLevel = requestedDetail === "core" ? "core" : "full";
     const nextVersion = (existing?.version ?? 0) + 1;
     const provisionalCanonical = ensureCanonicalStrategyPayload(
       client,
@@ -2951,7 +4526,7 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
       .insert(strategiesTable)
       .values({
         clientId,
-        structuredStrategy: {
+        structuredStrategy: annotateStrategyStructured({
           ...(provisionalCanonical.structured as Record<string, unknown>),
           __meta: {
             ...(((provisionalCanonical.structured as Record<string, unknown>).__meta as Record<
@@ -2963,7 +4538,15 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
               updatedAt: new Date().toISOString(),
             },
           },
-        },
+        }, buildRunMeta({
+          clientId,
+          snapshotId: approvedSnapshot.id,
+          taskType: "strategy_generate",
+          provider: currentProviderInfo.provider,
+          model: currentProviderInfo.model,
+          fallbackUsed: false,
+          sourceContext: "approved_snapshot",
+        }), approvedSnapshot.id, false),
         strategyDocument: provisionalCanonical.document,
         templateType: selectedTemplate as TemplateType,
         version: nextVersion,
@@ -3056,12 +4639,14 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
           enriched = buildFastEnrichedProfile({
             raw,
             existingEnriched,
+            sow: sowRec,
           }) as Awaited<ReturnType<typeof enrich>>;
         }
         enriched = {
           ...enriched,
           ...mcpStrategy.enriched.enriched,
           businessDna: currentBusinessDna,
+          approvedJumpToAction: approvedJtaStructured,
           sowSummary: sowOptimization.mergedContext,
         } as typeof enriched & { sowSummary: string };
         req.log.info(
@@ -3092,7 +4677,7 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
         );
         tpl = selectTemplate(
           enriched as unknown as Record<string, unknown>,
-          body.templateType ?? null,
+          body.templateType ?? approvedSnapshot.templateType ?? null,
         );
         const structuredStartedAt = Date.now();
         const structuredOutput = await withTimeout(
@@ -3109,7 +4694,22 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
               topSections: sowOptimization.topSections,
             },
           },
-          { detailLevel },
+          {
+            detailLevel,
+            strategyContext: {
+              activePlatforms: readSelectedPlatforms(sowRec),
+              monthlyPostCounts: readMonthlyPosts(sowRec),
+              contentMixBreakdown: readContentMix(sowRec),
+              toneByPlatform: readToneByPlatform(sowRec),
+              targetAudienceDefinition: String(sowRec?.targetAudience ?? ""),
+              businessObjectives:
+                firstUseful([
+                  String((normalizedStrategySections ?? {}).objectivesAndGoals ?? ""),
+                  String((sowRec?.businessObjectives as string | undefined) ?? ""),
+                  String((sowRec?.goals as string | undefined) ?? ""),
+                ]) || raw.oneLineDescription,
+            },
+          },
           ),
           Number(process.env.STRATEGY_STRUCTURED_TIMEOUT_MS ?? "25000"),
           "strategy_structured_generation",
@@ -3261,6 +4861,21 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
     );
     structured = canonicalReady.structured;
     const strategySummary = buildStrategySummary(client.name, structured);
+    const strategyRunMeta = buildRunMeta({
+      clientId,
+      snapshotId: approvedSnapshot.id,
+      taskType: "strategy_generate",
+      provider:
+        strategySource === "fallback" && strategyAiFailure
+          ? strategyAiFailure.providerId
+          : (resolvedStrategyLlm?.describe?.().provider ?? currentProviderInfo.provider),
+      model:
+        strategySource === "fallback" && strategyAiFailure
+          ? strategyAiFailure.model
+          : (resolvedStrategyLlm?.describe?.().model ?? currentProviderInfo.model),
+      fallbackUsed: strategySource === "fallback",
+      sourceContext: "approved_snapshot",
+    });
     structured = {
       ...structured,
       __summary: {
@@ -3272,6 +4887,10 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
         ...(((structured.__meta as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>),
         mcp: mcpProv,
         strategySource,
+        latestRun: strategyRunMeta,
+        snapshotId: approvedSnapshot.id,
+        sourceContext: "approved_snapshot",
+        snapshotState: "fresh",
         tokenUsage: {
           sowSourceTokens: sowOptimization.sourceTokens,
           sowContextTokens: sowOptimization.mergedContextTokens,
@@ -3284,7 +4903,17 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
 
     await db
       .update(onboardingProfilesTable)
-      .set({ enrichedData: enriched, updatedAt: new Date() })
+      .set({
+        enrichedData: approvedBusinessDnaForStrategy
+          ? (enriched as unknown as Record<string, unknown>)
+          : annotateBusinessDnaArtifact(
+              enriched as unknown as Record<string, unknown>,
+              businessDnaRunMeta,
+              approvedSnapshot.id,
+              false,
+            ),
+        updatedAt: new Date(),
+      })
       .where(eq(onboardingProfilesTable.id, profile.id));
 
     const [strategy] = await db
@@ -3306,8 +4935,12 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
 
     req.log.info({ source: strategySource }, "Strategy generation source selected");
     res.setHeader("x-strategy-source", strategySource);
-    if (resolvedStrategyLlm) {
-      const info = resolvedStrategyLlm.describe?.() ?? { provider: "unknown", model: "default" };
+    const responseProvider =
+      strategySource === "fallback" && strategyAiFailure
+        ? { provider: strategyAiFailure.providerId, model: strategyAiFailure.model }
+        : resolvedStrategyLlm?.describe?.() ?? null;
+    if (responseProvider) {
+      const info = responseProvider;
       res.setHeader("x-ai-provider", info.provider);
       res.setHeader("x-ai-model", info.model);
     }
@@ -3334,8 +4967,18 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
         });
         return;
       }
+      const approvedSnapshot = readApprovedSnapshot(
+        (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+      );
+      if (!approvedSnapshot) {
+        res.status(400).json({ error: "Approve SOW to generate final Business DNA and Jump-to-Action." });
+        return;
+      }
 
-      const selectedTemplate = (body.templateType ?? "brand_building") as string;
+      const selectedTemplate = resolveConcreteTemplateType(
+        (memoryProfile.enrichedData as Record<string, unknown> | null | undefined) ?? null,
+        body.templateType ?? approvedSnapshot.templateType ?? null,
+      );
       const now = new Date().toISOString();
       const previous = memoryStrategies.get(clientId);
       const nextVersion = (previous?.version ?? 0) + 1;
@@ -3350,10 +4993,24 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
         nextVersion - 1,
         memoryDna,
       );
+      const strategyRunMetaMem = buildRunMeta({
+        clientId,
+        snapshotId: approvedSnapshot.id,
+        taskType: "strategy_generate",
+        provider: shouldUseRealAI(req) ? "fallback" : "demo",
+        model: shouldUseRealAI(req) ? "safe_template" : "deterministic",
+        fallbackUsed: true,
+        sourceContext: "approved_snapshot",
+      });
       const strategy: MemoryStrategy = {
         id: randomUUID(),
         clientId,
-        structuredStrategy: canonicalReady.structured,
+        structuredStrategy: annotateStrategyStructured(
+          canonicalReady.structured,
+          strategyRunMetaMem,
+          approvedSnapshot.id,
+          false,
+        ),
         strategyDocument: canonicalReady.document,
         templateType: selectedTemplate,
         version: nextVersion,
@@ -3379,6 +5036,8 @@ router.post("/clients/:clientId/strategy/generate", async (req, res) => {
           })
         : realAiDisabledFailure({ providerId: "demo", model: "deterministic" });
       res.setHeader("x-strategy-source", "fallback");
+      res.setHeader("x-ai-provider", strategyAiFailureMem.providerId);
+      res.setHeader("x-ai-model", strategyAiFailureMem.model);
       res.json({
         ...strategy,
         strategySource: "fallback" as const,
@@ -3405,16 +5064,20 @@ router.post("/clients/:clientId/strategy/bootstrap", async (req, res) => {
       return;
     }
 
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate Business DNA and Jump-to-Action." });
+      return;
+    }
+
     const [existing] = await db
       .select()
       .from(strategiesTable)
       .where(eq(strategiesTable.clientId, clientId))
       .orderBy(desc(strategiesTable.version))
       .limit(1);
-    if (existing) {
-      res.json(serializeStrategy(existing));
-      return;
-    }
 
     const [profile] = await db
       .select()
@@ -3427,37 +5090,311 @@ router.post("/clients/:clientId/strategy/bootstrap", async (req, res) => {
       return;
     }
 
-    const businessDna =
-      (profile.enrichedData as { businessDna?: BusinessDna } | null | undefined)?.businessDna ?? null;
-    if (!isValidBusinessDna(businessDna)) {
-      res.status(400).json({ error: "Business DNA is not ready yet" });
+    const requestedTemplateType =
+      typeof (req.body as { templateType?: unknown } | null | undefined)?.templateType === "string"
+        ? String((req.body as { templateType: string }).templateType).trim()
+        : null;
+
+    const enrichedData = (profile.enrichedData as Record<string, unknown> | null | undefined) ?? {};
+    const approvedBusinessDna = readApprovedBusinessDnaFromEnriched(enrichedData, approvedSnapshot.id);
+    if (!approvedBusinessDna) {
+      res.status(400).json({ error: "Approved Business DNA is required before generating Jump-to-Action." });
       return;
     }
 
-    const requestedTemplate =
-      typeof (req.body as { templateType?: unknown } | null | undefined)?.templateType === "string"
-        ? String((req.body as { templateType?: string }).templateType).trim()
-        : "";
-    const templateType = (requestedTemplate || "brand_building") as TemplateType;
-    const canonicalSections = buildBootstrapCanonicalSections({
+    const templateType = resolveConcreteTemplateType(
+      enrichedData,
+      requestedTemplateType ?? approvedSnapshot.templateType ?? null,
+    );
+    const aiHeaderDiagnostics = buildAiHeaderDiagnostics(req);
+    let resolvedProvider: LLMProvider | null = null;
+    let providerInfo = { provider: "fallback", model: "bootstrap_deterministic" };
+    if (shouldUseRealAI(req)) {
+      try {
+        resolvedProvider = getRequestLLMProvider(req);
+        providerInfo = resolvedProvider.describe?.() ?? { provider: resolvedProvider.id, model: "default" };
+      } catch (error) {
+        providerInfo = { provider: "fallback", model: "bootstrap_deterministic" };
+        req.log.warn({ clientId, err: error }, "JTA/bootstrap falling back because no AI provider was available");
+      }
+    }
+    const approvedSowRecord = approvedSnapshot.sow as Record<string, unknown>;
+    const businessType = classifyBusinessType({
+      brandName: client.name,
+      clientName: client.name,
+      oneLineDescription: client.oneLineDescription,
+      industry: approvedSowRecord.industry,
+      targetAudience: approvedSowRecord.targetAudience,
+      websiteText: client.website,
+      instagramBio: approvedBusinessDna.platformSignals?.instagram?.bioSignals?.join(" "),
+      offerSummary: approvedBusinessDna.offers?.primaryOffers?.[0] ?? approvedBusinessDna.offers?.transformationPromise,
+    });
+    const snapshotInput = buildGenerationInputsFromSnapshot(
+      approvedSnapshot,
+      (profile.rawInput as Record<string, unknown> | null | undefined) ?? null,
+    );
+    const importedResearchBrief =
+      (profile.rawInput as Record<string, unknown> | null | undefined)?.importedResearchBrief ?? null;
+    const websiteSummary = summarizeWebsiteForBusinessDnaInput(approvedBusinessDna);
+    const resolvedBrandName = resolveClientFacingBrandName(client.name, {
+      oneLineDescription: client.oneLineDescription,
+      websiteTitle: websiteSummary?.title ?? null,
+    });
+    const fallbackCanonicalSections = buildBootstrapCanonicalSections({
       client: {
-        name: client.name,
+        name: resolvedBrandName,
         website: client.website,
         instagramHandle: client.instagramHandle,
         oneLineDescription: client.oneLineDescription,
       },
-      businessDna,
+      businessDna: approvedBusinessDna,
       sow: (client.sow as Record<string, unknown> | null | undefined) ?? null,
       templateType,
     });
-    const structuredStrategy: Record<string, unknown> = {
+    const jtaInput = buildApprovedJtaGeneratorInput({
+      approvedSnapshot,
+      snapshotInput,
+      clientName: client.name,
+      businessType: { primary: businessType.primary, confidence: businessType.confidence },
+      approvedBusinessDna,
+      templateType,
+      importedResearchBrief:
+        importedResearchBrief && typeof importedResearchBrief === "object" && !Array.isArray(importedResearchBrief)
+          ? (importedResearchBrief as Record<string, unknown>)
+          : null,
+      websiteSummary,
+    });
+    if (shouldLogProvenance()) {
+      req.log.info(
+        {
+          clientId,
+          clientName: client.name,
+          businessType: businessType.primary,
+          artifactStage: "jump_to_action",
+          approvedSnapshotId: approvedSnapshot.id,
+          sourceSnippet: {
+            sow: previewText(jtaInput.sow, 300),
+            approvedBusinessDna: previewText(jtaInput.approvedBusinessDna, 300),
+            instagram: previewText(jtaInput.instagram, 220),
+          },
+          promptInput: previewJson(jtaInput),
+        },
+        "Jump-to-Action provenance source",
+      );
+    }
+    let canonicalSections = fallbackCanonicalSections;
+    let fallbackUsed = true;
+    let fallbackReason = "AI generation unavailable; deterministic Jump-to-Action fallback was used.";
+    let repairAttempted = false;
+    let repairSucceeded = false;
+    if (resolvedProvider) {
+      try {
+        const generated = await generateJtaWithLlm({
+          provider: resolvedProvider,
+          input: jtaInput,
+        });
+        const generatedSections = sanitizeJtaCanonicalSections(
+          generated.canonicalSections,
+          client.name,
+          jtaInput.client.brandName,
+        );
+        const generatedAssessment = evaluateJtaCandidate({
+          canonicalSections: generatedSections,
+          businessTypePrimary: businessType.primary,
+          platforms: Array.isArray(approvedSowRecord.platforms)
+            ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+            : [],
+          approvedBusinessDnaCategory: approvedBusinessDna.positioning?.category ?? null,
+          approvedBusinessDnaAudience: approvedBusinessDna.targetAudience?.segments ?? [],
+          approvedBusinessDnaPains: approvedBusinessDna.targetAudience?.pains ?? [],
+          approvedBusinessDnaThemes: approvedBusinessDna.contentStrategy?.themes ?? [],
+          approvedBusinessDnaDifferentiators: approvedBusinessDna.positioning?.differentiators ?? [],
+          proofConstraints: jtaInput.proofConstraints ?? null,
+          proofGaps: jtaInput.approvedResearchContext?.proofGaps ?? null,
+        });
+        if (generatedAssessment.validationStatus === "failed") {
+          repairAttempted = true;
+          const repaired = await generateJtaWithLlm({
+            provider: resolvedProvider,
+            input: jtaInput,
+            repairIssues: buildJtaRepairInstructionLines({
+              ok: generatedAssessment.validationStatus !== "failed",
+              status: generatedAssessment.validationStatus,
+              issues: generatedAssessment.validationIssues,
+              issueDetails: generatedAssessment.validationIssueDetails,
+            }),
+            existingDraft: generatedSections,
+          });
+          const repairedSections = sanitizeJtaCanonicalSections(
+            repaired.canonicalSections,
+            client.name,
+            jtaInput.client.brandName,
+          );
+          const repairedAssessment = evaluateJtaCandidate({
+            canonicalSections: repairedSections,
+            businessTypePrimary: businessType.primary,
+            platforms: Array.isArray(approvedSowRecord.platforms)
+              ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+              : [],
+            approvedBusinessDnaCategory: approvedBusinessDna.positioning?.category ?? null,
+            approvedBusinessDnaAudience: approvedBusinessDna.targetAudience?.segments ?? [],
+            approvedBusinessDnaPains: approvedBusinessDna.targetAudience?.pains ?? [],
+            approvedBusinessDnaThemes: approvedBusinessDna.contentStrategy?.themes ?? [],
+            approvedBusinessDnaDifferentiators: approvedBusinessDna.positioning?.differentiators ?? [],
+            proofConstraints: jtaInput.proofConstraints ?? null,
+          proofGaps: jtaInput.approvedResearchContext?.proofGaps ?? null,
+          });
+          if (repairedAssessment.validationStatus !== "failed") {
+            canonicalSections = repairedSections;
+            fallbackUsed = false;
+            fallbackReason = "";
+            repairSucceeded = true;
+            providerInfo = { provider: repaired.provider ?? providerInfo.provider, model: repaired.model ?? providerInfo.model };
+          } else {
+            setLastFailureStage("validation_failed_after_response");
+            fallbackReason = `LLM Jump-to-Action failed validation after repair: ${repairedAssessment.validationIssues.join("; ")}`;
+          }
+        } else {
+          canonicalSections = generatedSections;
+          fallbackUsed = false;
+          fallbackReason = "";
+          providerInfo = { provider: generated.provider ?? providerInfo.provider, model: generated.model ?? providerInfo.model };
+        }
+      } catch (error) {
+        fallbackReason = error instanceof Error ? error.message : String(error);
+        req.log.warn({ clientId, err: error }, "JTA/bootstrap fell back to deterministic output");
+      }
+    }
+    const jtaValidation = evaluateJtaCandidate({
+      canonicalSections,
+      businessTypePrimary: businessType.primary,
+      platforms: Array.isArray(approvedSowRecord.platforms)
+        ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      approvedBusinessDnaCategory: approvedBusinessDna.positioning?.category ?? null,
+      approvedBusinessDnaAudience: approvedBusinessDna.targetAudience?.segments ?? [],
+      approvedBusinessDnaPains: approvedBusinessDna.targetAudience?.pains ?? [],
+      approvedBusinessDnaThemes: approvedBusinessDna.contentStrategy?.themes ?? [],
+      approvedBusinessDnaDifferentiators: approvedBusinessDna.positioning?.differentiators ?? [],
+      proofConstraints: jtaInput.proofConstraints ?? null,
+      proofGaps: jtaInput.approvedResearchContext?.proofGaps ?? null,
+    });
+    const runMeta = buildRunMeta({
+      clientId,
+      snapshotId: approvedSnapshot.id,
+      taskType: "strategy_bootstrap",
+      provider: providerInfo.provider,
+      model: providerInfo.model,
+      fallbackUsed,
+      sourceContext: "approved_snapshot",
+      generationMode: fallbackUsed ? "deterministic" : "llm",
+      validation: {
+        status: jtaValidation.validationStatus,
+        note:
+          jtaValidation.validationIssues.length > 0
+            ? buildJtaRepairPromptInput({
+                ok: jtaValidation.validationStatus !== "failed",
+                status: jtaValidation.validationStatus,
+                issues: jtaValidation.validationIssues,
+                issueDetails: jtaValidation.validationIssueDetails,
+              })
+            : fallbackUsed
+              ? fallbackReason
+              : "Jump-to-Action validation passed.",
+        issues: jtaValidation.validationIssues,
+      },
+      inputSources: buildJtaBootstrapInputSourceSummary({
+        sourceContext: "approved_snapshot",
+        templateType,
+        businessDna: approvedBusinessDna,
+        sow: (client.sow as Record<string, unknown> | null | undefined) ?? null,
+        client: {
+          website: client.website,
+          instagramHandle: client.instagramHandle,
+          oneLineDescription: client.oneLineDescription,
+        },
+      }),
+      diagnostics: {
+        ...aiHeaderDiagnostics,
+        hasImportedResearchContext: Boolean(jtaInput.approvedResearchContext),
+        proofConstraintsPresent: Boolean(jtaInput.proofConstraints),
+        compactionFieldCount: countJtaResearchContextFields(jtaInput.approvedResearchContext),
+        resolvedBrandName: jtaInput.client.brandName,
+        ...buildProviderDiagnostics(resolvedProvider, {
+          repairAttempted,
+          repairSucceeded,
+          fallbackReason: fallbackUsed ? fallbackReason : null,
+        }),
+      },
+    });
+    if (shouldLogProvenance()) {
+      req.log.info(
+        {
+          clientId,
+          clientName: client.name,
+          businessType: businessType.primary,
+          artifactStage: "jump_to_action",
+          contentSource: fallbackUsed ? "deterministic_fallback" : "llm",
+          helper_modified_content_fields: fallbackUsed ? "yes" : "no",
+          helperNames: fallbackUsed ? ["buildBootstrapCanonicalSections"] : [],
+          finalArtifact: previewJson(canonicalSections),
+        },
+        "Jump-to-Action provenance final",
+      );
+    }
+    const structuredStrategyBase: Record<string, unknown> = {
       canonicalSections,
       __meta: {
-        sectionApprovals: Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, false])),
-        regenerateCounters: Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, 0])),
-        strategySource: "bootstrap",
+        sectionApprovals: existing
+          ? (((existing.structuredStrategy as Record<string, unknown> | undefined)?.__meta as { sectionApprovals?: Record<string, boolean> } | undefined)
+              ?.sectionApprovals ??
+            Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, false])))
+          : Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, false])),
+        regenerateCounters: existing
+          ? (((existing.structuredStrategy as Record<string, unknown> | undefined)?.__meta as { regenerateCounters?: Record<string, number> } | undefined)
+              ?.regenerateCounters ??
+            Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, 0])))
+          : Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, 0])),
+        strategySource: fallbackUsed ? "fallback" : "bootstrap",
+        snapshotId: approvedSnapshot.id,
+        sourceContext: "approved_snapshot",
+        ...(fallbackUsed ? { aiFailure: { message: fallbackReason } } : {}),
       },
     };
+    const structuredStrategy = annotateStrategyStructured(
+      structuredStrategyBase,
+      runMeta,
+      approvedSnapshot.id,
+      false,
+      businessType,
+    );
+    req.log.info(
+      {
+        clientId,
+        trace: ((structuredStrategy.__meta as Record<string, unknown> | undefined)?.latestRun ?? null),
+      },
+      "JTA/bootstrap trace prepared",
+    );
+
+    if (existing) {
+      const [updated] = await db
+        .update(strategiesTable)
+        .set({
+          structuredStrategy,
+          strategyDocument: buildCanonicalDocument(client.name, canonicalSections),
+          templateType,
+          status: "draft",
+          updatedAt: new Date(),
+        })
+        .where(eq(strategiesTable.id, existing.id))
+        .returning();
+      if (!updated) {
+        res.status(500).json({ error: "Failed to regenerate bootstrap strategy" });
+        return;
+      }
+      res.json(serializeStrategy(updated));
+      return;
+    }
 
     const [created] = await db
       .insert(strategiesTable)
@@ -3481,7 +5418,418 @@ router.post("/clients/:clientId/strategy/bootstrap", async (req, res) => {
     if (!isDbUnavailableError(err)) {
       throw err;
     }
-    res.status(503).json({ error: "Strategy bootstrap is temporarily unavailable." });
+    markFallbackUsed();
+    const memoryClient = memoryClients.get(clientId);
+    const memoryProfile = memoryOnboarding.get(clientId);
+    if (!memoryClient || !memoryProfile) {
+      res.status(503).json({
+        error:
+          "Strategy bootstrap is temporarily unavailable. The database is unreachable and this client is not in the offline session. Retry when the database is available, or create the client again while the API is running in offline fallback mode.",
+      });
+      return;
+    }
+    const approvedSnapshot = readApprovedSnapshot(
+      (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate Business DNA and Jump-to-Action." });
+      return;
+    }
+    const existingMem = memoryStrategies.get(clientId);
+    const enrichedDataMem = (memoryProfile.enrichedData as Record<string, unknown> | null | undefined) ?? {};
+    const approvedBusinessDnaMem = readApprovedBusinessDnaFromEnriched(enrichedDataMem, approvedSnapshot.id);
+    if (!approvedBusinessDnaMem) {
+      res.status(400).json({ error: "Approved Business DNA is required before generating Jump-to-Action." });
+      return;
+    }
+    const templateTypeMem = resolveConcreteTemplateType(
+      enrichedDataMem,
+      approvedSnapshot.templateType ?? null,
+    );
+    const approvedSowRecord = approvedSnapshot.sow as Record<string, unknown>;
+    const businessType = classifyBusinessType({
+      brandName: memoryClient.name,
+      clientName: memoryClient.name,
+      oneLineDescription: memoryClient.oneLineDescription,
+      industry: approvedSowRecord.industry,
+      targetAudience: approvedSowRecord.targetAudience,
+      websiteText: memoryClient.website,
+      instagramBio: approvedBusinessDnaMem.platformSignals?.instagram?.bioSignals?.join(" "),
+      offerSummary: approvedBusinessDnaMem.offers?.primaryOffers?.[0] ?? approvedBusinessDnaMem.offers?.transformationPromise,
+    });
+    const aiHeaderDiagnostics = buildAiHeaderDiagnostics(req);
+    let resolvedMemProvider: LLMProvider | null = null;
+    let memProviderInfo = { provider: "fallback", model: "bootstrap_deterministic" };
+    if (shouldUseRealAI(req)) {
+      try {
+        resolvedMemProvider = getRequestLLMProvider(req);
+        memProviderInfo = resolvedMemProvider.describe?.() ?? { provider: resolvedMemProvider.id, model: "default" };
+      } catch (error) {
+        memProviderInfo = { provider: "fallback", model: "bootstrap_deterministic" };
+        req.log.warn({ clientId, err: error, persistence: "memory_fallback" }, "JTA/bootstrap falling back because no AI provider was available");
+      }
+    }
+    const snapshotInput = buildGenerationInputsFromSnapshot(
+      approvedSnapshot,
+      (memoryProfile.rawInput as Record<string, unknown> | null | undefined) ?? null,
+    );
+    const importedResearchBriefMem =
+      (memoryProfile.rawInput as Record<string, unknown> | null | undefined)?.importedResearchBrief ?? null;
+    const websiteSummaryMem = summarizeWebsiteForBusinessDnaInput(approvedBusinessDnaMem);
+    const resolvedBrandNameMem = resolveClientFacingBrandName(memoryClient.name, {
+      oneLineDescription: memoryClient.oneLineDescription,
+      websiteTitle: websiteSummaryMem?.title ?? null,
+    });
+    const fallbackCanonicalSectionsMem = buildBootstrapCanonicalSections({
+      client: {
+        name: resolvedBrandNameMem,
+        website: memoryClient.website,
+        instagramHandle: memoryClient.instagramHandle,
+        oneLineDescription: memoryClient.oneLineDescription,
+      },
+      businessDna: approvedBusinessDnaMem,
+      sow: (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+      templateType: templateTypeMem,
+    });
+    const jtaInput = buildApprovedJtaGeneratorInput({
+      approvedSnapshot,
+      snapshotInput,
+      clientName: memoryClient.name,
+      businessType: { primary: businessType.primary, confidence: businessType.confidence },
+      approvedBusinessDna: approvedBusinessDnaMem,
+      templateType: templateTypeMem,
+      importedResearchBrief:
+        importedResearchBriefMem && typeof importedResearchBriefMem === "object" && !Array.isArray(importedResearchBriefMem)
+          ? (importedResearchBriefMem as Record<string, unknown>)
+          : null,
+      websiteSummary: websiteSummaryMem,
+    });
+    let canonicalSectionsMem = fallbackCanonicalSectionsMem;
+    let fallbackUsed = true;
+    let fallbackReason = "AI generation unavailable; deterministic Jump-to-Action fallback was used.";
+    let repairAttempted = false;
+    let repairSucceeded = false;
+    if (resolvedMemProvider) {
+      try {
+        const generated = await generateJtaWithLlm({
+          provider: resolvedMemProvider,
+          input: jtaInput,
+        });
+        const generatedSectionsMem = sanitizeJtaCanonicalSections(
+          generated.canonicalSections,
+          memoryClient.name,
+          jtaInput.client.brandName,
+        );
+        const generatedAssessment = evaluateJtaCandidate({
+          canonicalSections: generatedSectionsMem,
+          businessTypePrimary: businessType.primary,
+          platforms: Array.isArray(approvedSowRecord.platforms)
+            ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+            : [],
+          approvedBusinessDnaCategory: approvedBusinessDnaMem.positioning?.category ?? null,
+          approvedBusinessDnaAudience: approvedBusinessDnaMem.targetAudience?.segments ?? [],
+          approvedBusinessDnaPains: approvedBusinessDnaMem.targetAudience?.pains ?? [],
+          approvedBusinessDnaThemes: approvedBusinessDnaMem.contentStrategy?.themes ?? [],
+          approvedBusinessDnaDifferentiators: approvedBusinessDnaMem.positioning?.differentiators ?? [],
+          proofConstraints: jtaInput.proofConstraints ?? null,
+          proofGaps: jtaInput.approvedResearchContext?.proofGaps ?? null,
+        });
+        if (generatedAssessment.validationStatus === "failed") {
+          repairAttempted = true;
+          const repaired = await generateJtaWithLlm({
+            provider: resolvedMemProvider,
+            input: jtaInput,
+            repairIssues: buildJtaRepairInstructionLines({
+              ok: generatedAssessment.validationStatus !== "failed",
+              status: generatedAssessment.validationStatus,
+              issues: generatedAssessment.validationIssues,
+              issueDetails: generatedAssessment.validationIssueDetails,
+            }),
+            existingDraft: generatedSectionsMem,
+          });
+          const repairedSectionsMem = sanitizeJtaCanonicalSections(
+            repaired.canonicalSections,
+            memoryClient.name,
+            jtaInput.client.brandName,
+          );
+          const repairedAssessment = evaluateJtaCandidate({
+            canonicalSections: repairedSectionsMem,
+            businessTypePrimary: businessType.primary,
+            platforms: Array.isArray(approvedSowRecord.platforms)
+              ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+              : [],
+            approvedBusinessDnaCategory: approvedBusinessDnaMem.positioning?.category ?? null,
+            approvedBusinessDnaAudience: approvedBusinessDnaMem.targetAudience?.segments ?? [],
+            approvedBusinessDnaPains: approvedBusinessDnaMem.targetAudience?.pains ?? [],
+            approvedBusinessDnaThemes: approvedBusinessDnaMem.contentStrategy?.themes ?? [],
+            approvedBusinessDnaDifferentiators: approvedBusinessDnaMem.positioning?.differentiators ?? [],
+            proofConstraints: jtaInput.proofConstraints ?? null,
+          proofGaps: jtaInput.approvedResearchContext?.proofGaps ?? null,
+          });
+          if (repairedAssessment.validationStatus !== "failed") {
+            canonicalSectionsMem = repairedSectionsMem;
+            fallbackUsed = false;
+            fallbackReason = "";
+            repairSucceeded = true;
+            memProviderInfo = { provider: repaired.provider ?? memProviderInfo.provider, model: repaired.model ?? memProviderInfo.model };
+          } else {
+            fallbackReason = `LLM Jump-to-Action failed validation after repair: ${repairedAssessment.validationIssues.join("; ")}`;
+          }
+        } else {
+          canonicalSectionsMem = generatedSectionsMem;
+          fallbackUsed = false;
+          fallbackReason = "";
+          memProviderInfo = { provider: generated.provider ?? memProviderInfo.provider, model: generated.model ?? memProviderInfo.model };
+        }
+      } catch (error) {
+        if (!fallbackReason) setLastFailureStage("fallback_used");
+        fallbackReason = error instanceof Error ? error.message : String(error);
+        req.log.warn({ clientId, err: error, persistence: "memory_fallback" }, "JTA/bootstrap fell back to deterministic output");
+      }
+    }
+    if (fallbackUsed && shouldUseRealAI(req)) markAIFallbackUsed();
+    if (!fallbackUsed) clearAIFallbackUsed();
+    const jtaValidation = evaluateJtaCandidate({
+      canonicalSections: canonicalSectionsMem,
+      businessTypePrimary: businessType.primary,
+      platforms: Array.isArray(approvedSowRecord.platforms)
+        ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      approvedBusinessDnaCategory: approvedBusinessDnaMem.positioning?.category ?? null,
+      approvedBusinessDnaAudience: approvedBusinessDnaMem.targetAudience?.segments ?? [],
+      approvedBusinessDnaPains: approvedBusinessDnaMem.targetAudience?.pains ?? [],
+      approvedBusinessDnaThemes: approvedBusinessDnaMem.contentStrategy?.themes ?? [],
+      approvedBusinessDnaDifferentiators: approvedBusinessDnaMem.positioning?.differentiators ?? [],
+      proofConstraints: jtaInput.proofConstraints ?? null,
+      proofGaps: jtaInput.approvedResearchContext?.proofGaps ?? null,
+    });
+    const runMeta = buildRunMeta({
+      clientId,
+      snapshotId: approvedSnapshot.id,
+      taskType: "strategy_bootstrap",
+      provider: memProviderInfo.provider,
+      model: memProviderInfo.model,
+      fallbackUsed,
+      sourceContext: "approved_snapshot",
+      generationMode: fallbackUsed ? "deterministic" : "llm",
+      validation: {
+        status: jtaValidation.validationStatus,
+        note:
+          jtaValidation.validationIssues.length > 0
+            ? buildJtaRepairPromptInput({
+                ok: jtaValidation.validationStatus !== "failed",
+                status: jtaValidation.validationStatus,
+                issues: jtaValidation.validationIssues,
+                issueDetails: jtaValidation.validationIssueDetails,
+              })
+            : fallbackUsed
+              ? fallbackReason
+              : "Jump-to-Action validation passed.",
+        issues: jtaValidation.validationIssues,
+      },
+      inputSources: buildJtaBootstrapInputSourceSummary({
+        sourceContext: "approved_snapshot",
+        templateType: templateTypeMem,
+        businessDna: approvedBusinessDnaMem,
+        sow: (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+        client: {
+          website: memoryClient.website,
+          instagramHandle: memoryClient.instagramHandle,
+          oneLineDescription: memoryClient.oneLineDescription,
+        },
+      }),
+      diagnostics: {
+        ...aiHeaderDiagnostics,
+        hasImportedResearchContext: Boolean(jtaInput.approvedResearchContext),
+        proofConstraintsPresent: Boolean(jtaInput.proofConstraints),
+        compactionFieldCount: countJtaResearchContextFields(jtaInput.approvedResearchContext),
+        resolvedBrandName: jtaInput.client.brandName,
+        ...buildProviderDiagnostics(resolvedMemProvider, {
+          repairAttempted,
+          repairSucceeded,
+          fallbackReason: fallbackUsed ? fallbackReason : null,
+        }),
+      },
+    });
+    const structuredStrategyMemBase: Record<string, unknown> = {
+      canonicalSections: canonicalSectionsMem,
+      __meta: {
+        sectionApprovals: existingMem
+          ? (((existingMem.structuredStrategy as Record<string, unknown> | undefined)?.__meta as { sectionApprovals?: Record<string, boolean> } | undefined)
+              ?.sectionApprovals ??
+            Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, false])))
+          : Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, false])),
+        regenerateCounters: existingMem
+          ? (((existingMem.structuredStrategy as Record<string, unknown> | undefined)?.__meta as { regenerateCounters?: Record<string, number> } | undefined)
+              ?.regenerateCounters ??
+            Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, 0])))
+          : Object.fromEntries(CANONICAL_SECTION_KEYS.map((key) => [key, 0])),
+        strategySource: fallbackUsed ? "fallback" : "bootstrap",
+        snapshotId: approvedSnapshot.id,
+        sourceContext: "approved_snapshot",
+        ...(fallbackUsed ? { aiFailure: { message: fallbackReason } } : {}),
+      },
+    };
+    const structuredStrategyMem = annotateStrategyStructured(
+      structuredStrategyMemBase,
+      runMeta,
+      approvedSnapshot.id,
+      false,
+      businessType,
+    );
+    req.log.info(
+      {
+        clientId,
+        trace: ((structuredStrategyMem.__meta as Record<string, unknown> | undefined)?.latestRun ?? null),
+        persistence: "memory_fallback",
+      },
+      "JTA/bootstrap trace prepared",
+    );
+    const nowIso = new Date().toISOString();
+    const nextStrategyMem: MemoryStrategy = existingMem
+      ? {
+          ...existingMem,
+          structuredStrategy: structuredStrategyMem,
+          strategyDocument: buildCanonicalDocument(memoryClient.name, canonicalSectionsMem),
+          templateType: templateTypeMem,
+          status: "draft",
+          updatedAt: nowIso,
+        }
+      : {
+          id: randomUUID(),
+          clientId,
+          structuredStrategy: structuredStrategyMem,
+          strategyDocument: buildCanonicalDocument(memoryClient.name, canonicalSectionsMem),
+          templateType: templateTypeMem,
+          version: 1,
+          status: "draft",
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+    memoryStrategies.set(clientId, nextStrategyMem);
+    res.status(existingMem ? 200 : 201).json(serializeStrategy(nextStrategyMem as any));
+  }
+});
+
+router.post("/clients/:clientId/strategy/bootstrap/approve", async (req, res) => {
+  const { clientId } = req.params;
+  if (!clientId) {
+    res.status(400).json({ error: "clientId required" });
+    return;
+  }
+
+  try {
+    const [client] = await db.select().from(clientsTable).where(eq(clientsTable.id, clientId));
+    if (!client) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW before approving Jump-to-Action." });
+      return;
+    }
+
+    const [strategy] = await db
+      .select()
+      .from(strategiesTable)
+      .where(eq(strategiesTable.clientId, clientId))
+      .orderBy(desc(strategiesTable.version))
+      .limit(1);
+    if (!strategy) {
+      res.status(404).json({ error: "Jump-to-Action is not ready yet" });
+      return;
+    }
+
+    const structured =
+      ((strategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? null);
+    const currentMeta =
+      (((structured?.__meta as StrategyArtifactMeta | undefined) ?? undefined));
+    if (currentMeta?.validationStatus === "failed") {
+      res.status(400).json({ error: "Jump-to-Action failed validation and cannot be approved yet" });
+      return;
+    }
+
+    const nextStructured = {
+      ...(structured ?? {}),
+      __meta: {
+        ...((currentMeta ?? {}) as StrategyArtifactMeta),
+        approval: {
+          approved: true,
+          approvedAt: new Date().toISOString(),
+          approvedSnapshotId: approvedSnapshot.id,
+          approvalVersion: "v1" as const,
+        },
+      } satisfies StrategyArtifactMeta,
+    };
+
+    const [updated] = await db
+      .update(strategiesTable)
+      .set({
+        structuredStrategy: nextStructured,
+        updatedAt: new Date(),
+      })
+      .where(eq(strategiesTable.id, strategy.id))
+      .returning();
+
+    if (!updated) {
+      res.status(500).json({ error: "Failed to approve Jump-to-Action" });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      strategy: serializeStrategy(updated),
+    });
+  } catch (err) {
+    if (!isDbUnavailableError(err)) {
+      throw err;
+    }
+    markFallbackUsed();
+    const client = memoryClients.get(clientId);
+    const strategy = memoryStrategies.get(clientId);
+    if (!client || !strategy) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW before approving Jump-to-Action." });
+      return;
+    }
+    const structured =
+      ((strategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? null);
+    const currentMeta =
+      (((structured?.__meta as StrategyArtifactMeta | undefined) ?? undefined));
+    if (currentMeta?.validationStatus === "failed") {
+      res.status(400).json({ error: "Jump-to-Action failed validation and cannot be approved yet" });
+      return;
+    }
+    const nextStrategy = {
+      ...strategy,
+      updatedAt: new Date().toISOString(),
+      structuredStrategy: {
+        ...(structured ?? {}),
+        __meta: {
+          ...((currentMeta ?? {}) as StrategyArtifactMeta),
+          approval: {
+            approved: true,
+            approvedAt: new Date().toISOString(),
+            approvedSnapshotId: approvedSnapshot.id,
+            approvalVersion: "v1" as const,
+          },
+        } satisfies StrategyArtifactMeta,
+      },
+    } satisfies MemoryStrategy;
+    memoryStrategies.set(clientId, nextStrategy);
+    res.json({
+      ok: true,
+      strategy: serializeStrategy(nextStrategy as any),
+    });
   }
 });
 
@@ -3491,7 +5839,13 @@ router.patch("/clients/:clientId/strategy", async (req, res) => {
     res.status(400).json({ error: "clientId required" });
     return;
   }
-  const body = UpdateStrategyBody.parse(req.body);
+  const body = UpdateStrategyBody.parse(req.body) as z.infer<typeof UpdateStrategyBody> & {
+    templateType?: string;
+  };
+  const requestedTemplateType =
+    typeof body.templateType === "string" && body.templateType.trim().length > 0
+      ? body.templateType.trim()
+      : undefined;
 
   try {
     const [existing] = await db
@@ -3506,10 +5860,32 @@ router.patch("/clients/:clientId/strategy", async (req, res) => {
       return;
     }
 
+    const baseStructured = (existing.structuredStrategy as Record<string, unknown> | null | undefined) ?? {};
+    const nextStructured =
+      body.structuredStrategy !== undefined
+        ? { ...(body.structuredStrategy as Record<string, unknown>) }
+        : { ...baseStructured };
+    if (requestedTemplateType !== undefined) {
+      nextStructured.template = requestedTemplateType;
+    }
+    const currentMeta =
+      (((baseStructured.__meta as StrategyArtifactMeta | undefined) ?? undefined) as StrategyArtifactMeta | undefined);
+    if (body.structuredStrategy !== undefined || body.status === "draft") {
+      nextStructured.__meta = {
+        ...((nextStructured.__meta as Record<string, unknown> | undefined) ?? {}),
+        approval:
+          body.status === "approved"
+            ? (currentMeta?.approval ?? defaultApprovalMeta(currentMeta?.snapshotId ?? null))
+            : defaultApprovalMeta(currentMeta?.snapshotId ?? null),
+      };
+    }
+
     const updates: Partial<typeof strategiesTable.$inferInsert> = { updatedAt: new Date() };
     if (body.strategyDocument !== undefined) updates.strategyDocument = body.strategyDocument;
-    if (body.structuredStrategy !== undefined)
-      updates.structuredStrategy = body.structuredStrategy as Record<string, unknown>;
+    if (body.structuredStrategy !== undefined || requestedTemplateType !== undefined) {
+      updates.structuredStrategy = nextStructured;
+    }
+    if (requestedTemplateType !== undefined) updates.templateType = requestedTemplateType as TemplateType;
     if (body.status !== undefined) updates.status = body.status;
 
     const [updated] = await db
@@ -3521,6 +5897,37 @@ router.patch("/clients/:clientId/strategy", async (req, res) => {
     if (!updated) {
       res.status(500).json({ error: "Failed to update strategy" });
       return;
+    }
+    if (requestedTemplateType !== undefined) {
+      const [client] = await db.select().from(clientsTable).where(eq(clientsTable.id, clientId));
+      if (client) {
+        const sow = ((client.sow as Record<string, unknown> | null | undefined) ?? {}) as Record<string, unknown>;
+        const currentSnapshot = readApprovedSnapshot(sow);
+        const nextSow: Record<string, unknown> = {
+          ...sow,
+          __templatePreference: requestedTemplateType,
+        };
+        if (currentSnapshot) {
+          const nextSnapshot = buildApprovedContextSnapshot({
+            clientId,
+            clientName: client.name,
+            websiteUrl: client.website,
+            instagramHandle: client.instagramHandle,
+            oneLineDescription: client.oneLineDescription,
+            sow: nextSow,
+            templateType: requestedTemplateType,
+            previousSnapshot: currentSnapshot,
+          });
+          nextSow.__approvedContextSnapshot = nextSnapshot;
+          nextSow.__artifactState = {
+            snapshotId: nextSnapshot.id,
+            stale: nextSnapshot.id !== currentSnapshot.id,
+            reason: nextSnapshot.id !== currentSnapshot.id ? "template_changed_after_approval" : null,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        await db.update(clientsTable).set({ sow: nextSow }).where(eq(clientsTable.id, clientId));
+      }
     }
 
     res.json(serializeStrategy(updated));
@@ -3534,16 +5941,70 @@ router.patch("/clients/:clientId/strategy", async (req, res) => {
       res.status(404).json({ error: "No strategy found" });
       return;
     }
+    const memoryStructured = {
+      ...(((body.structuredStrategy as Record<string, unknown> | undefined) ?? existing.structuredStrategy) as Record<
+        string,
+        unknown
+      >),
+    };
+    if (requestedTemplateType !== undefined) {
+      memoryStructured.template = requestedTemplateType;
+    }
+    const currentMeta =
+      (((existing.structuredStrategy as Record<string, unknown> | undefined)?.__meta as StrategyArtifactMeta | undefined) ??
+        undefined);
+    if (body.structuredStrategy !== undefined || body.status === "draft") {
+      memoryStructured.__meta = {
+        ...((memoryStructured.__meta as Record<string, unknown> | undefined) ?? {}),
+        approval:
+          body.status === "approved"
+            ? (currentMeta?.approval ?? defaultApprovalMeta(currentMeta?.snapshotId ?? null))
+            : defaultApprovalMeta(currentMeta?.snapshotId ?? null),
+      };
+    }
     const updated: MemoryStrategy = {
       ...existing,
       strategyDocument: body.strategyDocument ?? existing.strategyDocument,
       structuredStrategy:
-        (body.structuredStrategy as Record<string, unknown> | undefined) ??
-        existing.structuredStrategy,
+        body.structuredStrategy !== undefined || requestedTemplateType !== undefined
+          ? memoryStructured
+          : existing.structuredStrategy,
+      templateType: requestedTemplateType ?? existing.templateType,
       status: body.status ?? existing.status,
       updatedAt: new Date().toISOString(),
     };
     memoryStrategies.set(clientId, updated);
+    if (requestedTemplateType !== undefined) {
+      const client = memoryClients.get(clientId);
+      if (client) {
+        const sow = ((client.sow as Record<string, unknown> | null | undefined) ?? {}) as Record<string, unknown>;
+        const currentSnapshot = readApprovedSnapshot(sow);
+        const nextSow: Record<string, unknown> = {
+          ...sow,
+          __templatePreference: requestedTemplateType,
+        };
+        if (currentSnapshot) {
+          const nextSnapshot = buildApprovedContextSnapshot({
+            clientId,
+            clientName: client.name,
+            websiteUrl: client.website,
+            instagramHandle: client.instagramHandle,
+            oneLineDescription: client.oneLineDescription,
+            sow: nextSow,
+            templateType: requestedTemplateType,
+            previousSnapshot: currentSnapshot,
+          });
+          nextSow.__approvedContextSnapshot = nextSnapshot;
+          nextSow.__artifactState = {
+            snapshotId: nextSnapshot.id,
+            stale: nextSnapshot.id !== currentSnapshot.id,
+            reason: nextSnapshot.id !== currentSnapshot.id ? "template_changed_after_approval" : null,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        memoryClients.set(clientId, { ...client, sow: nextSow });
+      }
+    }
     res.json(updated);
   }
 });
@@ -3560,14 +6021,49 @@ router.post("/clients/:clientId/strategy/sections/:sectionKey/regenerate", async
   }
   try {
     const [client] = await db.select().from(clientsTable).where(eq(clientsTable.id, clientId));
+    const [profile] = await db
+      .select()
+      .from(onboardingProfilesTable)
+      .where(eq(onboardingProfilesTable.clientId, clientId))
+      .orderBy(desc(onboardingProfilesTable.createdAt))
+      .limit(1);
     const [strategy] = await db
       .select()
       .from(strategiesTable)
       .where(eq(strategiesTable.clientId, clientId))
       .orderBy(desc(strategiesTable.version))
       .limit(1);
-    if (!client || !strategy) {
+    if (!client || !strategy || !profile) {
       res.status(404).json({ error: "Client/strategy not found" });
+      return;
+    }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate Business DNA and Jump-to-Action." });
+      return;
+    }
+    const enrichedData =
+      ((profile.enrichedData as Record<string, unknown> | null | undefined) ?? {});
+    const businessDnaApprovalError = getBusinessDnaApprovalRequirementError(
+      enrichedData,
+      approvedSnapshot.id,
+      "regenerating strategy sections",
+    );
+    if (businessDnaApprovalError) {
+      res.status(400).json({ error: businessDnaApprovalError });
+      return;
+    }
+    const jtaApprovalError = getCurrentJtaDraftRequirementError(
+      getJtaWorkflowState(
+        (strategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? null,
+        approvedSnapshot.id,
+      ),
+      "regenerating strategy sections",
+    );
+    if (jtaApprovalError) {
+      res.status(400).json({ error: jtaApprovalError });
       return;
     }
     const structured = strategy.structuredStrategy as Record<string, unknown>;
@@ -3576,22 +6072,78 @@ router.post("/clients/:clientId/strategy/sections/:sectionKey/regenerate", async
       (((structured.__meta ?? {}) as { regenerateCounters?: Record<string, number> }).regenerateCounters ??
         {}) as Record<string, number>;
     const nextCounter = (regenerateCounters[sectionKey] ?? 0) + 1;
-    const refreshed = buildSectionVariantText(
-      sectionKey,
-      {
-        name: client.name,
-        website: client.website,
-        instagramHandle: client.instagramHandle,
-        oneLineDescription: client.oneLineDescription,
-      },
-      nextCounter,
-    );
+    const useRealAI = shouldUseRealAI(req);
+    const businessDna =
+      (profile.enrichedData as { businessDna?: BusinessDna } | null | undefined)?.businessDna ?? null;
+    let refreshed = "";
+    if (useRealAI) {
+      try {
+        const provider = getRequestLLMProvider(req);
+        refreshed = validateCanonicalSection(
+          sectionKey,
+          await generateStrategySectionPatch({
+            provider,
+            client: {
+              id: approvedSnapshot.client.id,
+              name: approvedSnapshot.client.name,
+              website: approvedSnapshot.client.websiteUrl,
+              instagramHandle: approvedSnapshot.client.instagramHandle,
+              oneLineDescription: approvedSnapshot.client.oneLineDescription,
+            },
+            sectionKey,
+            structured,
+            businessDna,
+            sow: approvedSnapshot.sow as unknown as Record<string, unknown>,
+            importedResearchBrief:
+              (profile.rawInput as Record<string, unknown> | null | undefined)?.importedResearchBrief as
+                | Record<string, unknown>
+                | undefined,
+            reason: typeof (req.body as { reason?: unknown } | null | undefined)?.reason === "string"
+              ? String((req.body as { reason: string }).reason)
+              : null,
+          }),
+            {
+              website: approvedSnapshot.client.websiteUrl,
+              instagramHandle: approvedSnapshot.client.instagramHandle,
+              oneLineDescription: approvedSnapshot.client.oneLineDescription,
+            },
+          );
+      } catch (err) {
+        req.log.warn({ err, clientId, sectionKey }, "Context-aware section regenerate failed; falling back");
+      }
+    }
+if (!refreshed) {
+      const dnaValid = businessDna && isValidBusinessDna(businessDna);
+      const platforms = readSelectedPlatforms(client.sow as Record<string, unknown> | null | undefined);
+      refreshed = dnaValid
+        ? buildBootstrapCanonicalSections({
+            client: {
+              name: approvedSnapshot.client.name,
+              website: approvedSnapshot.client.websiteUrl,
+              instagramHandle: approvedSnapshot.client.instagramHandle,
+              oneLineDescription: approvedSnapshot.client.oneLineDescription,
+            },
+            businessDna,
+            sow: approvedSnapshot.sow as unknown as Record<string, unknown>,
+            templateType: strategy.templateType,
+          })[sectionKey]
+        : buildSectionVariantText(
+            sectionKey,
+            {
+          name: approvedSnapshot.client.name,
+          website: approvedSnapshot.client.websiteUrl,
+          instagramHandle: approvedSnapshot.client.instagramHandle,
+          oneLineDescription: approvedSnapshot.client.oneLineDescription,
+        },
+        nextCounter,
+      );
+    }
     const sectionApprovals = {
       ...(((structured.__meta ?? {}) as { sectionApprovals?: Record<string, boolean> }).sectionApprovals ??
         {}),
       [sectionKey]: false,
     };
-    const nextStructured = {
+    const nextStructured: Record<string, unknown> = {
       ...structured,
       canonicalSections: { ...canonical, [sectionKey]: refreshed },
       __meta: {
@@ -3603,7 +6155,28 @@ router.post("/clients/:clientId/strategy/sections/:sectionKey/regenerate", async
         },
       },
     };
-    const nextDocument = buildCanonicalDocument(client.name, nextStructured.canonicalSections);
+    const sectionPatchSucceeded = Boolean(useRealAI && refreshed);
+    nextStructured.__meta = {
+      ...((nextStructured.__meta as Record<string, unknown> | undefined) ?? {}),
+      latestRun: buildRunMeta({
+        clientId,
+        snapshotId: approvedSnapshot.id,
+        taskType: "strategy_generate",
+        provider: sectionPatchSucceeded ? "section_patch" : "deterministic",
+        model: sectionPatchSucceeded ? "context_patch" : "bootstrap",
+        fallbackUsed: !sectionPatchSucceeded,
+        sourceContext: "approved_snapshot",
+        generationMode: sectionPatchSucceeded ? "llm" : "deterministic",
+      }),
+      snapshotId: approvedSnapshot.id,
+      snapshotState: "fresh",
+      approval: defaultApprovalMeta(approvedSnapshot.id),
+      sourceContext: "approved_snapshot",
+    };
+    const nextDocument = buildCanonicalDocument(
+      client.name,
+      (nextStructured.canonicalSections as Record<string, string> | undefined) ?? {},
+    );
     const [updated] = await db
       .update(strategiesTable)
       .set({
@@ -3620,8 +6193,38 @@ router.post("/clients/:clientId/strategy/sections/:sectionKey/regenerate", async
       markFallbackUsed();
       const memoryClient = memoryClients.get(clientId);
       const memoryStrategy = memoryStrategies.get(clientId);
-      if (!memoryClient || !memoryStrategy) {
+      const memoryProfile = memoryOnboarding.get(clientId);
+      if (!memoryClient || !memoryStrategy || !memoryProfile) {
         res.status(404).json({ error: "Client/strategy not found" });
+        return;
+      }
+      const approvedSnapshot = readApprovedSnapshot(
+        (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+      );
+      if (!approvedSnapshot) {
+        res.status(400).json({ error: "Approve SOW to generate Business DNA and Jump-to-Action." });
+        return;
+      }
+      const memoryEnrichedData =
+        ((memoryProfile.enrichedData as Record<string, unknown> | null | undefined) ?? {});
+      const memoryBusinessDnaApprovalError = getBusinessDnaApprovalRequirementError(
+        memoryEnrichedData,
+        approvedSnapshot.id,
+        "regenerating strategy sections",
+      );
+      if (memoryBusinessDnaApprovalError) {
+        res.status(400).json({ error: memoryBusinessDnaApprovalError });
+        return;
+      }
+      const memoryJtaApprovalError = getCurrentJtaDraftRequirementError(
+        getJtaWorkflowState(
+          (memoryStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? null,
+          approvedSnapshot.id,
+        ),
+        "regenerating strategy sections",
+      );
+      if (memoryJtaApprovalError) {
+        res.status(400).json({ error: memoryJtaApprovalError });
         return;
       }
       const structured = memoryStrategy.structuredStrategy as Record<string, unknown>;
@@ -3630,16 +6233,70 @@ router.post("/clients/:clientId/strategy/sections/:sectionKey/regenerate", async
         (((structured.__meta ?? {}) as { regenerateCounters?: Record<string, number> })
           .regenerateCounters ?? {}) as Record<string, number>;
       const nextCounter = (regenerateCounters[sectionKey] ?? 0) + 1;
-      const refreshed = buildSectionVariantText(
-        sectionKey,
-        {
-          name: memoryClient.name,
-          website: memoryClient.website,
-          instagramHandle: memoryClient.instagramHandle,
-          oneLineDescription: memoryClient.oneLineDescription,
-        },
-        nextCounter,
-      );
+      let refreshed = "";
+      if (shouldUseRealAI(req)) {
+        try {
+          const provider = getRequestLLMProvider(req);
+          refreshed = validateCanonicalSection(
+            sectionKey,
+            await generateStrategySectionPatch({
+              provider,
+              client: {
+                id: memoryClient.id,
+                name: memoryClient.name,
+                website: memoryClient.website,
+                instagramHandle: memoryClient.instagramHandle,
+                oneLineDescription: memoryClient.oneLineDescription,
+              },
+              sectionKey,
+              structured,
+              businessDna:
+                (memoryProfile.enrichedData as { businessDna?: BusinessDna } | null | undefined)?.businessDna ?? null,
+              sow: (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+              importedResearchBrief:
+                (memoryProfile.rawInput as Record<string, unknown> | null | undefined)?.importedResearchBrief as
+                  | Record<string, unknown>
+                  | undefined,
+              reason: typeof (req.body as { reason?: unknown } | null | undefined)?.reason === "string"
+                ? String((req.body as { reason: string }).reason)
+                : null,
+            }),
+            {
+              website: memoryClient.website,
+              instagramHandle: memoryClient.instagramHandle,
+              oneLineDescription: memoryClient.oneLineDescription,
+            },
+          );
+        } catch (err) {
+          req.log.warn({ err, clientId, sectionKey }, "Memory section regenerate AI patch failed; falling back");
+        }
+      }
+      if (!refreshed) {
+        const memoryBusinessDna =
+          (memoryProfile.enrichedData as { businessDna?: BusinessDna } | null | undefined)?.businessDna ?? null;
+        refreshed = memoryBusinessDna && isValidBusinessDna(memoryBusinessDna)
+          ? buildBootstrapCanonicalSections({
+              client: {
+                name: memoryClient.name,
+                website: memoryClient.website,
+                instagramHandle: memoryClient.instagramHandle,
+                oneLineDescription: memoryClient.oneLineDescription,
+              },
+              businessDna: memoryBusinessDna,
+              sow: (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+              templateType: memoryStrategy.templateType,
+            })[sectionKey]
+          : buildSectionVariantText(
+              sectionKey,
+              {
+                name: memoryClient.name,
+                website: memoryClient.website,
+                instagramHandle: memoryClient.instagramHandle,
+                oneLineDescription: memoryClient.oneLineDescription,
+              },
+              nextCounter,
+            );
+      }
       const sectionApprovals = {
         ...(((structured.__meta ?? {}) as { sectionApprovals?: Record<string, boolean> })
           .sectionApprovals ?? {}),
@@ -3655,6 +6312,7 @@ router.post("/clients/:clientId/strategy/sections/:sectionKey/regenerate", async
             ...regenerateCounters,
             [sectionKey]: nextCounter,
           },
+          approval: defaultApprovalMeta(approvedSnapshot.id),
         },
       };
       const updated: MemoryStrategy = {
@@ -3679,33 +6337,1068 @@ function isSowPayloadValid(body: Record<string, unknown>): boolean {
   const contentMix = (body.contentMix ?? {}) as Record<string, unknown>;
   const deliverables = Array.isArray(body.deliverables) ? body.deliverables : [];
   const toneByPlatform = (body.toneByPlatform ?? {}) as Record<string, unknown>;
+  const instagram = (body.instagram ?? null) as Record<string, unknown> | null;
   if (body.industry != null && typeof body.industry !== "string") return false;
   if (body.targetAudience != null && typeof body.targetAudience !== "string") return false;
   if (body.understandingOfRequirements != null && typeof body.understandingOfRequirements !== "string") return false;
   if (body.scopeOfWork != null && typeof body.scopeOfWork !== "string") return false;
   if (body.strategyLaunchPlanning != null && typeof body.strategyLaunchPlanning !== "string") return false;
   if (body.contentCreation != null && typeof body.contentCreation !== "string") return false;
+  if (body.instagram != null && (typeof body.instagram !== "object" || body.instagram === null || Array.isArray(body.instagram))) {
+    return false;
+  }
   if (body.normalizedSections != null && (typeof body.normalizedSections !== "object" || body.normalizedSections === null)) {
     return false;
   }
   if (body.sowVersion != null && typeof body.sowVersion !== "number") return false;
   if (body.parseMeta != null && (typeof body.parseMeta !== "object" || body.parseMeta === null)) return false;
+  if (body.researchBriefImport != null && (typeof body.researchBriefImport !== "object" || body.researchBriefImport === null)) {
+    return false;
+  }
+  if (body.clientBasics != null && (typeof body.clientBasics !== "object" || body.clientBasics === null)) return false;
+  if (instagram) {
+    if (instagram.handle != null && typeof instagram.handle !== "string") return false;
+    if (instagram.bio != null && typeof instagram.bio !== "string") return false;
+    if (instagram.offerSummary != null && typeof instagram.offerSummary !== "string") return false;
+    if (instagram.additionalInstagramNotes != null && typeof instagram.additionalInstagramNotes !== "string") return false;
+    if (instagram.followerCount != null && typeof instagram.followerCount !== "string") return false;
+    if (instagram.category != null && typeof instagram.category !== "string") return false;
+    if (instagram.visualStyleNotes != null && typeof instagram.visualStyleNotes !== "string") return false;
+    if (instagram.recentCaptionSnippets != null && !Array.isArray(instagram.recentCaptionSnippets)) return false;
+    if (instagram.recurringTopics != null && !Array.isArray(instagram.recurringTopics)) return false;
+    if (instagram.ctaPatterns != null && !Array.isArray(instagram.ctaPatterns)) return false;
+    if (instagram.proofSignals != null && !Array.isArray(instagram.proofSignals)) return false;
+  }
   return (
     platforms.every((p) => typeof p === "string") &&
     Object.values(monthlyPosts).every((v) => typeof v === "number") &&
     Object.values(contentMix).every((v) => typeof v === "number") &&
     deliverables.every((d) => typeof d === "string") &&
-    Object.values(toneByPlatform).every((v) => typeof v === "string")
+    Object.values(toneByPlatform).every((v) => typeof v === "string") &&
+    (!instagram ||
+      [instagram.recentCaptionSnippets, instagram.recurringTopics, instagram.ctaPatterns, instagram.proofSignals]
+        .filter(Array.isArray)
+        .every((items) => items.every((item) => typeof item === "string")))
   );
+}
+
+function stripPlaceholderText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(trimmed))) return "";
+  return trimmed;
+}
+
+function cleanStringList(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value) => stripPlaceholderText(value))
+    .filter(Boolean);
+}
+
+function cleanNumberMap(values: unknown): Record<string, number> {
+  if (!values || typeof values !== "object" || Array.isArray(values)) return {};
+  return Object.fromEntries(
+    Object.entries(values as Record<string, unknown>)
+      .map(([key, value]) => [String(key).trim(), Number(value) || 0] as const)
+      .filter(([key, value]) => key.length > 0 && value > 0),
+  );
+}
+
+function cleanStringMap(values: unknown): Record<string, string> {
+  if (!values || typeof values !== "object" || Array.isArray(values)) return {};
+  return Object.fromEntries(
+    Object.entries(values as Record<string, unknown>)
+      .map(([key, value]) => [String(key).trim(), stripPlaceholderText(value)] as const)
+      .filter(([key, value]) => key.length > 0 && value.length > 0),
+  );
+}
+
+function cleanStructuredInstagram(values: unknown): StructuredInstagramInput | undefined {
+  if (!values || typeof values !== "object" || Array.isArray(values)) return undefined;
+  const record = values as Record<string, unknown>;
+  const recentCaptionSnippets = cleanStringList(record.recentCaptionSnippets);
+  const recurringTopics = cleanStringList(record.recurringTopics);
+  const cleaned: StructuredInstagramInput = {
+    handle: stripPlaceholderText(record.handle),
+    bio: stripPlaceholderText(record.bio),
+    offerSummary: stripPlaceholderText(record.offerSummary),
+    recentCaptionSnippets,
+    recurringTopics,
+    ...(stripPlaceholderText(record.additionalInstagramNotes)
+      ? { additionalInstagramNotes: stripPlaceholderText(record.additionalInstagramNotes) }
+      : {}),
+    ...(cleanStringList(record.ctaPatterns).length > 0
+      ? { ctaPatterns: cleanStringList(record.ctaPatterns) }
+      : {}),
+    ...(cleanStringList(record.proofSignals).length > 0
+      ? { proofSignals: cleanStringList(record.proofSignals) }
+      : {}),
+    ...(stripPlaceholderText(record.followerCount)
+      ? { followerCount: stripPlaceholderText(record.followerCount) }
+      : {}),
+    ...(stripPlaceholderText(record.category) ? { category: stripPlaceholderText(record.category) } : {}),
+    ...(stripPlaceholderText(record.visualStyleNotes)
+      ? { visualStyleNotes: stripPlaceholderText(record.visualStyleNotes) }
+      : {}),
+  };
+  const hasAnyValue = Boolean(
+    cleaned.handle ||
+      cleaned.bio ||
+      cleaned.offerSummary ||
+      cleaned.recentCaptionSnippets.length > 0 ||
+      cleaned.recurringTopics.length > 0 ||
+      cleaned.additionalInstagramNotes ||
+      (cleaned.ctaPatterns?.length ?? 0) > 0 ||
+      (cleaned.proofSignals?.length ?? 0) > 0 ||
+      cleaned.followerCount ||
+      cleaned.category ||
+      cleaned.visualStyleNotes,
+  );
+  return hasAnyValue ? cleaned : undefined;
+}
+
+function deriveInstagramSummaryNotesFromStructuredInstagram(
+  instagram: StructuredInstagramInput | null | undefined,
+): string {
+  if (!instagram) return "";
+  const blocks = [
+    instagram.bio ? `Bio: ${instagram.bio}` : "",
+    instagram.offerSummary ? `Offer: ${instagram.offerSummary}` : "",
+    instagram.additionalInstagramNotes ? `Additional Instagram notes: ${instagram.additionalInstagramNotes}` : "",
+    instagram.category ? `Category: ${instagram.category}` : "",
+    instagram.followerCount ? `Follower count: ${instagram.followerCount}` : "",
+    instagram.recurringTopics.length > 0 ? `Recurring topics: ${instagram.recurringTopics.join(", ")}` : "",
+    instagram.recentCaptionSnippets.length > 0
+      ? `Recent captions or themes: ${instagram.recentCaptionSnippets.join(" | ")}`
+      : "",
+    (instagram.ctaPatterns?.length ?? 0) > 0 ? `CTA patterns: ${instagram.ctaPatterns!.join(", ")}` : "",
+    (instagram.proofSignals?.length ?? 0) > 0 ? `Proof signals: ${instagram.proofSignals!.join(", ")}` : "",
+    instagram.visualStyleNotes ? `Visual style: ${instagram.visualStyleNotes}` : "",
+  ].filter(Boolean);
+  return blocks.join("\n").trim();
+}
+
+function readStructuredInstagramFromUnknown(values: unknown): StructuredInstagramInput | undefined {
+  return cleanStructuredInstagram(values);
+}
+
+function pickPreferredInstagramInput(
+  ...candidates: Array<StructuredInstagramInput | null | undefined>
+): StructuredInstagramInput | undefined {
+  for (const candidate of candidates) {
+    const cleaned = cleanStructuredInstagram(candidate);
+    if (cleaned) return cleaned;
+  }
+  return undefined;
+}
+
+function readApprovedSnapshot(sow: Record<string, unknown> | null | undefined): ApprovedContextSnapshot | null {
+  return readApprovedSnapshotRecord<ApprovedContextSnapshot>(sow);
+}
+
+function buildRunMeta(input: RunMetaInput) {
+  return {
+    clientId: input.clientId,
+    snapshotId: input.snapshotId,
+    runId: randomUUID(),
+    taskType: input.taskType,
+    provider: input.provider,
+    model: input.model,
+    fallbackUsed: input.fallbackUsed,
+    sourceContext: input.sourceContext,
+    timestamp: input.timestamp ?? new Date().toISOString(),
+    generationMode: input.generationMode ?? (input.fallbackUsed ? "fallback" : "deterministic"),
+    validation:
+      input.validation ?? {
+        status: "not_run" as const,
+        note: "Phase 1 trace placeholder - semantic validation not wired yet.",
+      },
+    inputSources: input.inputSources ?? {},
+    diagnostics: input.diagnostics ?? {},
+  };
+}
+
+function shouldLogProvenance(): boolean {
+  return process.env.NODE_ENV !== "production";
+}
+
+function hashPreview(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function previewText(value: unknown, maxChars = 500): string {
+  const text =
+    typeof value === "string"
+      ? value
+      : value == null
+        ? ""
+        : JSON.stringify(value);
+  return text.replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+function previewJson(value: unknown, maxChars = 500): { hash: string; preview: string } {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? {});
+  return {
+    hash: hashPreview(text),
+    preview: previewText(text, maxChars),
+  };
+}
+
+function buildAiHeaderDiagnostics(req: Parameters<typeof shouldUseRealAI>[0]) {
+  const requestedProvider = req.header("x-ai-provider")?.trim() || null;
+  const requestedModel = req.header("x-ai-model")?.trim() || null;
+  const providedApiKey = req.header("x-ai-api-key");
+  return {
+    useRealAI: shouldUseRealAI(req),
+    requestedProvider,
+    requestedModel,
+    clientApiKeyPresent: typeof providedApiKey === "string" && providedApiKey.trim().length > 0,
+  };
+}
+
+function buildProviderDiagnostics(
+  provider: LLMProvider | null,
+  extras?: {
+    repairAttempted?: boolean;
+    repairSucceeded?: boolean;
+    fallbackReason?: string | null;
+  },
+) {
+  const configuredChain =
+    provider instanceof FallbackProvider
+      ? provider.getConfiguredProviders()
+      : provider
+        ? [provider.describe?.() ?? { provider: provider.id, model: "default" }]
+        : [];
+  const attempts =
+    provider instanceof FallbackProvider
+      ? provider.getLastAttemptDiagnostics()
+      : [];
+
+  return {
+    configuredProviderChain: configuredChain,
+    providerAttempts: attempts,
+    repairAttempted: Boolean(extras?.repairAttempted),
+    repairSucceeded: Boolean(extras?.repairSucceeded),
+    fallbackReason: extras?.fallbackReason ?? null,
+    failureStage: getLastFailureStage(),
+  };
+}
+
+function defaultApprovalMeta(snapshotId: string | null): ArtifactApprovalMeta {
+  return {
+    approved: false,
+    approvedAt: null,
+    approvedSnapshotId: snapshotId,
+    approvalVersion: "v1",
+  };
+}
+
+function mergeValidationIssues(...groups: Array<string[] | null | undefined>): string[] {
+  return Array.from(
+    new Set(
+      groups
+        .flatMap((group) => group ?? [])
+        .map((item) => String(item ?? "").trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function summarizeWebsiteForBusinessDnaInput(businessDna: BusinessDna | null | undefined) {
+  if (!businessDna) return null;
+  return {
+    title: typeof businessDna.raw?.siteTitle === "string" ? businessDna.raw.siteTitle : "",
+    metaDescription: typeof businessDna.raw?.metaDescription === "string" ? businessDna.raw.metaDescription : "",
+    heroExcerpt: typeof businessDna.raw?.heroExcerpt === "string" ? businessDna.raw.heroExcerpt : "",
+    messagingPatterns: businessDna.platformSignals?.website?.messagingPatterns ?? [],
+    trustElements: businessDna.platformSignals?.website?.trustElements ?? [],
+    conversionElements: businessDna.platformSignals?.website?.conversionElements ?? [],
+    colors: businessDna.visualIdentity?.colors?.map((entry) => entry.hex) ?? [],
+  };
+}
+
+function buildApprovedBusinessDnaGeneratorInput(params: {
+  approvedSnapshot: ApprovedContextSnapshot;
+  snapshotInput: ReturnType<typeof buildGenerationInputsFromSnapshot>;
+  clientName: string;
+  businessType: { primary: string; confidence: string };
+  websiteSummary?: ReturnType<typeof summarizeWebsiteForBusinessDnaInput> | null;
+  importedResearchBrief?: Record<string, unknown> | null;
+}): BusinessDnaGeneratorInput {
+  const approvedSowRecord = params.approvedSnapshot.sow as Record<string, unknown>;
+  const structuredInstagram = params.snapshotInput.instagram;
+  return {
+    client: {
+      brandName: params.approvedSnapshot.client.name,
+      clientName: params.clientName,
+      websiteUrl: params.approvedSnapshot.client.websiteUrl ?? params.snapshotInput.websiteUrl ?? "",
+      instagramHandle:
+        params.approvedSnapshot.client.instagramHandle ?? params.snapshotInput.instagramHandle ?? "",
+      oneLineDescription:
+        params.approvedSnapshot.client.oneLineDescription ?? params.snapshotInput.oneLineDescription ?? "",
+    },
+    businessType: params.businessType,
+    sow: {
+      industry: typeof approvedSowRecord.industry === "string" ? approvedSowRecord.industry : "",
+      targetAudience: typeof approvedSowRecord.targetAudience === "string" ? approvedSowRecord.targetAudience : "",
+      understandingOfRequirements:
+        typeof approvedSowRecord.understandingOfRequirements === "string"
+          ? approvedSowRecord.understandingOfRequirements
+          : "",
+      strategyLaunchPlanning:
+        typeof approvedSowRecord.strategyLaunchPlanning === "string"
+          ? approvedSowRecord.strategyLaunchPlanning
+          : "",
+      contentCreation:
+        typeof approvedSowRecord.contentCreation === "string" ? approvedSowRecord.contentCreation : "",
+      scopeOfWork: typeof approvedSowRecord.scopeOfWork === "string" ? approvedSowRecord.scopeOfWork : "",
+      platforms: Array.isArray(approvedSowRecord.platforms)
+        ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      monthlyPosts:
+        typeof approvedSowRecord.monthlyPosts === "object" && approvedSowRecord.monthlyPosts !== null
+          ? (approvedSowRecord.monthlyPosts as Record<string, number>)
+          : {},
+      contentMix:
+        typeof approvedSowRecord.contentMix === "object" && approvedSowRecord.contentMix !== null
+          ? (approvedSowRecord.contentMix as Record<string, number>)
+          : {},
+      deliverables: Array.isArray(approvedSowRecord.deliverables)
+        ? approvedSowRecord.deliverables.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      toneByPlatform:
+        typeof approvedSowRecord.toneByPlatform === "object" && approvedSowRecord.toneByPlatform !== null
+          ? Object.fromEntries(
+              Object.entries(approvedSowRecord.toneByPlatform as Record<string, unknown>).map(([key, value]) => [
+                key,
+                String(value ?? "").trim(),
+              ]),
+            )
+          : {},
+    },
+    instagram: structuredInstagram
+      ? {
+          handle: structuredInstagram.handle,
+          bio: structuredInstagram.bio,
+          offerSummary: structuredInstagram.offerSummary,
+          recentCaptionSnippets: structuredInstagram.recentCaptionSnippets,
+          recurringTopics: structuredInstagram.recurringTopics,
+          ...(structuredInstagram.additionalInstagramNotes
+            ? { additionalInstagramNotes: structuredInstagram.additionalInstagramNotes }
+            : {}),
+          ...(structuredInstagram.ctaPatterns?.length ? { ctaPatterns: structuredInstagram.ctaPatterns } : {}),
+          ...(structuredInstagram.proofSignals?.length ? { proofSignals: structuredInstagram.proofSignals } : {}),
+          ...(structuredInstagram.followerCount ? { followerCount: structuredInstagram.followerCount } : {}),
+          ...(structuredInstagram.category ? { category: structuredInstagram.category } : {}),
+          ...(structuredInstagram.visualStyleNotes ? { visualStyleNotes: structuredInstagram.visualStyleNotes } : {}),
+          ...(params.snapshotInput.instagramSummaryNotes
+            ? { instagramSummaryNotes: params.snapshotInput.instagramSummaryNotes }
+            : {}),
+        }
+      : params.snapshotInput.instagramSummaryNotes
+        ? {
+            handle: params.snapshotInput.instagramHandle ?? "",
+            bio: params.snapshotInput.instagramSummaryNotes,
+            offerSummary: "",
+            recentCaptionSnippets: [],
+            recurringTopics: [],
+            instagramSummaryNotes: params.snapshotInput.instagramSummaryNotes,
+          }
+        : null,
+    website: params.websiteSummary ?? null,
+    importedResearch: compactImportedResearchForDna(
+      (params.importedResearchBrief as import("@workspace/research-brief").ImportedResearchBrief | null | undefined) ??
+        null,
+    ),
+  };
+}
+
+function evaluateBusinessDnaCandidate(
+  businessDna: BusinessDna,
+  params: {
+    approvedSowRecord: Record<string, unknown>;
+    snapshotInput: ReturnType<typeof buildGenerationInputsFromSnapshot>;
+    brandName: string;
+    clientName: string;
+    businessTypePrimary: string;
+  },
+) {
+  const structuralValidation = validateBusinessDnaStructure(businessDna);
+  const semanticValidation = validateBusinessDnaSemantics(businessDna, {
+    strategyLaunchPlanning:
+      typeof params.approvedSowRecord.strategyLaunchPlanning === "string"
+        ? params.approvedSowRecord.strategyLaunchPlanning
+        : null,
+    scopeOfWork:
+      typeof params.approvedSowRecord.scopeOfWork === "string" ? params.approvedSowRecord.scopeOfWork : null,
+    recentCaptionSnippets: params.snapshotInput.instagram?.recentCaptionSnippets ?? [],
+    proofSignals: params.snapshotInput.instagram?.proofSignals ?? [],
+    brandName: params.brandName,
+    clientName: params.clientName,
+    businessTypePrimary: params.businessTypePrimary,
+  });
+  const validationIssues = mergeValidationIssues(structuralValidation.issues, semanticValidation.issues);
+  const validationStatus: NonNullable<RunMetaInput["validation"]>["status"] =
+    structuralValidation.status === "failed"
+      ? "failed"
+      : semanticValidation.status === "warning"
+        ? "warning"
+        : "passed";
+  return {
+    structuralValidation,
+    semanticValidation,
+    validationIssues,
+    validationIssueDetails: [...structuralValidation.issueDetails, ...semanticValidation.issueDetails],
+    validationStatus,
+  };
+}
+
+function readApprovedBusinessDnaFromEnriched(
+  enrichedData: Record<string, unknown> | null | undefined,
+  snapshotId: string | null,
+): BusinessDna | null {
+  const state = getBusinessDnaWorkflowState<BusinessDna & Record<string, unknown>>(enrichedData, snapshotId);
+  return state.status === "approved_current" && state.artifact && isValidBusinessDna(state.artifact)
+    ? state.artifact
+    : null;
+}
+
+function getBusinessDnaApprovalRequirementError(
+  enrichedData: Record<string, unknown> | null | undefined,
+  snapshotId: string | null,
+  actionLabel: string,
+): string | null {
+  return getBusinessDnaRequirementError(getBusinessDnaWorkflowState(enrichedData, snapshotId), actionLabel);
+}
+
+function readApprovedJtaFromStructured(
+  structured: Record<string, unknown> | null | undefined,
+  snapshotId: string | null,
+): Record<string, unknown> | null {
+  const state = getJtaWorkflowState<Record<string, unknown>>(structured, snapshotId);
+  return state.status === "approved_current" ? state.artifact : null;
+}
+
+function getJtaApprovalRequirementError(
+  structured: Record<string, unknown> | null | undefined,
+  snapshotId: string | null,
+  actionLabel: string,
+): string | null {
+  return getJtaRequirementError(getJtaWorkflowState(structured, snapshotId), actionLabel);
+}
+
+function buildApprovedJtaGeneratorInput(params: {
+  approvedSnapshot: ApprovedContextSnapshot;
+  snapshotInput: ReturnType<typeof buildGenerationInputsFromSnapshot>;
+  clientName: string;
+  businessType: { primary: string; confidence: string };
+  approvedBusinessDna: BusinessDna;
+  templateType: string;
+  importedResearchBrief?: Record<string, unknown> | null;
+  websiteSummary?: ReturnType<typeof summarizeWebsiteForBusinessDnaInput> | null;
+}): JtaGeneratorInput {
+  const approvedSowRecord = params.approvedSnapshot.sow as Record<string, unknown>;
+  const structuredInstagram = params.snapshotInput.instagram;
+  const rawBrandName = params.approvedSnapshot.client.name;
+  const websiteSummary = params.websiteSummary ?? null;
+  const brandName = resolveClientFacingBrandName(rawBrandName, {
+    oneLineDescription:
+      params.approvedSnapshot.client.oneLineDescription ?? params.snapshotInput.oneLineDescription ?? "",
+    websiteTitle: websiteSummary?.title ?? null,
+  });
+  const knownTextBlob = [
+    params.snapshotInput.oneLineDescription,
+    approvedSowRecord.industry,
+    approvedSowRecord.targetAudience,
+    structuredInstagram?.bio,
+    structuredInstagram?.offerSummary,
+    ...(structuredInstagram?.recentCaptionSnippets ?? []),
+    ...(structuredInstagram?.recurringTopics ?? []),
+    params.approvedBusinessDna.positioning.valueProposition,
+    params.approvedBusinessDna.mission,
+  ]
+    .map((item) => String(item ?? "").replace(/\s+/g, " ").trim().toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+  const approvedResearchContext = compactImportedResearchForJta(params.importedResearchBrief, {
+    knownTextBlob,
+  });
+  const proofConstraints = buildProofConstraintsFromResearchContext(approvedResearchContext);
+  const hasStructuredInstagram = Boolean(
+    structuredInstagram &&
+      (structuredInstagram.bio ||
+        structuredInstagram.offerSummary ||
+        structuredInstagram.recentCaptionSnippets.length > 0 ||
+        structuredInstagram.recurringTopics.length > 0 ||
+        (structuredInstagram.ctaPatterns?.length ?? 0) > 0 ||
+        (structuredInstagram.proofSignals?.length ?? 0) > 0 ||
+        structuredInstagram.visualStyleNotes),
+  );
+  const instagram = structuredInstagram
+    ? {
+        handle: structuredInstagram.handle,
+        bio: structuredInstagram.bio,
+        offerSummary: structuredInstagram.offerSummary,
+        recentCaptionSnippets: structuredInstagram.recentCaptionSnippets,
+        recurringTopics: structuredInstagram.recurringTopics,
+        ...(structuredInstagram.additionalInstagramNotes
+          ? { additionalInstagramNotes: structuredInstagram.additionalInstagramNotes }
+          : {}),
+        ...(structuredInstagram.ctaPatterns?.length ? { ctaPatterns: structuredInstagram.ctaPatterns } : {}),
+        ...(structuredInstagram.proofSignals?.length ? { proofSignals: structuredInstagram.proofSignals } : {}),
+        ...(structuredInstagram.followerCount ? { followerCount: structuredInstagram.followerCount } : {}),
+        ...(structuredInstagram.category ? { category: structuredInstagram.category } : {}),
+        ...(structuredInstagram.visualStyleNotes ? { visualStyleNotes: structuredInstagram.visualStyleNotes } : {}),
+        ...(!hasStructuredInstagram && params.snapshotInput.instagramSummaryNotes
+          ? { instagramSummaryNotes: params.snapshotInput.instagramSummaryNotes }
+          : {}),
+      }
+    : params.snapshotInput.instagramSummaryNotes
+      ? {
+          handle: params.snapshotInput.instagramHandle ?? "",
+          bio: params.snapshotInput.instagramSummaryNotes,
+          offerSummary: "",
+          recentCaptionSnippets: [],
+          recurringTopics: [],
+          instagramSummaryNotes: params.snapshotInput.instagramSummaryNotes,
+        }
+      : null;
+
+  return {
+    client: {
+      brandName,
+      clientName: params.clientName,
+      websiteUrl: params.approvedSnapshot.client.websiteUrl ?? params.snapshotInput.websiteUrl ?? "",
+      instagramHandle:
+        params.approvedSnapshot.client.instagramHandle ?? params.snapshotInput.instagramHandle ?? "",
+      oneLineDescription:
+        params.approvedSnapshot.client.oneLineDescription ?? params.snapshotInput.oneLineDescription ?? "",
+    },
+    businessType: params.businessType,
+    sow: {
+      industry: typeof approvedSowRecord.industry === "string" ? approvedSowRecord.industry : "",
+      targetAudience: typeof approvedSowRecord.targetAudience === "string" ? approvedSowRecord.targetAudience : "",
+      understandingOfRequirements:
+        typeof approvedSowRecord.understandingOfRequirements === "string"
+          ? approvedSowRecord.understandingOfRequirements
+          : "",
+      strategyLaunchPlanning:
+        typeof approvedSowRecord.strategyLaunchPlanning === "string"
+          ? approvedSowRecord.strategyLaunchPlanning
+          : "",
+      contentCreation:
+        typeof approvedSowRecord.contentCreation === "string" ? approvedSowRecord.contentCreation : "",
+      scopeOfWork: typeof approvedSowRecord.scopeOfWork === "string" ? approvedSowRecord.scopeOfWork : "",
+      platforms: Array.isArray(approvedSowRecord.platforms)
+        ? approvedSowRecord.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      monthlyPosts:
+        typeof approvedSowRecord.monthlyPosts === "object" && approvedSowRecord.monthlyPosts !== null
+          ? (approvedSowRecord.monthlyPosts as Record<string, number>)
+          : {},
+      contentMix:
+        typeof approvedSowRecord.contentMix === "object" && approvedSowRecord.contentMix !== null
+          ? (approvedSowRecord.contentMix as Record<string, number>)
+          : {},
+      deliverables: Array.isArray(approvedSowRecord.deliverables)
+        ? approvedSowRecord.deliverables.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      toneByPlatform:
+        typeof approvedSowRecord.toneByPlatform === "object" && approvedSowRecord.toneByPlatform !== null
+          ? Object.fromEntries(
+              Object.entries(approvedSowRecord.toneByPlatform as Record<string, unknown>).map(([key, value]) => [
+                key,
+                String(value ?? "").trim(),
+              ]),
+            )
+          : {},
+    },
+    instagram,
+    approvedBusinessDna: {
+      purpose: params.approvedBusinessDna.purpose,
+      mission: params.approvedBusinessDna.mission,
+      vision: params.approvedBusinessDna.vision,
+      brandArchetype: params.approvedBusinessDna.brandArchetype,
+      coreValues: params.approvedBusinessDna.coreValues,
+      personalityTraits: params.approvedBusinessDna.personalityTraits,
+      audienceSegments: params.approvedBusinessDna.targetAudience.segments,
+      pains: params.approvedBusinessDna.targetAudience.pains,
+      desires: params.approvedBusinessDna.targetAudience.desires,
+      objections: params.approvedBusinessDna.targetAudience.objections,
+      category: params.approvedBusinessDna.positioning.category,
+      valueProposition: params.approvedBusinessDna.positioning.valueProposition,
+      differentiators: params.approvedBusinessDna.positioning.differentiators,
+      reasonToBelieve: params.approvedBusinessDna.positioning.reasonToBelieve,
+      primaryOffers: params.approvedBusinessDna.offers.primaryOffers,
+      transformationPromise: params.approvedBusinessDna.offers.transformationPromise,
+      contentPillars: params.approvedBusinessDna.contentStrategy.contentPillars,
+      themes: params.approvedBusinessDna.contentStrategy.themes,
+      hooksThatFitBrand: params.approvedBusinessDna.contentStrategy.hooksThatFitBrand,
+      trustSignalsToRepeat: params.approvedBusinessDna.contentStrategy.trustSignalsToRepeat,
+      voiceTone: params.approvedBusinessDna.toneOfVoice.style,
+    },
+    ...(approvedResearchContext ? { approvedResearchContext } : {}),
+    ...(websiteSummary ? { websiteSignals: websiteSummary } : {}),
+    platformSignals: {
+      instagram: {
+        ...(structuredInstagram?.followerCount ? { followerCount: structuredInstagram.followerCount } : {}),
+        ...(structuredInstagram?.ctaPatterns?.length ? { ctaPatterns: structuredInstagram.ctaPatterns } : {}),
+        ...(params.approvedBusinessDna.platformSignals?.instagram?.contentPatterns?.length
+          ? { contentPatterns: params.approvedBusinessDna.platformSignals.instagram.contentPatterns.slice(0, 6) }
+          : {}),
+        ...(params.approvedBusinessDna.platformSignals?.instagram?.engagementSignals?.length
+          ? { engagementNotes: params.approvedBusinessDna.platformSignals.instagram.engagementSignals.slice(0, 6) }
+          : {}),
+      },
+    },
+    ...(proofConstraints ? { proofConstraints } : {}),
+    templateType: params.templateType,
+  };
+}
+
+function sanitizeJtaCanonicalSections(
+  sections: Record<string, string>,
+  rawName: string,
+  brandName: string,
+): Record<string, string> {
+  if (!rawName || rawName === brandName) return sections;
+  return Object.fromEntries(
+    Object.entries(sections).map(([key, value]) => [
+      key,
+      sanitizeClientFacingText(String(value ?? ""), rawName, brandName),
+    ]),
+  );
+}
+
+function evaluateJtaCandidate(params: {
+  canonicalSections: Record<string, unknown>;
+  businessTypePrimary: string;
+  platforms: string[];
+  approvedBusinessDnaCategory?: string | null;
+  approvedBusinessDnaAudience?: string[] | null;
+  approvedBusinessDnaPains?: string[] | null;
+  approvedBusinessDnaThemes?: string[] | null;
+  approvedBusinessDnaDifferentiators?: string[] | null;
+  proofConstraints?: JtaProofConstraints | null;
+  proofGaps?: string[] | null;
+}) {
+  const structural = validateJtaStructure({ canonicalSections: params.canonicalSections });
+  const semantic = validateJtaSemantics({
+    canonicalSections: params.canonicalSections,
+    businessTypePrimary: params.businessTypePrimary,
+    platforms: params.platforms,
+    approvedBusinessDnaCategory: params.approvedBusinessDnaCategory,
+    approvedBusinessDnaAudience: params.approvedBusinessDnaAudience,
+    approvedBusinessDnaPains: params.approvedBusinessDnaPains,
+    approvedBusinessDnaThemes: params.approvedBusinessDnaThemes,
+    approvedBusinessDnaDifferentiators: params.approvedBusinessDnaDifferentiators,
+    proofConstraints: params.proofConstraints ?? null,
+    proofGaps: params.proofGaps ?? null,
+  });
+  const validationIssues = mergeValidationIssues(structural.issues, semantic.issues);
+  const validationStatus: NonNullable<RunMetaInput["validation"]>["status"] =
+    structural.status === "failed"
+      ? "failed"
+      : semantic.status === "warning"
+        ? "warning"
+        : "passed";
+  return {
+    structural,
+    semantic,
+    validationIssues,
+    validationIssueDetails: [...structural.issueDetails, ...semantic.issueDetails],
+    validationStatus,
+  };
+}
+
+function buildBusinessDnaInputSourceSummary(input: {
+  sourceContext: "draft" | "approved_snapshot";
+  websiteUrl: string | null | undefined;
+  instagramHandle: string | null | undefined;
+  structuredInstagram: StructuredInstagramInput | null | undefined;
+  instagramSummaryNotes: string | null | undefined;
+  sowSections?: { understandingOfRequirements?: string; scopeOfWork?: string } | null | undefined;
+  mcpDataPresent?: boolean;
+  skipInstagramFetch?: boolean;
+  strategyType?: string | null | undefined;
+}): Record<string, unknown> {
+  const structured = cleanStructuredInstagram(input.structuredInstagram);
+  const notes = typeof input.instagramSummaryNotes === "string" ? input.instagramSummaryNotes.trim() : "";
+  const understanding = String(input.sowSections?.understandingOfRequirements ?? "").trim();
+  const scope = String(input.sowSections?.scopeOfWork ?? "").trim();
+  return {
+    sourceContext: input.sourceContext,
+    strategyType: input.strategyType ?? null,
+    hasWebsiteUrl: Boolean(input.websiteUrl?.trim()),
+    hasInstagramHandle: Boolean(input.instagramHandle?.trim()),
+    hasStructuredInstagram: Boolean(structured),
+    structuredInstagramFields: structured
+      ? {
+          handle: Boolean(structured.handle),
+          bio: Boolean(structured.bio),
+          offerSummary: Boolean(structured.offerSummary),
+          recentCaptionSnippets: structured.recentCaptionSnippets.length,
+          recurringTopics: structured.recurringTopics.length,
+          additionalInstagramNotes: Boolean(structured.additionalInstagramNotes),
+          ctaPatterns: structured.ctaPatterns?.length ?? 0,
+          proofSignals: structured.proofSignals?.length ?? 0,
+          followerCount: Boolean(structured.followerCount),
+          category: Boolean(structured.category),
+          visualStyleNotes: Boolean(structured.visualStyleNotes),
+        }
+      : null,
+    hasLegacyInstagramNotes: Boolean(notes),
+    legacyInstagramNotesLength: notes.length,
+    hasUnderstandingOfRequirements: Boolean(understanding),
+    hasScopeOfWork: Boolean(scope),
+    mcpDataPresent: Boolean(input.mcpDataPresent),
+    skipInstagramFetch: Boolean(input.skipInstagramFetch),
+  };
+}
+
+function buildJtaBootstrapInputSourceSummary(input: {
+  sourceContext: "draft" | "approved_snapshot";
+  templateType: string | null | undefined;
+  businessDna: BusinessDna | null | undefined;
+  sow: Record<string, unknown> | null | undefined;
+  client: Pick<MemoryClient, "website" | "instagramHandle" | "oneLineDescription">;
+}): Record<string, unknown> {
+  const dna = input.businessDna;
+  const sow = input.sow ?? {};
+  const sectionCount = dna && typeof dna === "object" ? Object.keys(dna).length : 0;
+  return {
+    sourceContext: input.sourceContext,
+    templateType: input.templateType ?? null,
+    hasBusinessDna: Boolean(dna),
+    businessDnaSectionCount: sectionCount,
+    hasWebsiteUrl: Boolean(input.client.website?.trim()),
+    hasInstagramHandle: Boolean(input.client.instagramHandle?.trim()),
+    hasOneLineDescription: Boolean(input.client.oneLineDescription?.trim()),
+    selectedPlatforms: readSelectedPlatforms(sow),
+    monthlyPostCountTotal: Object.values(readMonthlyPosts(sow)).reduce((sum, value) => sum + (Number(value) || 0), 0),
+    contentMixBucketCount: Object.keys(readContentMix(sow)).length,
+    toneByPlatformCount: Object.keys(readToneByPlatform(sow)).length,
+  };
+}
+
+function buildApprovedContextSnapshot(params: {
+  clientId: string;
+  clientName: string;
+  websiteUrl: string | null | undefined;
+  instagramHandle: string | null | undefined;
+  oneLineDescription: string | null | undefined;
+  sow: Record<string, unknown>;
+  templateType: string;
+  previousSnapshot?: ApprovedContextSnapshot | null;
+}): ApprovedContextSnapshot {
+  const cleanedInstagram = cleanStructuredInstagram(params.sow.instagram);
+  const cleanedNormalizedSections = (() => {
+    const raw = (params.sow.normalizedSections as Record<string, unknown> | undefined) ?? undefined;
+    if (!raw) return undefined;
+    const out = Object.fromEntries(
+      Object.entries(raw)
+        .map(([key, value]) => [String(key).trim(), stripPlaceholderText(value)] as const)
+        .filter(([key, value]) => key.length > 0 && value.length > 0),
+    );
+    return Object.keys(out).length > 0 ? out : undefined;
+  })();
+  const base = {
+    sourceContext: "approved_snapshot" as const,
+    templateType: params.templateType,
+    client: {
+      id: params.clientId,
+      name: params.clientName,
+      websiteUrl: stripPlaceholderText(params.websiteUrl) || null,
+      instagramHandle: stripPlaceholderText(params.instagramHandle) || cleanedInstagram?.handle || null,
+      oneLineDescription: stripPlaceholderText(params.oneLineDescription) || null,
+    },
+    sow: {
+      industry: stripPlaceholderText(params.sow.industry),
+      targetAudience: stripPlaceholderText(params.sow.targetAudience),
+      understandingOfRequirements: stripPlaceholderText(params.sow.understandingOfRequirements),
+      strategyLaunchPlanning: stripPlaceholderText(params.sow.strategyLaunchPlanning),
+      contentCreation: stripPlaceholderText(params.sow.contentCreation),
+      scopeOfWork: stripPlaceholderText(params.sow.scopeOfWork),
+      platforms: cleanStringList(params.sow.platforms),
+      monthlyPosts: cleanNumberMap(params.sow.monthlyPosts),
+      contentMix: cleanNumberMap(params.sow.contentMix),
+      deliverables: cleanStringList(params.sow.deliverables),
+      toneByPlatform: cleanStringMap(params.sow.toneByPlatform),
+      ...(cleanedInstagram ? { instagram: cleanedInstagram } : {}),
+      ...(cleanedNormalizedSections ? { normalizedSections: cleanedNormalizedSections } : {}),
+      approval:
+        params.sow.approval && typeof params.sow.approval === "object"
+          ? (params.sow.approval as { approved?: boolean; approvedAt?: string | null })
+          : undefined,
+    },
+    provenance: {
+      website: stripPlaceholderText(params.websiteUrl) ? "extracted" as const : "missing" as const,
+      instagram:
+        stripPlaceholderText(params.instagramHandle) || cleanedInstagram
+          ? "extracted" as const
+          : "missing" as const,
+      oneLineDescription: stripPlaceholderText(params.oneLineDescription)
+        ? "extracted" as const
+        : "missing" as const,
+      sow: "extracted" as const,
+      template: "extracted" as const,
+      generatedAt: new Date().toISOString(),
+    },
+  };
+  const stablePayload = JSON.stringify(base);
+  const previousPayload = params.previousSnapshot
+    ? JSON.stringify({
+        sourceContext: params.previousSnapshot.sourceContext,
+        templateType: params.previousSnapshot.templateType,
+        client: params.previousSnapshot.client,
+        sow: params.previousSnapshot.sow,
+      })
+    : null;
+  const snapshotId =
+    previousPayload === stablePayload && params.previousSnapshot?.id
+      ? params.previousSnapshot.id
+      : randomUUID();
+  const createdAt =
+    previousPayload === stablePayload && params.previousSnapshot?.createdAt
+      ? params.previousSnapshot.createdAt
+      : new Date().toISOString();
+  return {
+    id: snapshotId,
+    createdAt,
+    ...base,
+  };
+}
+
+function stampArtifactState(
+  sow: Record<string, unknown>,
+  snapshot: ApprovedContextSnapshot | null,
+  stale: boolean,
+  reason?: string,
+): Record<string, unknown> {
+  return {
+    ...sow,
+    __approvedContextSnapshot: snapshot,
+    __artifactState: {
+      snapshotId: snapshot?.id ?? null,
+      stale,
+      ...(reason ? { reason } : {}),
+      updatedAt: new Date().toISOString(),
+    },
+  };
+}
+
+function annotateBusinessDnaArtifact(
+  enrichedData: Record<string, unknown> | null | undefined,
+  runMeta: ReturnType<typeof buildRunMeta>,
+  snapshotId: string | null,
+  stale: boolean,
+  businessType?: { primary?: string; confidence?: string } | null,
+): Record<string, unknown> {
+  const current = enrichedData ?? {};
+  const currentBusinessDna =
+    ((current.businessDna as Record<string, unknown> | null | undefined) ?? null);
+  const existingMeta =
+    ((currentBusinessDna?.__meta as BusinessDnaArtifactMeta | undefined) ?? undefined);
+  const nextBusinessDna = currentBusinessDna
+    ? {
+        ...currentBusinessDna,
+        __artifactMeta: {
+          ...(((currentBusinessDna.__artifactMeta as Record<string, unknown> | undefined) ?? {}) as Record<
+            string,
+            unknown
+          >),
+          ...runMeta,
+          snapshotId,
+          stale,
+        },
+        __meta: {
+          ...((existingMeta ?? {}) as BusinessDnaArtifactMeta),
+          businessDnaVersion: existingMeta?.businessDnaVersion ?? "v1",
+          businessDnaInputVersion: existingMeta?.businessDnaInputVersion ?? "v1",
+          generationMode:
+            (runMeta.generationMode === "llm" ? "llm" : "heuristic_fallback") as BusinessDnaArtifactMeta["generationMode"],
+          validationStatus: runMeta.validation?.status ?? existingMeta?.validationStatus ?? "not_run",
+          validationIssues: runMeta.validation?.issues ?? existingMeta?.validationIssues ?? [],
+          provider: runMeta.provider,
+          model: runMeta.model,
+          fallbackReason:
+            runMeta.generationMode === "llm"
+              ? undefined
+              : (typeof runMeta.diagnostics?.fallbackReason === "string"
+                  ? runMeta.diagnostics.fallbackReason
+                  : undefined) ??
+                runMeta.validation?.note ??
+                existingMeta?.fallbackReason,
+          fallbackSource:
+            runMeta.generationMode === "llm" ? existingMeta?.fallbackSource : "business_dna_heuristic",
+          generatedAt: runMeta.timestamp,
+          snapshotId,
+          currentSnapshotId: snapshotId,
+          stale,
+          latestRun: runMeta,
+          approval: defaultApprovalMeta(snapshotId),
+          businessType: businessType ?? existingMeta?.businessType,
+        } satisfies BusinessDnaArtifactMeta,
+      }
+    : currentBusinessDna;
+  return {
+    ...current,
+    ...(nextBusinessDna ? { businessDna: nextBusinessDna } : {}),
+    __provenance: {
+      ...(typeof current.__provenance === "object" && current.__provenance !== null
+        ? (current.__provenance as Record<string, unknown>)
+        : {}),
+      latestBusinessDnaRun: runMeta,
+      artifactSnapshotId: snapshotId,
+      artifactStale: stale,
+    },
+  };
+}
+
+function annotateStrategyStructured(
+  structured: Record<string, unknown>,
+  runMeta: ReturnType<typeof buildRunMeta>,
+  snapshotId: string | null,
+  stale: boolean,
+  businessType?: { primary?: string; confidence?: string } | null,
+): Record<string, unknown> {
+  const existingMeta =
+    (((structured.__meta as StrategyArtifactMeta | undefined) ?? undefined) as StrategyArtifactMeta | undefined);
+  return {
+    ...structured,
+    __meta: {
+      ...(((structured.__meta as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>),
+      latestRun: runMeta,
+      snapshotId,
+      snapshotState: stale ? "stale" : "fresh",
+      jtaVersion: existingMeta?.jtaVersion ?? "v1",
+      generationMode:
+        (runMeta.generationMode === "llm" ? "llm" : "deterministic_fallback") as StrategyArtifactMeta["generationMode"],
+      validationStatus: runMeta.validation?.status ?? existingMeta?.validationStatus ?? "not_run",
+      validationIssues: runMeta.validation?.issues ?? existingMeta?.validationIssues ?? [],
+      provider: runMeta.provider,
+      model: runMeta.model,
+      fallbackReason:
+        runMeta.generationMode === "llm"
+          ? undefined
+          : runMeta.validation?.note ?? existingMeta?.fallbackReason,
+      fallbackSource:
+        runMeta.generationMode === "llm" ? existingMeta?.fallbackSource : "bootstrap_deterministic",
+      generatedAt: runMeta.timestamp,
+      jtaInputVersion: existingMeta?.jtaInputVersion ?? "v1",
+      approval: defaultApprovalMeta(snapshotId),
+      businessType: businessType ?? existingMeta?.businessType,
+    },
+  };
+}
+
+function annotatePlannerMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  runMeta: ReturnType<typeof buildRunMeta>,
+  snapshotId: string | null,
+  stale: boolean,
+): Record<string, unknown> {
+  return {
+    ...((metadata ?? {}) as Record<string, unknown>),
+    latestRun: runMeta,
+    snapshotId,
+    snapshotState: stale ? "stale" : "fresh",
+  };
+}
+
+function markBusinessDnaStale(
+  enrichedData: Record<string, unknown> | null | undefined,
+  currentSnapshotId: string | null,
+): Record<string, unknown> {
+  const current = enrichedData ?? {};
+  const businessDna =
+    ((current.businessDna as Record<string, unknown> | null | undefined) ?? null);
+  const currentMeta =
+    ((businessDna?.__meta as BusinessDnaArtifactMeta | undefined) ?? undefined);
+  return {
+    ...current,
+    ...(businessDna
+      ? {
+          businessDna: {
+            ...businessDna,
+            __artifactMeta: {
+              ...(((businessDna.__artifactMeta as Record<string, unknown> | undefined) ?? {}) as Record<
+                string,
+                unknown
+              >),
+              stale: true,
+              currentSnapshotId,
+              staleAt: new Date().toISOString(),
+            },
+            __meta: {
+              ...((currentMeta ?? {}) as BusinessDnaArtifactMeta),
+              stale: true,
+              currentSnapshotId,
+              approval: defaultApprovalMeta(currentSnapshotId),
+            } satisfies BusinessDnaArtifactMeta,
+          },
+        }
+      : {}),
+    __provenance: {
+      ...(typeof current.__provenance === "object" && current.__provenance !== null
+        ? (current.__provenance as Record<string, unknown>)
+        : {}),
+      artifactStale: true,
+      artifactSnapshotId: currentSnapshotId,
+      artifactStaleAt: new Date().toISOString(),
+    },
+  };
+}
+
+function markStructuredArtifactStale(
+  structured: Record<string, unknown>,
+  currentSnapshotId: string | null,
+): Record<string, unknown> {
+  const currentMeta =
+    (((structured.__meta as StrategyArtifactMeta | undefined) ?? undefined) as StrategyArtifactMeta | undefined);
+  return {
+    ...structured,
+    __meta: {
+      ...(((structured.__meta as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>),
+      snapshotState: "stale",
+      currentSnapshotId,
+      staleAt: new Date().toISOString(),
+      approval: defaultApprovalMeta(currentSnapshotId),
+      generationMode: currentMeta?.generationMode,
+      validationStatus: currentMeta?.validationStatus,
+      validationIssues: currentMeta?.validationIssues,
+    },
+  };
+}
+
+function markPlannerArtifactStale(
+  metadata: Record<string, unknown> | null | undefined,
+  currentSnapshotId: string | null,
+): Record<string, unknown> {
+  return {
+    ...((metadata ?? {}) as Record<string, unknown>),
+    snapshotState: "stale",
+    currentSnapshotId,
+    staleAt: new Date().toISOString(),
+  };
 }
 
 function sanitizeSowPayload(body: Record<string, unknown>): Record<string, unknown> {
   const next: Record<string, unknown> = { ...body };
   delete next.excludedCommercial;
+  delete next.clientBasics;
 
   const pdfExtraction = (body.pdfExtraction as Record<string, unknown> | undefined) ?? undefined;
   if (pdfExtraction) {
     next.pdfExtraction = slimPdfExtraction(pdfExtraction);
+  }
+
+  const researchBriefImport = (body.researchBriefImport as Record<string, unknown> | undefined) ?? undefined;
+  if (researchBriefImport) {
+    next.researchBriefImport = slimResearchBriefImport(researchBriefImport);
   }
 
   const normalizedSections = (body.normalizedSections as Record<string, unknown> | undefined) ?? undefined;
@@ -3715,6 +7408,13 @@ function sanitizeSowPayload(body: Record<string, unknown>): Record<string, unkno
         .filter(([, value]) => typeof value === "string" && value.trim().length > 0)
         .filter(([key, value]) => !isExcludedSowSection(key, value as string)),
     );
+  }
+
+  const instagram = cleanStructuredInstagram(body.instagram);
+  if (instagram) {
+    next.instagram = instagram;
+  } else {
+    delete next.instagram;
   }
 
   return next;
@@ -3756,9 +7456,18 @@ function slimPdfExtraction(pdfExtraction: Record<string, unknown>): Record<strin
   );
 }
 
+function slimResearchBriefImport(researchBriefImport: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(researchBriefImport).filter(([key]) =>
+      ["lastImportedAt", "importFileName", "importHash", "fieldProvenance", "sectionMap"].includes(key),
+    ),
+  );
+}
+
 function buildFastEnrichedProfile(input: {
   raw: { name: string; websiteUrl: string; instagramHandle: string; oneLineDescription: string };
   existingEnriched: Record<string, unknown>;
+  sow?: Record<string, unknown> | null;
 }) {
   const existingAudience =
     input.existingEnriched.target_audience && typeof input.existingEnriched.target_audience === "object"
@@ -3766,6 +7475,7 @@ function buildFastEnrichedProfile(input: {
       : {};
   const websiteHost = safeHostFromUrl(input.raw.websiteUrl);
   const fallbackOffer = input.raw.oneLineDescription || `Offer for ${input.raw.name}`;
+  const selectedPlatforms = readSelectedPlatforms(input.sow);
   return {
     brand_name: asNonEmptyString(input.existingEnriched.brand_name) ?? input.raw.name,
     offer: asNonEmptyString(input.existingEnriched.offer) ?? fallbackOffer,
@@ -3780,7 +7490,9 @@ function buildFastEnrichedProfile(input: {
     positioning:
       asNonEmptyString(input.existingEnriched.positioning) ??
       `${input.raw.name} focused on ${input.raw.oneLineDescription || "clear customer outcomes"}`,
-    platform: asNonEmptyString(input.existingEnriched.platform) ?? "Instagram",
+    platform:
+      asNonEmptyString(input.existingEnriched.platform) ??
+      (selectedPlatforms.length > 0 ? selectedPlatforms.map(formatPlatformName).join(" + ") : "Instagram"),
     content_preference: asNonEmptyString(input.existingEnriched.content_preference) ?? "Educational + proof content",
     competitors: Array.isArray(input.existingEnriched.competitors)
       ? input.existingEnriched.competitors.map((item) => String(item)).filter(Boolean).slice(0, 5)
@@ -3850,6 +7562,526 @@ function buildStrategyDnaSowSections(
     understandingOfRequirements: join(understandingKeys),
     scopeOfWork: join(scopeKeys),
   };
+}
+
+function trimSentence(input: string, maxChars = 280): string {
+  const clean = String(input ?? "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  return clean.length <= maxChars ? clean : `${clean.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function formatPlatformName(platform: string): string {
+  return platform
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function readSelectedPlatforms(sow: Record<string, unknown> | null | undefined): string[] {
+  return Array.isArray(sow?.platforms)
+    ? sow.platforms.map((item) => String(item ?? "").trim()).filter(Boolean)
+    : [];
+}
+
+function readMonthlyPosts(sow: Record<string, unknown> | null | undefined): Record<string, number> {
+  const raw = (sow?.monthlyPosts as Record<string, unknown> | undefined) ?? {};
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([key, value]) => [String(key).trim(), Number(value) || 0] as const)
+      .filter(([key, value]) => key.length > 0 && value > 0),
+  );
+}
+
+function readContentMix(sow: Record<string, unknown> | null | undefined): Record<string, number> {
+  const raw = (sow?.contentMix as Record<string, unknown> | undefined) ?? {};
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([key, value]) => [String(key).trim(), Number(value) || 0] as const)
+      .filter(([key, value]) => key.length > 0 && value > 0),
+  );
+}
+
+function readToneByPlatform(sow: Record<string, unknown> | null | undefined): Record<string, string> {
+  const raw = (sow?.toneByPlatform as Record<string, unknown> | undefined) ?? {};
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([key, value]) => [String(key).trim(), String(value ?? "").trim()])
+      .filter(([key, value]) => key && value),
+  );
+}
+
+function buildGenerationInputsFromSnapshot(
+  snapshot: ApprovedContextSnapshot,
+  rawInput: Record<string, unknown> | null | undefined,
+) {
+  const rawInstagram = readStructuredInstagramFromUnknown(rawInput?.instagram);
+  const snapshotInstagram = readStructuredInstagramFromUnknown(snapshot.sow.instagram);
+  const preferredInstagram = pickPreferredInstagramInput(snapshotInstagram, rawInstagram);
+  const structuredInstagramNotes = deriveInstagramSummaryNotesFromStructuredInstagram(preferredInstagram);
+  const legacyInstagramNotes =
+    typeof rawInput?.instagramSummaryNotes === "string"
+      ? stripPlaceholderText(rawInput.instagramSummaryNotes)
+      : "";
+  return {
+    name: snapshot.client.name,
+    websiteUrl: snapshot.client.websiteUrl ?? "",
+    instagramHandle: snapshot.client.instagramHandle ?? preferredInstagram?.handle ?? "",
+    oneLineDescription: snapshot.client.oneLineDescription ?? "",
+    instagram: preferredInstagram,
+    instagramSummaryNotes: structuredInstagramNotes || legacyInstagramNotes,
+    sowSections: buildStrategyDnaSowSections(snapshot.sow as unknown as Record<string, unknown>, snapshot.sow.normalizedSections ?? null),
+  };
+}
+
+function describePlatforms(
+  platforms: string[],
+  monthlyPosts: Record<string, number>,
+  toneByPlatform: Record<string, string>,
+): string {
+  const parts = platforms
+    .map((platform) => {
+      const monthly = monthlyPosts[platform] ?? 0;
+      const tone = toneByPlatform[platform] ?? "";
+      return [
+        formatPlatformName(platform),
+        monthly > 0 ? `${monthly} posts/month` : "",
+        tone ? `${tone} tone` : "",
+      ]
+        .filter(Boolean)
+        .join(", ");
+    })
+    .filter(Boolean);
+  return parts.join("; ");
+}
+
+function describeContentMix(contentMix: Record<string, number>): string {
+  return Object.entries(contentMix)
+    .map(([key, value]) => `${canonicalLabelForMix(key)} (${value})`)
+    .join(", ");
+}
+
+function firstUseful(items: Array<string | null | undefined>): string {
+  return items.map((item) => String(item ?? "").trim()).find(Boolean) ?? "";
+}
+
+function joinSentences(lines: Array<string | null | undefined>): string {
+  return lines
+    .map((line) => trimSentence(String(line ?? "")))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function lowerFirst(text: string): string {
+  const clean = String(text ?? "").trim();
+  if (!clean) return "";
+  return clean.charAt(0).toLowerCase() + clean.slice(1);
+}
+
+function cleanStrategicPhrase(text: string, fallback = ""): string {
+  const clean = replaceDetectorPhrases(trimSentence(text, 180))
+    .replace(/\.\.\.+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.]+$/g, "");
+  return clean || fallback;
+}
+
+function summarizeAudienceNeed(dna: BusinessDna): string {
+  return cleanStrategicPhrase(
+    firstUseful([
+      dna.targetAudience.desires[0],
+      dna.targetAudience.pains[0],
+      dna.targetAudience.objections[0],
+    ]),
+    "clear proof, fit, and everyday relevance",
+  );
+}
+
+function buildMetricBullet(label: string, metrics: string[]): string {
+  const cleanMetrics = metrics.map((item) => cleanStrategicPhrase(item)).filter(Boolean);
+  if (cleanMetrics.length === 0) return "";
+  return `${label}: ${cleanMetrics.join(", ")}`;
+}
+
+function buildBootstrapSectionText(input: {
+  client: Pick<MemoryClient, "name" | "oneLineDescription">;
+  dna: BusinessDna;
+  sow: Record<string, unknown>;
+  platforms: string[];
+  monthlyPosts: Record<string, number>;
+  contentMix: Record<string, number>;
+  toneByPlatform: Record<string, string>;
+  fallback: Record<string, string>;
+}): Record<string, string> {
+  const { client, dna, sow, platforms, monthlyPosts, contentMix, toneByPlatform, fallback } = input;
+  const platformSummary = describePlatforms(platforms, monthlyPosts, toneByPlatform);
+  const contentMixSummary = describeContentMix(contentMix);
+  const category = firstUseful([
+    dna.positioning.category,
+    String(sow.industry ?? ""),
+    "the category",
+  ]);
+  const marketAngle = firstUseful([
+    dna.positioning.marketAngle,
+    dna.positioning.valueProposition,
+    client.oneLineDescription ?? "",
+  ]);
+  const primarySegments = dna.targetAudience.segments.slice(0, 2).join(" and ");
+  const audienceNeed = summarizeAudienceNeed(dna);
+  const differentiator = firstUseful([
+    dna.positioning.differentiators[0],
+    dna.positioning.valueProposition,
+    dna.mission,
+  ]);
+  const promiseFrame = cleanStrategicPhrase(
+    firstUseful([
+      dna.positioning.valueProposition,
+      dna.mission,
+      dna.offers.primaryOffers[0],
+    ]),
+    "a more credible and differentiated category choice",
+  );
+  const differentiatorFrame = cleanStrategicPhrase(
+    firstUseful([
+      dna.positioning.differentiators[0],
+      dna.positioning.valueProposition,
+      dna.mission,
+    ]),
+    "a clearer, more trustable alternative to generic category positioning",
+  );
+  const hooks = dna.contentStrategy.hooksThatFitBrand.slice(0, 2).join(", ");
+  const trustSignals = dna.contentStrategy.trustSignalsToRepeat
+    .slice(0, 2)
+    .map((item) => cleanStrategicPhrase(item))
+    .filter(Boolean)
+    .join(", ");
+  const activePlatformsLabel =
+    platforms.length > 0 ? platforms.map(formatPlatformName).join(" and ") : "the active channels";
+  const nonNegotiables = dna.coreValues.length > 0
+    ? dna.coreValues.slice(0, 4).map((item) => cleanStrategicPhrase(item)).filter(Boolean)
+    : ["Clarity", "Trust", "Consistency", "Premium restraint"];
+  const audienceSegments = dna.targetAudience.segments.slice(0, 4).map((item) => cleanStrategicPhrase(item)).filter(Boolean);
+  const audienceMotivations = [
+    ...dna.targetAudience.desires.slice(0, 2),
+    dna.targetAudience.psychographics[0],
+  ].map((item) => cleanStrategicPhrase(item)).filter(Boolean);
+  const painAndDesire = [
+    dna.targetAudience.pains[0],
+    dna.targetAudience.desires[0],
+  ].map((item) => cleanStrategicPhrase(item)).filter(Boolean);
+  const buyingTriggers = [
+    dna.targetAudience.objections[0]
+      ? `Clear proof that resolves ${lowerFirst(cleanStrategicPhrase(dna.targetAudience.objections[0]))}`
+      : "",
+    "Tangible differentiation they can understand quickly",
+    "A low-friction next step that converts interest into action",
+  ].map((item) => cleanStrategicPhrase(item)).filter(Boolean);
+  const emotionalBullets = [
+    buildMetricBullet("Confidence", [
+      cleanStrategicPhrase(dna.targetAudience.desires[0], "buyers want confidence that the brand is the right fit"),
+    ]),
+    buildMetricBullet("Relief", [
+      dna.targetAudience.objections[0]
+        ? `reassurance that removes ${lowerFirst(cleanStrategicPhrase(dna.targetAudience.objections[0]))}`
+        : "reassurance that reduces hesitation before action",
+    ]),
+    buildMetricBullet("Trust", [
+      "credibility needs to feel earned before buyers convert",
+    ]),
+    buildMetricBullet("Aspiration", [
+      "the brand should feel aligned with the routine and identity the audience wants to sustain",
+    ]),
+  ].filter(Boolean);
+
+  return {
+    marketNarrative:
+      joinStrategyLines([
+        `${client.name} should be framed inside a changing ${category} market where product utility alone is no longer enough to win attention or trust.`,
+        `Category context: ${client.name} operates in ${category}, where buyers increasingly evaluate performance, credibility, and brand meaning together rather than as separate decisions.`,
+        `Market shift: Demand is moving toward brands that make ${lowerFirst(promiseFrame)} feel credible, differentiated, and easy to understand at a glance.`,
+        primarySegments
+          ? `Audience behavior: ${primarySegments} compare fit, trust, and everyday relevance before they act, especially when the category needs more explanation than a simple product claim.`
+          : "Audience behavior: Buyers compare fit, trust, and everyday relevance before they act, especially when the category needs more explanation than a simple product claim.",
+        `Brand relevance: ${client.name} becomes more relevant when it translates ${lowerFirst(differentiatorFrame)} into a message buyers can place inside their routines, standards, and self-image.`,
+        `Whitespace / opportunity: Own the space between generic premium positioning and a clearer everyday outcome built around ${lowerFirst(audienceNeed)}.`,
+      ]) || fallback.marketNarrative,
+    problemGapSolution:
+      joinSentences([
+        `The core problem is that buyers in ${category} often see options that describe the product but do not reduce uncertainty about fit, trust, or everyday relevance.`,
+        dna.targetAudience.pains[0]
+          ? `For this audience, the friction shows up as ${dna.targetAudience.pains[0].toLowerCase()}, which slows conversion and makes discovery content harder to turn into action.`
+          : "",
+        differentiatorFrame
+          ? `The gap is not simply product availability; it is the lack of messaging that makes ${lowerFirst(differentiatorFrame)} feel concrete, believable, and easy to act on.`
+          : "",
+        `The solution is to make ${client.name} communicate the category pain, the missing proof, and the brand-specific solve in one sequence so every section moves from problem to reassurance to action.`,
+      ]) || fallback.problemGapSolution,
+    brandFoundation:
+      joinStrategyLines([
+        `${client.name} should be framed as a brand with a clear promise, not just a product descriptor.`,
+        `Mission: Build a brand that makes ${lowerFirst(promiseFrame)} feel easier to trust, choose, and repeat.`,
+        `Core promise: Deliver ${lowerFirst(promiseFrame)} in a way that feels credible, relevant, and usable in real routines.`,
+        `Differentiator: Position ${client.name} as ${lowerFirst(differentiatorFrame)} rather than another brand relying on broad premium language.`,
+        `Non-negotiables: ${nonNegotiables.join(", ")}`,
+      ]) || fallback.brandFoundation,
+    brandPhilosophy:
+      joinSentences([
+        dna.brandArchetype ? `${client.name} should behave like a ${dna.brandArchetype.toLowerCase()} brand, not a generic content publisher.` : "",
+        dna.voice_tone ? `Its communication philosophy should feel ${dna.voice_tone.toLowerCase()}, with every message helping the audience interpret the brand quickly and confidently.` : "",
+        dna.personalityTraits.length > 0
+          ? `Personality should come through as ${dna.personalityTraits.slice(0, 4).join(", ")}, which shapes how the brand educates, reassures, and differentiates itself.`
+          : "",
+        dna.toneOfVoice.donts.length > 0
+          ? `Just as important, it should avoid ${dna.toneOfVoice.donts.slice(0, 3).join(", ")} so the brand does not collapse into category cliches or overclaiming.`
+          : "",
+      ]) || fallback.brandPhilosophy,
+    audience:
+      joinStrategyLines([
+        `The audience definition should explain who acts, what they care about, and what finally moves them toward action.`,
+        `Primary audience: ${primarySegments || "Decision-makers seeking a more credible category choice"}`,
+        audienceSegments.length > 0 ? `Priority segments: ${audienceSegments.join(", ")}` : "",
+        audienceMotivations.length > 0 ? `Motivations: ${audienceMotivations.join(", ")}` : "Motivations: Confidence in the choice, fit with identity, and lower decision friction",
+        painAndDesire.length > 0 ? `Pains and desires: ${painAndDesire.join(", ")}` : "Pains and desires: Unclear proof, fit concerns, and a desire for a clearer reason to choose",
+        buyingTriggers.length > 0 ? `Buying triggers: ${buyingTriggers.join(", ")}` : "",
+      ]) || fallback.audience,
+    emotionalDrivers:
+      joinStrategyLines([
+        "The strongest emotional triggers should explain what helps the audience move from interest to action.",
+        ...emotionalBullets,
+      ]) || fallback.emotionalDrivers,
+    platformStrategy:
+      joinSentences([
+        platformSummary
+          ? `The active platform system for ${client.name} is ${platformSummary}, and each channel should have a clear role in moving the audience from discovery to trust to conversion.`
+          : "",
+        platforms.length > 0
+          ? `${activePlatformsLabel} should not repeat the same message in the same format; each platform should translate the same positioning into channel-native behavior and intent.`
+          : "",
+        dna.platformSignals.instagram.contentPatterns.length > 0
+          ? `The strongest reusable platform behavior today comes from patterns such as ${dna.platformSignals.instagram.contentPatterns.slice(0, 3).join(", ")}, which can be adapted into repeatable creative systems.`
+          : "",
+        toneByPlatform && Object.keys(toneByPlatform).length > 0
+          ? `Execution should stay consistent with the selected tone guidance so the audience experiences a coherent brand voice even when the content format changes.`
+          : "",
+      ]) || fallback.platformStrategy,
+    contentStrategy:
+      joinSentences([
+        dna.contentStrategy.contentPillars.length > 0
+          ? `The content strategy should run on a fixed system of pillars such as ${dna.contentStrategy.contentPillars.slice(0, 4).join(", ")}, with each pillar serving a different trust or conversion job.`
+          : "",
+        contentMixSummary
+          ? `The approved content mix of ${contentMixSummary} should be treated as an operating ratio, not a loose suggestion, so each month balances education, positioning, proof, and action.`
+          : "",
+        hooks
+          ? `Hooks should consistently open with angles like ${hooks.toLowerCase()}, while proof angles should come from ${trustSignals || "demonstrable reasons to believe"}.`
+          : "",
+        platforms.length > 0
+          ? `Across ${activePlatformsLabel}, repetition should come from recurring message architecture and recognizable formats, not from reusing the same caption logic everywhere.`
+          : "",
+      ]) || fallback.contentStrategy,
+    kpis:
+      joinStrategyLines([
+        "Performance should be tracked through business-facing metrics across awareness, engagement, trust, conversion, and retention.",
+        "Awareness: Reach growth, discovery efficiency, and new-audience penetration",
+        "Engagement: Saves, shares, profile actions, and deeper content interaction",
+        "Trust: Proof consumption, repeat visits, and high-intent engagement quality",
+        "Conversion: Click-throughs, inquiries, landing-page actions, or purchase-intent signals",
+        platforms.length > 0
+          ? `Retention: Compare which of ${activePlatformsLabel} keeps returning attention and compounds downstream response over time`
+          : "Retention: Returning audience behavior and repeat response over time",
+      ]) || fallback.kpis,
+    trackingPlan:
+      joinSentences([
+        `Track performance weekly by section, platform, and format, then review bi-weekly to identify which messages are earning attention versus which ones are actually moving intent.`,
+        contentMixSummary ? `Use the approved content mix as a control variable so changes in output quality are not confused with changes in distribution balance.` : "",
+        `A monthly review should decide what to scale, what to simplify, and what proof or audience angle still needs reinforcement.`
+      ]) || fallback.trackingPlan,
+    executionPhases:
+      joinSentences([
+        `Phase 1 should lock narrative clarity, platform roles, and repeatable creative systems so the strategy has a stable foundation before optimization begins.`,
+        `Phase 2 should strengthen proof, audience resonance, and conversion pathways by doubling down on the sections and formats that are earning response.`,
+        `Phase 3 should optimize the system using actual performance data, with updates tied to content mix, platform contribution, and the quality of action signals.`
+      ]) || fallback.executionPhases,
+    assetRequirements:
+      joinSentences([
+        `The asset plan should cover short-form video, carousels, static design units, caption templates, proof blocks, and reusable CTA-ready copy so the team can execute consistently across the active channels.`,
+        platforms.length > 0
+          ? `Because ${client.name} is activating ${activePlatformsLabel}, the asset library should include platform-adapted versions rather than one master asset pushed everywhere unchanged.`
+          : "",
+        trustSignals ? `Priority production inputs should support the strongest proof themes, especially ${trustSignals.toLowerCase()}.` : "",
+      ]) || fallback.assetRequirements,
+  };
+}
+
+async function generateStrategySectionPatch(input: {
+  provider: LLMProvider;
+  client: Pick<MemoryClient, "id" | "name" | "website" | "instagramHandle" | "oneLineDescription">;
+  sectionKey: string;
+  structured: Record<string, unknown>;
+  businessDna: BusinessDna | null;
+  sow: Record<string, unknown> | null | undefined;
+  importedResearchBrief?: Record<string, unknown> | null;
+  reason?: string | null;
+}): Promise<string> {
+  const websiteSummaryFromDna = summarizeWebsiteForBusinessDnaInput(input.businessDna);
+  const resolvedBrandName = resolveClientFacingBrandName(input.client.name, {
+    oneLineDescription: input.client.oneLineDescription,
+    websiteTitle: websiteSummaryFromDna?.title ?? null,
+  });
+  const instagramUrl = input.client.instagramHandle?.startsWith("http")
+    ? input.client.instagramHandle
+    : input.client.instagramHandle
+      ? `https://instagram.com/${input.client.instagramHandle.replace(/^@/, "")}`
+      : "";
+  const context = await getClientContextWithCache({
+    clientId: input.client.id,
+    websiteUrl: input.client.website ?? "",
+    instagramUrlOrHandle: instagramUrl,
+    timeoutMs: 6000,
+  });
+  const mergedInstagram = mergeInstagramForStrategy(
+    context.instagramSummary,
+    input.businessDna?.platformSignals?.instagram,
+  );
+  const knownTextBlob = [
+    input.client.oneLineDescription,
+    input.sow?.industry,
+    input.sow?.targetAudience,
+    mergedInstagram?.bio,
+    input.businessDna?.positioning.valueProposition,
+  ]
+    .map((item) => String(item ?? "").replace(/\s+/g, " ").trim().toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+  const approvedResearchContext = compactImportedResearchForJta(input.importedResearchBrief, { knownTextBlob });
+  const proofConstraints = buildProofConstraintsFromResearchContext(approvedResearchContext);
+  const summary = ((input.structured.__summary as Record<string, unknown> | undefined) ?? {}) as {
+    strategy?: string;
+    pillarPriorities?: string[];
+    monthlyGoals?: string[];
+  };
+  const patchPayload = {
+    client: {
+      id: input.client.id,
+      name: resolvedBrandName,
+      websiteUrl: input.client.website,
+      instagramHandle: input.client.instagramHandle,
+      oneLineDescription: input.client.oneLineDescription,
+    },
+    sow: {
+      sowVersion: Number(input.sow?.sowVersion ?? 0),
+      industry: String(input.sow?.industry ?? ""),
+      targetAudience: String(input.sow?.targetAudience ?? ""),
+      understandingOfRequirements: String(input.sow?.understandingOfRequirements ?? ""),
+      strategyLaunchPlanning: String(input.sow?.strategyLaunchPlanning ?? ""),
+      contentCreation: String(input.sow?.contentCreation ?? ""),
+      scopeOfWork: effectiveScopeOfWork(input.sow) || String(input.sow?.scopeOfWork ?? ""),
+      platforms: readSelectedPlatforms(input.sow),
+      monthlyPosts: readMonthlyPosts(input.sow),
+      contentMix: readContentMix(input.sow),
+      deliverables: Array.isArray(input.sow?.deliverables)
+        ? input.sow!.deliverables.map((item) => String(item ?? "").trim()).filter(Boolean)
+        : [],
+      toneByPlatform: readToneByPlatform(input.sow),
+      normalizedSections: getStrategyRelevantNormalizedSowSections(input.sow) ?? {},
+      parseMeta:
+        ((input.sow?.parseMeta as Record<string, unknown> | undefined) ?? {
+          mode: "",
+          parseConfidence: 0,
+          warnings: [],
+        }),
+    },
+    websiteSummary: {
+      url: input.client.website ?? null,
+      brandName: resolvedBrandName,
+      offerSummary:
+        trimSentence(approvedResearchContext?.websiteSignals?.primaryOffers ?? "", 220) ||
+        trimSentence(context.websiteSummary?.meta_description ?? websiteSummaryFromDna?.metaDescription ?? "", 220) ||
+        null,
+      positioningSummary:
+        trimSentence(approvedResearchContext?.websiteSignals?.brandPositioning ?? "", 220) ||
+        trimSentence(context.websiteSummary?.main_text_excerpt ?? websiteSummaryFromDna?.heroExcerpt ?? "", 220) ||
+        null,
+      proofPoints: [],
+      toneSignals: websiteSummaryFromDna?.messagingPatterns?.slice(0, 4) ?? [],
+    },
+    websiteSignals: {
+      ...(websiteSummaryFromDna ?? {}),
+      ...(approvedResearchContext?.websiteSignals ?? {}),
+    },
+    instagramSummary: {
+      handle: input.client.instagramHandle ?? null,
+      bioSummary: mergedInstagram?.bio ?? null,
+      captionThemes: mergedInstagram?.last_n_caption_snippets?.slice(0, 4) ?? [],
+      contentPatterns:
+        input.businessDna?.platformSignals?.instagram?.contentPatterns?.slice(0, 4) ??
+        mergedInstagram?.last_n_caption_snippets?.slice(0, 4) ??
+        [],
+      audienceSignals: input.businessDna?.platformSignals.instagram.bioSignals.slice(0, 4) ?? [],
+      followerCount: input.businessDna?.platformSignals?.instagram?.engagementSignals?.[0] ?? null,
+      ctaPatterns: input.businessDna?.platformSignals?.instagram?.bioSignals?.slice(0, 4) ?? [],
+      engagementNotes: input.businessDna?.platformSignals?.instagram?.engagementSignals?.slice(0, 4) ?? [],
+      notes: null,
+    },
+    businessDna: {
+      brandNarrative: firstUseful([
+        input.businessDna?.purpose,
+        input.businessDna?.mission,
+        input.businessDna?.positioning.marketAngle,
+      ]) || null,
+      offerClarity: firstUseful([
+        input.businessDna?.offers.transformationPromise,
+        input.businessDna?.positioning.valueProposition,
+      ]) || null,
+      audienceCore: input.businessDna?.targetAudience.segments.slice(0, 3).join(", ") || null,
+      voiceAndTone: input.businessDna?.voice_tone || null,
+      positioningEdge: input.businessDna?.positioning.differentiators.slice(0, 2).join(", ") || null,
+      contentAngles: input.businessDna?.contentStrategy.contentPillars.slice(0, 6) ?? [],
+      risksOrGaps: input.businessDna?.targetAudience.objections.slice(0, 4) ?? [],
+    },
+    approvedResearchContext: approvedResearchContext ?? null,
+    proofConstraints: proofConstraints ?? null,
+    downstreamContext: {
+      priorStrategySummary: typeof summary.strategy === "string" ? summary.strategy : null,
+      pillarPriorities: Array.isArray(summary.pillarPriorities) ? summary.pillarPriorities : [],
+      monthlyGoals: Array.isArray(summary.monthlyGoals) ? summary.monthlyGoals : [],
+    },
+    generationMode: "section_patch",
+    sectionPatchRequest: {
+      sectionKey: input.sectionKey,
+      reason: input.reason ?? null,
+      preserveContext: {
+        currentSection:
+          ((input.structured.canonicalSections as Record<string, unknown> | undefined) ?? {})[input.sectionKey] ?? "",
+      },
+    },
+  };
+
+  const template = await loadPromptTemplate("strategy/v1-patch");
+  const prompt = injectPromptVariables(
+    template,
+    { INPUT_JSON: JSON.stringify(patchPayload) },
+    { requiredKeys: ["INPUT_JSON"] },
+  );
+  const parsed = await getStrictJsonWithRetry<StrategyPatchResponse>(input.provider, {
+    contextLabel: `strategy section patch:${input.sectionKey}`,
+    maxOutputTokens: 700,
+    messages: [
+      { role: "user", content: prompt },
+    ],
+  });
+  const sectionValue = sanitizeClientFacingText(
+    String(parsed.patch?.sectionValue ?? "").trim(),
+    input.client.name,
+    resolvedBrandName,
+  );
+  const returnedKey = String(parsed.patch?.sectionKey ?? "").trim();
+  if (returnedKey !== input.sectionKey) {
+    throw new Error(`Patch returned wrong section key: expected ${input.sectionKey}, got ${returnedKey || "(empty)"}`);
+  }
+  if (!sectionValue) {
+    throw new Error("Patch returned empty section text");
+  }
+  return sectionValue;
 }
 
 function buildCanonicalDocument(name: string, sections: Record<string, string>): string {
@@ -3939,28 +8171,43 @@ function mergeBusinessDnaIntoCanonical(
   dna: BusinessDna | null | undefined,
   sections: Record<string, string>,
 ): Record<string, string> {
-  if (!dna) return sections;
-  const block = [
-    "### Business DNA",
-    `Purpose: ${dna.purpose || "n/a"}`,
-    `Mission: ${dna.mission || "n/a"}`,
-    `Audience: ${dna.targetAudience.segments.join(", ") || "n/a"}`,
-    `Positioning: ${dna.positioning.valueProposition || "n/a"}`,
-    `Content pillars: ${dna.contentStrategy.contentPillars.join(", ") || "n/a"}`,
-    `Voice: ${dna.toneOfVoice.style.join(", ") || dna.voice_tone || "n/a"}`,
-    `Visual style: ${dna.visualIdentity.layoutStyle || dna.visual_identity.style || "n/a"}`,
-    `Palette signals: ${dna.visualIdentity.colors.map((color) => color.hex).join(", ") || dna.visual_identity.colors.join(", ") || "n/a"}`,
-    `Website discovery: ${dna.mcp.website.ok ? "ok" : dna.mcp.website.error ?? "unavailable"}`,
-    `Instagram data: ${dna.mcp.instagram.ok ? "attached" : dna.mcp.instagram.note ?? dna.mcp.instagram.error ?? "MCP not configured"}`,
-  ].join("\n");
-  return {
-    ...sections,
-    marketNarrative: [block, sections.marketNarrative].filter(Boolean).join("\n\n"),
-  };
+  void dna;
+  return sections;
 }
 
 function joinStrategyLines(lines: Array<string | null | undefined>): string {
   return lines.map((line) => String(line ?? "").trim()).filter(Boolean).join("\n");
+}
+
+function cleanCanonicalSectionText(text: string): string {
+  return text
+    .replace(/â€”/g, "—")
+    .replace(/â€¢/g, "•")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeSectionComparison(text: string): string {
+  return cleanCanonicalSectionText(text).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringListValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  }
+  const single = stringValue(value);
+  return single ? [single] : [];
 }
 
 function bulletLines(items: unknown): string {
@@ -3970,6 +8217,645 @@ function bulletLines(items: unknown): string {
     .filter(Boolean)
     .map((item) => `- ${item}`)
     .join("\n");
+}
+
+function sentenceCase(text: string): string {
+  const clean = text.trim();
+  if (!clean) return "";
+  return clean.charAt(0).toUpperCase() + clean.slice(1);
+}
+
+function ensureSentence(text: string): string {
+  const clean = cleanCanonicalSectionText(text).replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  if (/[.!?]$/.test(clean)) return sentenceCase(clean);
+  return `${sentenceCase(clean)}.`;
+}
+
+function splitCanonicalLines(text: string): string[] {
+  return cleanCanonicalSectionText(text)
+    .split(/\n+/)
+    .map((line) => line.replace(/^[-•]\s*/, "").trim())
+    .filter(Boolean);
+}
+
+function splitSentences(text: string): string[] {
+  return cleanCanonicalSectionText(text)
+    .replace(/\n+/g, " ")
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function replaceDetectorPhrases(text: string): string {
+  return text
+    .replace(/testimonials mentioned on site/gi, "customer proof is visible")
+    .replace(/case studies mentioned on site/gi, "case-study evidence is available")
+    .replace(/certifications referenced/gi, "trust markers are visible")
+    .replace(/trusted-by brand block/gi, "brand credibility cues are present")
+    .replace(/review or rating language present/gi, "review-based credibility is visible")
+    .replace(/direct cta language present on site/gi, "clear conversion language is already present")
+    .replace(/audience-specific copy appears on site/gi, "audience-directed messaging is already present");
+}
+
+function isDetectorResidueLine(line: string): boolean {
+  const normalized = normalizeSectionComparison(line);
+  if (!normalized) return true;
+  return [
+    "website signals",
+    "instagram signals",
+    "business dna",
+    "website discovery",
+    "instagram data",
+    "proof angles",
+    "conversion signals",
+    "trust signals to repeat",
+    "primary offers",
+    "deliverables",
+    "scope of work",
+    "shop cta present",
+    "booking cta present",
+    "contact cta present",
+    "quiz or assessment cta present",
+    "consultation cta present",
+  ].some((pattern) => normalized.includes(pattern));
+}
+
+function stripCanonicalNoise(sectionKey: string, text: string): string {
+  const lines = splitCanonicalLines(replaceDetectorPhrases(text));
+  const cleanedLines = lines
+    .filter((line) => !isDetectorResidueLine(line))
+    .filter((line) => {
+      const normalized = normalizeSectionComparison(line);
+      if (sectionKey === "marketNarrative") {
+        return !/^for this audience the friction shows up as$/.test(normalized);
+      }
+      if (sectionKey === "emotionalDrivers") {
+        return !/\b(tone|personality|archetype|voice)\b/.test(normalized);
+      }
+      return true;
+    });
+  return cleanCanonicalSectionText(cleanedLines.join("\n"));
+}
+
+function normalizeLabel(label: string): string {
+  return label
+    .replace(/_/g, " ")
+    .replace(/\bcta\b/gi, "CTA")
+    .replace(/\bkpis\b/gi, "KPIs")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function parseLabeledLines(text: string): Array<{ label: string; value: string }> {
+  const lines = splitCanonicalLines(text);
+  const entries: Array<{ label: string; value: string }> = [];
+  let currentLabel = "";
+  let currentValues: string[] = [];
+
+  const flush = () => {
+    if (!currentLabel || currentValues.length === 0) return;
+    entries.push({
+      label: normalizeLabel(currentLabel),
+      value: ensureSentence(currentValues.join("; ")),
+    });
+    currentLabel = "";
+    currentValues = [];
+  };
+
+  for (const line of lines) {
+    const inlineMatch = line.match(/^([^:]{2,40}):\s*(.+)$/);
+    if (inlineMatch) {
+      flush();
+      entries.push({
+        label: normalizeLabel(inlineMatch[1] ?? ""),
+        value: ensureSentence(inlineMatch[2] ?? ""),
+      });
+      continue;
+    }
+
+    const labelOnlyMatch = line.match(/^([^:]{2,40}):\s*$/);
+    if (labelOnlyMatch) {
+      flush();
+      currentLabel = labelOnlyMatch[1] ?? "";
+      currentValues = [];
+      continue;
+    }
+
+    if (currentLabel) {
+      currentValues.push(line);
+    }
+  }
+
+  flush();
+  return entries;
+}
+
+function normalizeBulletLine(line: string): string {
+  const match = line.match(/^([^:]{2,40}):\s*(.+)$/);
+  if (!match) return ensureSentence(line);
+  const label = normalizeLabel(match[1] ?? "");
+  const value = String(match[2] ?? "").trim();
+  return `${label}: ${value.replace(/[.!?]$/, "")}`;
+}
+
+function toSummaryAndBullets(
+  text: string,
+  options?: { summary?: string; maxBullets?: number },
+): string {
+  const normalized = stripCanonicalNoise("", text);
+  if (!normalized) return "";
+  const rawLines = splitCanonicalLines(normalized);
+  const firstLine = rawLines[0] ?? "";
+  const leadingSummary =
+    firstLine && !/^([^:]{2,40}):\s*(.+)?$/.test(firstLine) ? ensureSentence(firstLine) : "";
+  const labeled = parseLabeledLines(normalized);
+  let summary = options?.summary ? ensureSentence(options.summary) : leadingSummary;
+  let bullets: string[] = [];
+
+  if (labeled.length > 0) {
+    if (!summary) summary = labeled[0]?.value ?? "";
+    bullets = labeled.map((entry) => `${entry.label}: ${entry.value.replace(/[.!?]$/, "")}`);
+  } else {
+    const lines = rawLines;
+    const sentences = splitSentences(normalized);
+    const source = lines.length > 1 ? lines : sentences;
+    if (!summary) summary = ensureSentence(source[0] ?? "");
+    bullets = source.slice(1).map(normalizeBulletLine);
+  }
+
+  const uniqueBullets: string[] = [];
+  const seen = new Set<string>();
+  for (const bullet of bullets) {
+    const normalizedBullet = normalizeSectionComparison(bullet);
+    if (!normalizedBullet || seen.has(normalizedBullet)) continue;
+    if (summary && normalizeSectionComparison(summary).includes(normalizedBullet)) continue;
+    seen.add(normalizedBullet);
+    uniqueBullets.push(`- ${bullet}`);
+  }
+
+  const limitedBullets = uniqueBullets.slice(0, Math.max(2, Math.min(options?.maxBullets ?? 5, 5)));
+  if (!summary) return limitedBullets.join("\n");
+  if (limitedBullets.length === 0) return summary;
+  return `${summary}\n${limitedBullets.join("\n")}`;
+}
+
+function finalizeCanonicalSectionText(sectionKey: string, text: string): string {
+  const stripped = stripCanonicalNoise(sectionKey, text);
+  if (!stripped) return "";
+
+  switch (sectionKey) {
+    case "marketNarrative":
+      return toSummaryAndBullets(stripped, { maxBullets: 5 });
+    case "brandFoundation":
+      return toSummaryAndBullets(stripped, { maxBullets: 4 });
+    case "audience":
+      return toSummaryAndBullets(stripped, { maxBullets: 5 });
+    case "emotionalDrivers":
+      return toSummaryAndBullets(stripped, { maxBullets: 4 });
+    case "kpis":
+      return toSummaryAndBullets(stripped, {
+        summary: "Performance should be tracked through business-facing metrics across awareness, engagement, trust, conversion, and retention.",
+        maxBullets: 5,
+      });
+    case "platformStrategy":
+      return toSummaryAndBullets(stripped, { maxBullets: 4 });
+    case "contentStrategy":
+      return toSummaryAndBullets(stripped, { maxBullets: 5 });
+    case "trackingPlan":
+      return toSummaryAndBullets(stripped, { maxBullets: 4 });
+    case "executionPhases":
+      return toSummaryAndBullets(stripped, { maxBullets: 4 });
+    case "assetRequirements":
+      return toSummaryAndBullets(stripped, { maxBullets: 4 });
+    default:
+      return stripped;
+  }
+}
+
+function formatNamedList(label: string, value: unknown): string {
+  const items = stringListValue(value);
+  return items.length > 0 ? `${label}:\n${bulletLines(items)}` : "";
+}
+
+function formatPlatformStrategy(value: unknown): string {
+  const record = recordValue(value);
+  if (!record) return "";
+  const platforms = Array.isArray(record.platforms) ? record.platforms : [];
+  const platformLines = platforms
+    .map((item) => {
+      const entry = recordValue(item);
+      if (!entry) return "";
+      const platform = stringValue(entry.platform);
+      const role = stringValue(entry.role);
+      const objective = stringValue(entry.objective);
+      const funnel = stringValue(entry.funnel_stage);
+      const behavior = stringValue(entry.content_behavior);
+      return [
+        platform ? `${platform}:` : "",
+        role,
+        objective ? `Objective: ${objective}` : "",
+        funnel ? `Funnel: ${funnel}` : "",
+        behavior ? `Behavior: ${behavior}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+    })
+    .filter(Boolean);
+  return joinStrategyLines([
+    platformLines.length > 0 ? bulletLines(platformLines) : "",
+    stringValue(record.system_role),
+  ]);
+}
+
+function formatContentStrategy(value: unknown): string {
+  const record = recordValue(value);
+  if (!record) return "";
+  const pillars = Array.isArray(record.pillars) ? record.pillars : [];
+  const pillarLines = pillars
+    .map((item) => {
+      const entry = recordValue(item);
+      if (!entry) return String(item ?? "").trim();
+      const name = stringValue(entry.name);
+      const angle = stringValue(entry.angle) || stringValue(entry.description);
+      return [name, angle].filter(Boolean).join(": ");
+    })
+    .filter(Boolean);
+  return joinStrategyLines([
+    pillarLines.length > 0 ? `Pillars:\n${bulletLines(pillarLines)}` : "",
+    formatNamedList("Hooks", record.hooks),
+    formatNamedList("Formats", record.formats),
+    formatNamedList("Proof angles", record.proof_angles),
+    stringValue(record.repeatable_system) ? `System: ${stringValue(record.repeatable_system)}` : "",
+  ]);
+}
+
+function formatKpis(value: unknown): string {
+  const record = recordValue(value);
+  if (!record) return "";
+  return joinStrategyLines([
+    formatNamedList("Awareness", record.awareness),
+    formatNamedList("Engagement", record.engagement),
+    formatNamedList("Trust", record.trust),
+    formatNamedList("Conversion", record.conversion),
+    formatNamedList("Retention", record.retention),
+  ]);
+}
+
+function formatTrackingPlan(value: unknown): string {
+  const record = recordValue(value);
+  if (!record) return "";
+  return joinStrategyLines([
+    stringValue(record.weekly) ? `Weekly: ${stringValue(record.weekly)}` : "",
+    stringValue(record.bi_weekly) ? `Bi-weekly: ${stringValue(record.bi_weekly)}` : "",
+    stringValue(record.monthly) ? `Monthly: ${stringValue(record.monthly)}` : "",
+    stringValue(record.decision_triggers) ? `Decision triggers: ${stringValue(record.decision_triggers)}` : "",
+  ]);
+}
+
+function formatPhases(value: unknown): string {
+  const phases = Array.isArray(value) ? value : [];
+  return phases
+    .map((item) => {
+      const entry = recordValue(item);
+      if (!entry) return String(item ?? "").trim();
+      const phase = stringValue(entry.phase) || stringValue(entry.name);
+      const objective = stringValue(entry.objective);
+      const focus = stringValue(entry.content_focus);
+      const signal = stringValue(entry.success_signal);
+      return [
+        phase ? `${phase}:` : "",
+        objective,
+        focus ? `Content focus: ${focus}` : "",
+        signal ? `Success signal: ${signal}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatAssetRequirements(value: unknown): string {
+  const entries = Array.isArray(value) ? value : [];
+  const lines = entries
+    .map((item) => {
+      const entry = recordValue(item);
+      if (!entry) return String(item ?? "").trim();
+      const asset = stringValue(entry.asset) || stringValue(entry.name);
+      const purpose = stringValue(entry.purpose);
+      const proof = stringValue(entry.proof_needed);
+      return [asset, purpose ? `Purpose: ${purpose}` : "", proof ? `Proof needed: ${proof}` : ""]
+        .filter(Boolean)
+        .join(" — ");
+    })
+    .filter(Boolean);
+  return lines.length > 0 ? bulletLines(lines) : "";
+}
+
+function formatStructuredSection(sectionKey: string, value: unknown): string {
+  const asString = stringValue(value);
+  if (asString) return finalizeCanonicalSectionText(sectionKey, asString);
+  if (Array.isArray(value)) {
+    if (sectionKey === "emotionalDrivers") {
+      return finalizeCanonicalSectionText(
+        sectionKey,
+        value.map((item) => String(item ?? "").trim()).filter(Boolean).join("\n"),
+      );
+    }
+    return finalizeCanonicalSectionText(
+      sectionKey,
+      value
+      .map((item) => {
+        const entry = recordValue(item);
+        if (!entry) return String(item ?? "").trim();
+        return Object.values(entry).map((part) => String(part ?? "").trim()).filter(Boolean).join(" ");
+      })
+      .filter(Boolean)
+      .join("\n"),
+    );
+  }
+  const record = recordValue(value);
+  if (!record) return "";
+  switch (sectionKey) {
+    case "marketNarrative":
+      return finalizeCanonicalSectionText(sectionKey, joinStrategyLines([
+        stringValue(record.category_context),
+        stringValue(record.market_shift),
+        stringValue(record.consumer_behavior),
+        stringValue(record.why_now),
+      ]));
+    case "problemGapSolution":
+      return finalizeCanonicalSectionText(sectionKey, joinStrategyLines([
+        stringValue(record.problem) ? `Problem: ${stringValue(record.problem)}` : "",
+        stringValue(record.gap) ? `Gap: ${stringValue(record.gap)}` : "",
+        stringValue(record.solution) ? `Solution: ${stringValue(record.solution)}` : "",
+      ]));
+    case "brandFoundation":
+      return finalizeCanonicalSectionText(sectionKey, joinStrategyLines([
+        stringValue(record.mission) ? `Mission: ${stringValue(record.mission)}` : "",
+        stringValue(record.core_promise) ? `Core promise: ${stringValue(record.core_promise)}` : "",
+        stringValue(record.differentiator) ? `Differentiator: ${stringValue(record.differentiator)}` : "",
+        formatNamedList("Non-negotiables", record.non_negotiables),
+      ]));
+    case "brandPhilosophy":
+      return finalizeCanonicalSectionText(sectionKey, joinStrategyLines([
+        stringValue(record.archetype) ? `Archetype: ${stringValue(record.archetype)}` : "",
+        stringValue(record.belief_system),
+        stringValue(record.personality) ? `Personality: ${stringValue(record.personality)}` : "",
+        stringValue(record.tone) ? `Tone: ${stringValue(record.tone)}` : "",
+        stringValue(record.emotional_role) ? `Emotional role: ${stringValue(record.emotional_role)}` : "",
+        formatNamedList("Avoid", record.avoid_list),
+      ]));
+    case "audience":
+      return finalizeCanonicalSectionText(sectionKey, joinStrategyLines([
+        stringValue(record.primary_audience) ? `Primary audience: ${stringValue(record.primary_audience)}` : "",
+        formatNamedList("Priority segments", record.priority_segments),
+        formatNamedList("Motivations", record.motivations),
+        formatNamedList("Pains and desires", record.pains_and_desires ?? record.pain_points ?? record.desires),
+        formatNamedList("Objections", record.objections),
+        formatNamedList("Buying triggers", record.buying_triggers),
+      ]));
+    case "emotionalDrivers":
+      return finalizeCanonicalSectionText(sectionKey, joinStrategyLines([
+        formatNamedList("Emotional drivers", record.drivers),
+        stringValue(record.summary),
+      ]));
+    case "platformStrategy":
+      return finalizeCanonicalSectionText(sectionKey, formatPlatformStrategy(record));
+    case "contentStrategy":
+      return finalizeCanonicalSectionText(sectionKey, formatContentStrategy(record));
+    case "kpis":
+      return finalizeCanonicalSectionText(sectionKey, formatKpis(record));
+    case "trackingPlan":
+      return finalizeCanonicalSectionText(sectionKey, formatTrackingPlan(record));
+    case "executionPhases":
+      return finalizeCanonicalSectionText(sectionKey, formatPhases(record.phases ?? value));
+    case "assetRequirements":
+      return finalizeCanonicalSectionText(sectionKey, formatAssetRequirements(record.assets ?? value));
+    default:
+      return finalizeCanonicalSectionText(
+        sectionKey,
+        Object.values(record)
+        .map((part) => (Array.isArray(part) ? stringListValue(part).join(", ") : String(part ?? "").trim()))
+        .filter(Boolean)
+        .join("\n"),
+      );
+  }
+}
+
+function extractCanonicalSectionsFromStructured(structured: Record<string, unknown>): Partial<Record<string, string>> {
+  const canonical = ((structured.canonicalSections ?? {}) as Record<string, unknown> | undefined) ?? {};
+  return {
+    marketNarrative: formatStructuredSection("marketNarrative", canonical.marketNarrative ?? structured.market_narrative),
+    problemGapSolution: formatStructuredSection("problemGapSolution", canonical.problemGapSolution ?? structured.problem_gap_solution),
+    brandFoundation: formatStructuredSection("brandFoundation", canonical.brandFoundation ?? structured.brand_foundation),
+    brandPhilosophy: formatStructuredSection("brandPhilosophy", canonical.brandPhilosophy ?? structured.brand_philosophy),
+    audience: formatStructuredSection("audience", canonical.audience ?? structured.audience),
+    emotionalDrivers: formatStructuredSection("emotionalDrivers", canonical.emotionalDrivers ?? structured.emotional_drivers),
+    platformStrategy: formatStructuredSection("platformStrategy", canonical.platformStrategy ?? structured.platform_strategy),
+    contentStrategy: formatStructuredSection("contentStrategy", canonical.contentStrategy ?? structured.content_strategy),
+    kpis: formatStructuredSection("kpis", canonical.kpis ?? structured.kpis),
+    trackingPlan: formatStructuredSection("trackingPlan", canonical.trackingPlan ?? structured.tracking_plan),
+    executionPhases: formatStructuredSection("executionPhases", canonical.executionPhases ?? structured.phases),
+    assetRequirements: formatStructuredSection("assetRequirements", canonical.assetRequirements ?? structured.asset_requirements),
+  };
+}
+
+function isLikelyRawSourceDump(sectionKey: string, text: string): boolean {
+  const normalized = normalizeSectionComparison(text);
+  if (!normalized) return false;
+  const rawPatterns = [
+    "website signals",
+    "instagram signals",
+    "business dna",
+    "website discovery",
+    "instagram data",
+    "testimonials mentioned on site",
+    "case studies mentioned on site",
+    "certifications referenced",
+    "trusted by brand block",
+    "review or rating language present",
+    "booking cta present",
+    "shop cta present",
+    "contact cta present",
+    "quiz or assessment cta present",
+    "consultation cta present",
+  ];
+  if (rawPatterns.some((pattern) => normalized.includes(pattern))) return true;
+  if (sectionKey === "assetRequirements" && (normalized.startsWith("deliverables ") || normalized.startsWith("primary offers "))) {
+    return true;
+  }
+  return false;
+}
+
+function isWrongSectionContent(sectionKey: string, text: string): boolean {
+  const normalized = normalizeSectionComparison(text);
+  if (!normalized) return false;
+  if (/\bwhy the of\b|\.\.\./.test(normalized)) {
+    return true;
+  }
+  if (sectionKey === "platformStrategy" && (normalized.includes("website signals") || normalized.includes("instagram signals"))) {
+    return true;
+  }
+  if (sectionKey === "kpis" && (normalized.includes("testimonial") || normalized.includes("proof angles"))) {
+    return true;
+  }
+  if (sectionKey === "kpis" && /mentioned on site|cta present|trust markers are visible/.test(normalized)) {
+    return true;
+  }
+  if (
+    sectionKey === "contentStrategy" &&
+    (normalized.includes("weekly review") || normalized.includes("bi weekly") || normalized.includes("monthly review"))
+  ) {
+    return true;
+  }
+  if (sectionKey === "marketNarrative" && /problem:|gap:|solution:|mission:|core promise:/.test(normalized)) {
+    return true;
+  }
+  if (
+    sectionKey === "marketNarrative" &&
+    normalized.split(" ").length < 18
+  ) {
+    return true;
+  }
+  if (sectionKey === "assetRequirements" && (normalized.includes("scope of work") || normalized.includes("primary offers"))) {
+    return true;
+  }
+return false;
+}
+
+function filterPlatformStrategy(text: string, activePlatforms: string[]): string {
+  if (!text) {
+    return "";
+  }
+  const allKnownPlatforms = ["instagram", "pinterest", "linkedin", "twitter", "x", "youtube", "tiktok", "facebook"];
+  let platformsToRemove: string[];
+  
+  if (!activePlatforms || activePlatforms.length === 0) {
+    platformsToRemove = allKnownPlatforms;
+  } else {
+    const normalizedActive = activePlatforms.map(p => p.toLowerCase().trim());
+    platformsToRemove = allKnownPlatforms.filter(p => !normalizedActive.some(ap => ap.includes(p) || p.includes(ap)));
+  }
+  
+  let filtered = text;
+  for (const platform of platformsToRemove) {
+    const regex = new RegExp(`\\b${platform}\\b(?!\\w)`, "gi");
+    filtered = filtered.replace(regex, "___REMOVED___");
+  }
+  filtered = filtered.replace(/___REMOVED___\s*(?::|,|\.)?\s*/gi, "").replace(/\s+/g, " ").trim();
+  return filtered;
+}
+
+function mirrorsClientSource(
+  text: string,
+  client: Pick<MemoryClient, "website" | "instagramHandle" | "oneLineDescription">,
+): boolean {
+  const normalized = normalizeSectionComparison(text);
+  if (!normalized) return false;
+  const oneLine = normalizeSectionComparison(client.oneLineDescription ?? "");
+  if (oneLine && oneLine.length > 32 && (normalized === oneLine || normalized.includes(oneLine))) {
+    return true;
+  }
+  const website = normalizeSectionComparison(client.website ?? "");
+  if (website && website.length > 12 && normalized === website) return true;
+  const handle = normalizeSectionComparison(client.instagramHandle ?? "");
+  return Boolean(handle && handle.length > 3 && normalized === handle);
+}
+
+function hasMinimumUsefulContent(sectionKey: string, text: string): boolean {
+  const normalized = cleanCanonicalSectionText(text);
+  if (!normalized) return false;
+  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+  const thresholds: Record<string, number> = {
+    marketNarrative: 30,
+    problemGapSolution: 28,
+    brandFoundation: 24,
+    brandPhilosophy: 24,
+    audience: 24,
+    emotionalDrivers: 16,
+    platformStrategy: 30,
+    contentStrategy: 30,
+    kpis: 22,
+    trackingPlan: 18,
+    executionPhases: 18,
+    assetRequirements: 18,
+  };
+  return wordCount >= (thresholds[sectionKey] ?? 12);
+}
+
+function hasSectionSignals(sectionKey: string, text: string): boolean {
+  const normalized = normalizeSectionComparison(text);
+  if (!normalized) return false;
+  switch (sectionKey) {
+    case "marketNarrative":
+      return (
+        [/\bmarket\b/, /\bcategory\b/, /\baudience\b/, /\bshift\b|\bopportunity\b|\bwhitespace\b/].filter((pattern) =>
+          pattern.test(normalized),
+        ).length >= 3
+      );
+    case "brandFoundation":
+      return (
+        ["mission", "core promise", "differentiator", "non negotiables"].filter((token) =>
+          normalized.includes(token),
+        ).length >= 2
+      );
+    case "audience":
+      return (
+        ["primary audience", "priority segments", "motivations", "buying triggers"].filter((token) =>
+          normalized.includes(token),
+        ).length >= 3
+      );
+    case "emotionalDrivers":
+      return (
+        !/\btone\b|\bpersonality\b|\bvoice\b/.test(normalized) &&
+        /\b(confidence|trust|relief|certainty|belonging|status|fear|anxiety|desire|aspiration)\b/.test(normalized)
+      );
+    case "kpis":
+      return (
+        ["awareness", "engagement", "trust", "conversion", "retention"].filter((token) =>
+          normalized.includes(token),
+        ).length >= 3
+      );
+    default:
+      return true;
+  }
+}
+
+function validateCanonicalSection(
+  sectionKey: string,
+  text: string,
+  client?: Pick<MemoryClient, "website" | "instagramHandle" | "oneLineDescription">,
+): string {
+  const cleaned = finalizeCanonicalSectionText(sectionKey, text);
+  if (!cleaned) return "";
+  if (isLikelyRawSourceDump(sectionKey, cleaned)) return "";
+  if (isWrongSectionContent(sectionKey, cleaned)) return "";
+  if (client && mirrorsClientSource(cleaned, client)) return "";
+  if (!hasMinimumUsefulContent(sectionKey, cleaned)) return "";
+  if (!hasSectionSignals(sectionKey, cleaned)) return "";
+  return cleaned;
+}
+
+function dedupeCanonicalSections(
+  sections: Record<string, string>,
+  fallbackCanonical: Record<string, string>,
+): Record<string, string> {
+  const seen = new Set<string>();
+  const next = { ...sections };
+  for (const key of CANONICAL_SECTION_KEYS) {
+    const normalized = normalizeSectionComparison(next[key] ?? "");
+    if (!normalized) {
+      next[key] = fallbackCanonical[key];
+      continue;
+    }
+    if (seen.has(normalized)) {
+      next[key] = fallbackCanonical[key];
+      continue;
+    }
+    seen.add(normalized);
+  }
+  return next;
 }
 
 function buildBootstrapCanonicalSections(input: {
@@ -3986,109 +8872,38 @@ function buildBootstrapCanonicalSections(input: {
     0,
     input.businessDna,
   ).structured.canonicalSections as Record<string, string>;
-  const dna = input.businessDna;
+const dna = input.businessDna;
   const sow = input.sow ?? {};
-  const monthlyPosts = (sow.monthlyPosts as Record<string, unknown> | undefined) ?? {};
-  const toneByPlatform = (sow.toneByPlatform as Record<string, unknown> | undefined) ?? {};
-  const contentMix = (sow.contentMix as Record<string, unknown> | undefined) ?? {};
-  const platforms = Array.isArray(sow.platforms) ? sow.platforms.map((item) => String(item).trim()).filter(Boolean) : [];
+  const monthlyPosts = readMonthlyPosts(sow);
+  const toneByPlatform = readToneByPlatform(sow);
+  const contentMix = readContentMix(sow);
+  const platforms = readSelectedPlatforms(sow);
 
-  const platformPlan = platforms
-    .map((platform) => {
-      const monthly = Number(monthlyPosts[platform]) || 0;
-      const tone = String(toneByPlatform[platform] ?? "").trim();
-      return [platform, monthly > 0 ? `${monthly} posts/month` : "", tone ? `Tone: ${tone}` : ""]
-        .filter(Boolean)
-        .join(" - ");
-    })
-    .filter(Boolean);
-
-  const contentMixLines = Object.entries(contentMix)
-    .map(([key, value]) => {
-      const count = Number(value) || 0;
-      if (count <= 0) return "";
-      return `- ${canonicalLabelForMix(key)}: ${count} posts`;
-    })
-    .filter(Boolean)
-    .join("\n");
-
-  return {
-    ...base,
-    marketNarrative: joinStrategyLines([
-      dna.purpose || input.client.oneLineDescription,
-      dna.positioning.marketAngle,
-      dna.positioning.valueProposition,
-    ]) || base.marketNarrative,
-    problemGapSolution: joinStrategyLines([
-      `Problem: ${String(sow.understandingOfRequirements ?? "").trim() || "The category needs clearer proof-backed positioning."}`,
-      `Gap: ${dna.positioning.marketAngle || "Current messaging does not fully connect need, trust, and differentiation."}`,
-      `Solution: ${dna.positioning.valueProposition || dna.purpose || input.client.oneLineDescription || base.problemGapSolution}`,
-    ]),
-    brandFoundation: joinStrategyLines([
-      dna.mission ? `Mission: ${dna.mission}` : "",
-      dna.vision ? `Vision: ${dna.vision}` : "",
-      dna.coreValues.length > 0 ? `Values:\n${bulletLines(dna.coreValues)}` : "",
-      dna.positioning.differentiators.length > 0 ? `Differentiators:\n${bulletLines(dna.positioning.differentiators)}` : "",
-    ]) || base.brandFoundation,
-    brandPhilosophy: joinStrategyLines([
-      dna.brandArchetype ? `Archetype: ${dna.brandArchetype}` : "",
-      dna.purpose,
-      dna.voice_tone,
-      dna.personalityTraits.length > 0 ? `Traits: ${dna.personalityTraits.join(", ")}` : "",
-    ]) || base.brandPhilosophy,
-    audience: joinStrategyLines([
-      dna.targetAudience.segments.length > 0 ? `Primary segments:\n${bulletLines(dna.targetAudience.segments)}` : "",
-      dna.targetAudience.demographics.length > 0 ? `Demographics: ${dna.targetAudience.demographics.join(", ")}` : "",
-      dna.targetAudience.psychographics.length > 0 ? `Psychographics: ${dna.targetAudience.psychographics.join(", ")}` : "",
-      dna.targetAudience.pains.length > 0 ? `Pain points:\n${bulletLines(dna.targetAudience.pains)}` : "",
-      dna.targetAudience.desires.length > 0 ? `Desired outcomes:\n${bulletLines(dna.targetAudience.desires)}` : "",
-    ]) || base.audience,
-    emotionalDrivers: joinStrategyLines([
-      dna.targetAudience.desires.length > 0 ? bulletLines(dna.targetAudience.desires) : "",
-      dna.targetAudience.objections.length > 0 ? `Common objections:\n${bulletLines(dna.targetAudience.objections)}` : "",
-    ]) || base.emotionalDrivers,
-    platformStrategy: joinStrategyLines([
-      platformPlan.length > 0 ? bulletLines(platformPlan) : "",
-      dna.platformSignals.website.messagingPatterns.length > 0
-        ? `Website signals:\n${bulletLines(dna.platformSignals.website.messagingPatterns)}`
-        : "",
-      dna.platformSignals.instagram.contentPatterns.length > 0
-        ? `Instagram signals:\n${bulletLines(dna.platformSignals.instagram.contentPatterns)}`
-        : "",
-    ]) || base.platformStrategy,
-    contentStrategy: joinStrategyLines([
-      dna.contentStrategy.contentPillars.length > 0 ? `Pillars:\n${bulletLines(dna.contentStrategy.contentPillars)}` : "",
-      dna.contentStrategy.themes.length > 0 ? `Themes:\n${bulletLines(dna.contentStrategy.themes)}` : "",
-      contentMixLines ? `Content mix:\n${contentMixLines}` : "",
-      String(sow.contentCreation ?? "").trim(),
-    ]) || base.contentStrategy,
-    kpis: joinStrategyLines([
-      dna.platformSignals.website.conversionElements.length > 0
-        ? `Conversion signals:\n${bulletLines(dna.platformSignals.website.conversionElements)}`
-        : "",
-      dna.contentStrategy.trustSignalsToRepeat.length > 0
-        ? `Trust signals to repeat:\n${bulletLines(dna.contentStrategy.trustSignalsToRepeat)}`
-        : "",
-      "Track reach, saves, profile actions, clicks, and conversion intent weekly.",
-    ]) || base.kpis,
-    trackingPlan: joinStrategyLines([
-      "Weekly: review performance by section, platform, and format.",
-      "Bi-weekly: compare content mix vs platform response.",
-      "Monthly: refine priorities using the strongest proof, hooks, and conversion patterns.",
-    ]),
-    executionPhases: joinStrategyLines([
-      String(sow.strategyLaunchPlanning ?? "").trim(),
-      String(sow.timeline ?? "").trim(),
-      String(sow.nextSteps ?? "").trim(),
-    ]) || base.executionPhases,
-    assetRequirements: joinStrategyLines([
-      Array.isArray(sow.deliverables) && sow.deliverables.length > 0
-        ? `Deliverables:\n${bulletLines(sow.deliverables)}`
-        : "",
-      String(sow.scopeOfWork ?? "").trim(),
-      dna.offers.primaryOffers.length > 0 ? `Primary offers:\n${bulletLines(dna.offers.primaryOffers)}` : "",
-    ]) || base.assetRequirements,
-  };
+  const built = buildBootstrapSectionText({
+    client: input.client,
+    dna,
+    sow,
+    platforms,
+    monthlyPosts,
+    contentMix,
+    toneByPlatform,
+    fallback: base,
+  });
+const result: Record<string, string> = {};
+  for (const key of CANONICAL_SECTION_KEYS) {
+    const finalized = finalizeCanonicalSectionText(key, String(built[key] ?? ""));
+    const candidate =
+      finalized && !isLikelyRawSourceDump(key, finalized) ? finalized : "";
+    const fallbackValue =
+      validateCanonicalSection(key, String(base[key] ?? ""), input.client) ||
+      finalizeCanonicalSectionText(key, String(base[key] ?? ""));
+    let finalValue = candidate || fallbackValue;
+    if (key === "platformStrategy" && platforms.length > 0) {
+      finalValue = filterPlatformStrategy(finalValue, platforms);
+    }
+    result[key] = finalValue;
+  }
+  return result as Record<string, string>;
 }
 
 function canonicalLabelForMix(key: string): string {
@@ -4124,13 +8939,18 @@ function ensureCanonicalStrategyPayload(
   businessDna?: BusinessDna | null,
 ): { structured: Record<string, unknown>; document: string } {
   const fallbackCanonical = buildInitialCanonicalSections(client, templateType, seed);
+  const derivedCanonical = extractCanonicalSectionsFromStructured(structured);
   let canonicalSections = Object.fromEntries(
     CANONICAL_SECTION_KEYS.map((key) => {
-      const current = String(fallbackCanonical[key] ?? "").trim();
-      return [key, current || buildSectionVariantText(key, client, 0)];
+      const preferred = validateCanonicalSection(key, String(derivedCanonical[key] ?? ""), client);
+      const fallback =
+        validateCanonicalSection(key, String(fallbackCanonical[key] ?? ""), client) ||
+        buildSectionVariantText(key, client, 0);
+      return [key, preferred || fallback];
     }),
   ) as Record<string, string>;
   canonicalSections = mergeBusinessDnaIntoCanonical(businessDna, canonicalSections);
+  canonicalSections = dedupeCanonicalSections(canonicalSections, fallbackCanonical);
   return {
     structured: {
       ...structured,
@@ -4222,69 +9042,88 @@ function buildSectionVariantText(
   const productLine = client.oneLineDescription ?? "premium category offering";
   const website = client.website ?? "-";
   const instagram = client.instagramHandle ?? "-";
+const businessType = client.oneLineDescription?.toLowerCase() || "";
+  const isServiceOrAgency = businessType.includes("service") || businessType.includes("agency") || businessType.includes("consulting") || businessType.includes("coach") || businessType.includes("expert") || businessType.includes("firm");
+  const isD2C = businessType.includes("product") || businessType.includes("brand") || businessType.includes("store") || businessType.includes("shop") || businessType.includes("retail");
+  
   const variants: Record<string, string[]> = {
     marketNarrative: [
-      `${client.name} competes in a crowded fragrance market where harsh alcohol-based products dominate. The whitespace is skin-safe, alcohol-free daily fragrance rituals that combine wellness and premium scent identity.`,
-      `${client.name} operates at the intersection of personal care and fragrance. Category demand is shifting toward clean, non-irritating formulations, creating a strong narrative space for alcohol-free perfume routines.`,
-      `${client.name} is positioned inside an emerging clean-fragrance narrative: consumers want scent longevity without skin compromise. This market shift favors oil-based, gentle formulations with clear ingredient credibility.`,
+      `${client.name} operates in a competitive market where differentiation and audience relevance are key. Building a clear positioning that resonates with target customers is essential for growth.`,
+      `${client.name} is establishing its presence in the market. A strong narrative that connects with audience needs and demonstrates unique value will drive sustainable growth.`,
+      `${client.name} has an opportunity to capture market attention through clear positioning and consistent messaging that addresses audience pain points and desires.`,
     ],
     problemGapSolution: [
-      `Problem: mainstream perfumes can irritate sensitive skin.\nGap: limited premium options communicate both performance and skin comfort.\nSolution: ${client.name} delivers alcohol-free, oil-based fragrance positioned as safe for daily pulse-point use.`,
-      `Problem: consumers choose between longevity and skin safety.\nGap: category messaging rarely addresses reactive skin concerns.\nSolution: ${client.name} reframes fragrance as a wellness-aligned ritual with alcohol-free reliability.`,
-      `Problem: sensitive users avoid frequent fragrance use.\nGap: existing premium brands under-serve gentle-use needs.\nSolution: ${client.name} owns the "daily wear without harsh chemicals" promise and converts concern into confidence.`,
+      `Problem: target audience faces challenges that ${client.name} can address.\nGap: unclear differentiation or messaging in the market.\nSolution: ${client.name} provides clarity and value through its unique approach.`,
+      `Problem: potential customers struggle to find solutions that meet their specific needs.\nGap: limited awareness of available options.\nSolution: ${client.name} offers a compelling alternative with clear benefits.`,
+      `Problem: market lacks clear, trustworthy options for the target audience.\nGap: confusion about what constitutes quality or value.\nSolution: ${client.name} clarifies the choice with transparent positioning.`,
     ],
     brandFoundation: [
-      `Mission: make fragrance wearable every day for sensitive skin audiences.\nVision: become India’s most trusted alcohol-free wellness perfume brand.\nValues: safety, consistency, transparency, premium simplicity.`,
-      `Mission: remove skin anxiety from fragrance choices.\nVision: lead the clean personal-fragrance movement in India.\nValues: gentleness, credibility, craftsmanship, audience empathy.`,
-      `Mission: build skin-kind fragrance routines people can repeat daily.\nVision: define premium alcohol-free perfume standards.\nValues: efficacy, trust, clean formulation, ritual-first design.`,
+      `Mission: deliver value that solves customer problems effectively.\nVision: be the preferred choice for target audience needs.\nValues: quality, reliability, customer focus, continuous improvement.`,
+      `Mission: help customers achieve their goals through our offerings.\nVision: build lasting relationships based on trust and results.\nValues: integrity, excellence, innovation, service orientation.`,
+      `Mission: create meaningful impact for customers through our work.\nVision: establish recognized excellence in our market segment.\nValues: professionalism, creativity, collaboration, results-driven.`,
     ],
     brandPhilosophy: [
-      `${client.name} believes fragrance should feel as safe as skincare. The brand rejects harsh formulation shortcuts and champions repeatable daily comfort.`,
-      `${client.name} treats fragrance as personal care. It rejects irritation trade-offs and champions clean confidence, emotional comfort, and long-term trust.`,
-      `${client.name} frames scent as a wellness ritual, not a one-time spray. It rejects aggressive alcohol-heavy formulas and champions gentle consistency.`,
+      `${client.name} believes in delivering genuine value and building trust through consistent quality and customer-focused approach.`,
+      `${client.name} is committed to excellence and continuous improvement while maintaining authentic connection with the audience.`,
+      `${client.name} focuses on practical solutions and measurable results while building long-term relationships.`,
     ],
     audience: [
-      `Primary: men and women 18-40 in tier 1/2 cities seeking premium fragrance without irritation.\nSecondary: gifting buyers looking for safe daily-use products.\nSignals: checks ingredients, values comfort, prefers trusted digital education.`,
-      `Primary: consumers with dry/reactive skin avoiding harsh perfumes.\nSecondary: premium lifestyle audiences wanting clean-brand positioning.\nMotivations: confidence in social settings, skin safety, product credibility.`,
-      `Primary: personal care conscious users upgrading from mainstream sprays.\nSecondary: online-first audiences influenced by wellness-led beauty narratives.\nNeeds: non-irritating formula, long-wear confidence, proof-backed messaging.`,
+      `Primary: target customers who need the solutions ${client.name} provides.\nSecondary: broader market segments that could benefit.\nMotivations: solving problems, achieving goals, getting value for investment.`,
+      `Primary: audience seeking quality solutions in the market space.\nSecondary: potential customers exploring options.\nNeeds: clarity, trust, reliable options, proof of value.`,
+      `Primary: customers with specific needs that ${client.name} addresses.\nSecondary: related audience segments.\nDesires: solutions that work, good value, trustworthy providers.`,
     ],
     emotionalDrivers: [
-      `Confidence without irritation\nPride in clean premium choices\nRelief from skin anxiety`,
-      `Comfort in daily wear\nTrust in gentle formulation\nIdentity through premium rituals`,
-      `Safety in every application\nBelonging to mindful self-care culture\nAssurance through transparency`,
+      `Confidence in choice\nRelief from problem frustration\nTrust in provider\nDesire for better outcomes`,
+      `Security in decision\nAspiration for results\nFrustration with current options\nHope for improvement`,
+      `Peace of mind\nControl over outcomes\nBelonging to community\nAchievement of goals`,
     ],
     platformStrategy: [
-      `Instagram (primary): discovery + product education reels.\nPinterest (secondary): save-led visual education boards.\nSupport: weekly website-focused conversion posts.\nReferences: ${website}, ${instagram}`,
-      `Instagram: high-frequency short-form for routine storytelling.\nPinterest: evergreen guides and ingredient-led content.\nDistribution: product-use demos, lifestyle positioning, and trust proof.`,
-      `Instagram: conversion-intent creative with social proof.\nPinterest: intent-capture content for grooming routines.\nExecution: weekly rhythm balancing awareness, education, and conversion nudges.`,
+      `Instagram: primary platform for content and community building.\nFocus: consistent posting, audience engagement, content that resonates.\nStrategy: build presence through valuable content and interaction.`,
+      `Instagram: key platform for reach and engagement.\nApproach: regular content, stories, reels for visibility.\nGoal: grow following and build community around the brand.`,
+      `Instagram: main channel for brand presence and audience connection.\nMethod: varied content formats, engagement tactics, consistent messaging.`,
     ],
     contentStrategy: [
-      `Pillars: product education, skin-safe proof, lifestyle ritual, brand trust.\nFormats: reels, carousels, static visuals, stories.\nVoice: premium yet relatable; science-lite and practical.`,
-      `Pillars: why alcohol-free matters, daily use cues, ingredient confidence, emotional identity.\nFormats: short reels, infographics, before/after narratives.\nTone: warm, assured, benefit-led.`,
-      `Pillars: gentle formula differentiation, use-case storytelling, testimonials, guided routines.\nFormats: reels + carousel education + story prompts.\nTone: clear, credible, aspirational.`,
+      `Pillars: value-driven content, brand messaging, audience engagement.\nFormats: mix of content types suited to platform and audience.\nVoice: authentic, helpful, consistent.`,
+      `Pillars: education, connection, proof of value.\nFormats: varied content to maintain interest and provide value.\nTone: professional yet approachable.`,
+      `Pillars: content that serves audience needs, brand storytelling, social proof.\nFormats: platform-appropriate content mix.\nVoice: genuine, knowledgeable, customer-focused.`,
     ],
     kpis: [
-      `Reach growth on Instagram\nSave/share ratio on education content\nWebsite traffic from social landing pages\nDM inquiries for product recommendations`,
-      `Profile visit-to-click conversion\nCommunity engagement rate\nRepeat viewers on routine content\nLead quality from campaign CTAs`,
-      `Awareness lift across weekly content\nContent-assisted product page visits\nStory interactions and replies\nMonthly qualified intent actions`,
+      `Follower growth and reach\nEngagement rate and quality\nContent performance metrics\nAudience growth and retention`,
+      `Reach and impressions\nEngagement and interactions\nContent effectiveness\nAudience sentiment and growth`,
+      `Brand awareness metrics\nEngagement levels\nContent ROI\nCustomer acquisition and retention`,
     ],
     trackingPlan: [
-      `Weekly: reach, saves, shares, profile actions, outbound clicks.\nBi-weekly: top hooks, top formats, top audience segments.\nMonthly: platform split performance + content-to-conversion insights.`,
-      `Track event set: post saves, link clicks, DM keywords, product page sessions.\nTooling: platform analytics + web analytics dashboard.\nCadence: weekly sprint review, monthly optimization pass.`,
-      `Capture: awareness, engagement depth, conversion intent.\nReport by pillar and format every week.\nUse monthly synthesis to rebalance content mix and CTA strategy.`,
+      `Weekly: content performance, engagement metrics, audience growth.\nBi-weekly: top performing content, audience insights.\nMonthly: comprehensive analysis and strategy adjustment.`,
+      `Track: key metrics across platforms and content types.\nCadence: regular review cycles for optimization.\nFocus: metrics that indicate growth and engagement.`,
+      `Monitor: reach, engagement, growth, and conversion metrics.\nFrequency: weekly and monthly reviews.\nPurpose: continuous improvement of content strategy.`,
     ],
     executionPhases: [
-      `Phase 1 (Week 1-2): launch narrative + product education baseline.\nPhase 2 (Week 3-4): trust proof + routine integration.\nPhase 3 (Week 5-8): conversion-focused campaigns and optimization.`,
-      `Phase 1: rapid setup and consistency system.\nPhase 2: audience trust and differentiated messaging.\nPhase 3: growth acceleration via high-performing formats.`,
-      `Phase 1: awareness and positioning clarity.\nPhase 2: engagement depth and social proof build.\nPhase 3: conversion intent and scale cadence.`,
+      `Phase 1: establish presence and consistent content baseline.\nPhase 2: grow audience and refine messaging based on feedback.\nPhase 3: optimize for engagement and conversion.`,
+      `Phase 1: build foundation with consistent posting.\nPhase 2: expand reach and deepen audience engagement.\nPhase 3: maximize impact through data-driven optimization.`,
+      `Phase 1: launch and establish presence.\nPhase 2: grow and engage audience.\nPhase 3: refine and scale successful approaches.`,
     ],
     assetRequirements: [
-      `Monthly reel shot-list templates\nCarousel design system (6-slide structure)\nIngredient explainer visuals\nStory interaction templates\nUTM-ready landing links`,
-      `Foundational brand copy bank\nProduct-use demo scripts\nPlatform-specific caption bank\nCommunity response macros\nWeekly reporting dashboard`,
-      `Creative brief pack per pillar\nVisual mood board + typography guidance\nProof/content library workflow\nCTA keyword framework\nCampaign measurement sheet`,
+      `Content creation templates\nBrand messaging guidelines\nEngagement response framework\nAnalytics tracking setup`,
+      `Content calendar and planning\nVisual identity elements\nCopy and messaging library\nPerformance tracking tools`,
+      `Content templates\nBrand guidelines\nEngagement strategy\nMeasurement framework`,
     ],
   };
-  const choices = variants[sectionKey] ?? [`${sectionKey} strategy section for ${client.name}.`];
+  let choices = variants[sectionKey] ?? [`${sectionKey} strategy section for ${client.name}.`];
+  
+  if (isServiceOrAgency && sectionKey === "platformStrategy") {
+    choices = [
+      `Instagram: primary platform for content and community building.\nFocus: consistent posting, audience engagement, content that resonates.\nStrategy: build presence through valuable content and interaction.`,
+      `Instagram: key platform for reach and engagement.\nApproach: regular content, stories, reels for visibility.\nGoal: grow following and build community around the brand.`,
+      `Instagram: main channel for brand presence and audience connection.\nMethod: varied content formats, engagement tactics, consistent messaging.`,
+    ];
+  } else if (isServiceOrAgency && sectionKey === "contentStrategy") {
+    choices = [
+      `Pillars: value-driven content, brand messaging, audience engagement.\nFormats: mix of content types suited to platform and audience.\nVoice: authentic, helpful, consistent.`,
+      `Pillars: education, connection, proof of value.\nFormats: varied content to maintain interest and provide value.\nTone: professional yet approachable.`,
+      `Pillars: content that serves audience needs, brand storytelling, social proof.\nFormats: platform-appropriate content mix.\nVoice: genuine, knowledgeable, customer-focused.`,
+    ];
+  }
+  
   return choices[variant % choices.length] ?? choices[0]!;
 }
 
@@ -4318,6 +9157,10 @@ export default router;
 
 export function getMemoryClientForWorkflow(clientId: string): MemoryClient | null {
   return memoryClients.get(clientId) ?? null;
+}
+
+export function getMemoryOnboardingForWorkflow(clientId: string): MemoryOnboarding | null {
+  return memoryOnboarding.get(clientId) ?? null;
 }
 
 export function getMemoryStrategyForWorkflow(clientId: string): MemoryStrategy | null {

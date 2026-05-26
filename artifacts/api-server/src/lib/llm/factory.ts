@@ -15,9 +15,11 @@ import {
   readPerplexityCredentials,
   readNvidiaCredentials,
   readNvidiaModel,
-  readProviderPriority,
   readProviderId,
   filterProvidersWithCredentials,
+  readProviderApiKeys,
+  readProviderChainEntries,
+  type ProviderChainEntry,
   type ProviderId,
 } from "./env.js";
 import { OpenAICompatProvider } from "./openai-compat-provider.js";
@@ -30,6 +32,28 @@ type ProviderOverrides = {
   baseURL?: string;
   model?: string;
 };
+
+class ProviderSlotWrapper implements LLMProvider {
+  readonly id: LLMProvider["id"];
+  constructor(
+    private readonly inner: LLMProvider,
+    private readonly slotInfo: { provider: string; model: string; keySlot?: string | null },
+  ) {
+    this.id = inner.id;
+  }
+
+  chatCompletion(params: Parameters<LLMProvider["chatCompletion"]>[0]): ReturnType<LLMProvider["chatCompletion"]> {
+    return this.inner.chatCompletion(params);
+  }
+
+  describe() {
+    return {
+      provider: this.slotInfo.provider,
+      model: this.slotInfo.model,
+      ...(this.slotInfo.keySlot ? { keySlot: this.slotInfo.keySlot } : {}),
+    };
+  }
+}
 
 export function createLLMProvider(
   kind?: ProviderId,
@@ -162,25 +186,57 @@ export function createLLMProvider(
   }
 }
 
-export function createLLMProviderChain(priorities?: ProviderId[]): LLMProvider {
-  const raw = priorities?.length ? priorities : readProviderPriority();
-  const order = filterProvidersWithCredentials(raw);
-  for (const id of raw) {
-    if (!order.includes(id)) {
-      console.info(`[llm.factory] createLLMProviderChain: skipped (no env credentials) id=${id}`);
+export function createLLMProviderChainFromEntries(
+  rawEntries: readonly ProviderChainEntry[],
+  overrides?: { apiKey?: string; model?: string },
+  options?: { forceReal?: boolean },
+): LLMProvider {
+  const rawIds = rawEntries.map((entry) => entry.provider);
+  const order = filterProvidersWithCredentials(rawIds);
+  for (const entry of rawEntries) {
+    if (!order.includes(entry.provider)) {
+      console.info(`[llm.factory] createLLMProviderChain: skipped (no env credentials) id=${entry.provider}`);
     }
   }
   const providers: LLMProvider[] = [];
-  for (const id of order) {
-    try {
-      providers.push(createLLMProvider(id));
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[llm] skipped provider=${id} reason=${message}`);
+  let first = true;
+  for (const entry of rawEntries) {
+    if (!order.includes(entry.provider)) continue;
+    const keys =
+      first && overrides?.apiKey
+        ? [overrides.apiKey]
+        : readProviderApiKeys(entry.provider);
+    const slotKeys = keys.length > 0 ? keys : [undefined];
+    for (let index = 0; index < slotKeys.length; index += 1) {
+      try {
+        const provider = createLLMProvider(entry.provider, {
+          ...(slotKeys[index] ? { apiKey: slotKeys[index] } : {}),
+          ...((first && overrides?.model) ? { model: overrides.model } : entry.model ? { model: entry.model } : {}),
+        });
+        const described = provider.describe?.() ?? { provider: provider.id, model: entry.model ?? "default" };
+        providers.push(
+          new ProviderSlotWrapper(provider, {
+            provider: described.provider,
+            model: described.model,
+            keySlot: slotKeys[index] ? `slot_${index + 1}` : null,
+          }),
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[llm] skipped provider=${entry.provider} reason=${message}`);
+      }
     }
+    first = false;
   }
   if (providers.length === 0) {
     throw new Error("No usable LLM providers found from configured priority list");
   }
-  return new FallbackProvider(providers);
+  return new FallbackProvider(providers, { forceReal: options?.forceReal === true });
+}
+
+export function createLLMProviderChain(priorities?: ProviderId[]): LLMProvider {
+  const rawEntries: ProviderChainEntry[] = priorities?.length
+    ? priorities.map((provider) => ({ provider }))
+    : readProviderChainEntries();
+  return createLLMProviderChainFromEntries(rawEntries);
 }

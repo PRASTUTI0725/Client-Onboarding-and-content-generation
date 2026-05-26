@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { getGetClientQueryKey } from "@workspace/api-client-react";
+import { localApiFetch } from "@/lib/local-api";
 
 type Props = {
   open: boolean;
@@ -53,7 +54,7 @@ export function BusinessDnaEditDialog({ open, onOpenChange, clientId, businessDn
     }
     setPending(true);
     try {
-      const res = await fetch(`/api/clients/${clientId}/onboarding`, {
+      const res = await localApiFetch(`/api/clients/${clientId}/onboarding`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ businessDna: parsed }),

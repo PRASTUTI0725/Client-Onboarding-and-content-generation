@@ -14,7 +14,7 @@ import {
   ApiError,
 } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, FileText, RefreshCw, Settings2 } from "lucide-react";
+import { ArrowLeft, Download, FileText, RefreshCw, Settings2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { CalendarGrid } from "@/components/calendar-grid";
 import { CalendarBoard } from "@/components/calendar-board";
@@ -77,7 +77,7 @@ export default function Calendar() {
         queryClient.invalidateQueries({ queryKey: getGetCalendarQueryKey(id) });
         queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(id) });
         queryClient.invalidateQueries({ queryKey: ["runtime-health-mode"] });
-        toast({ title: "Calendar generated" });
+        toast({ title: calendarDialogMode === "regenerate" ? "Calendar regenerated" : "Calendar generated" });
         setDialogOpen(false);
       },
       onError: (err) => {
@@ -85,8 +85,13 @@ export default function Calendar() {
         const noProvider =
           data?.code === "NO_USABLE_AI_PROVIDER" ||
           (typeof (err as Error)?.message === "string" && (err as Error).message.includes("NO_USABLE_AI_PROVIDER"));
+        const calendarExists = data?.code === "CALENDAR_EXISTS_REQUIRES_REGENERATE";
         toast({
-          title: noProvider ? "No AI provider configured" : "Could not finish calendar generation",
+          title: noProvider
+            ? "No AI provider configured"
+            : calendarExists
+              ? "Calendar already exists"
+              : "Could not finish calendar generation",
           description: noProvider
             ? (data?.error ??
               "Configure a working AI provider in AI settings, add server API keys, or turn off “Use real AI” for demo mode.")
@@ -99,6 +104,7 @@ export default function Calendar() {
 
   const [openPostId, setOpenPostId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [calendarDialogMode, setCalendarDialogMode] = useState<"generate" | "regenerate">("generate");
   const [platformFilter, setPlatformFilter] = useState<string | null>(null);
   const [pillarFilter, setPillarFilter] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
@@ -142,12 +148,21 @@ export default function Calendar() {
     | {
         calendarSource?: string;
         generationMode?: string;
+        generationAction?: string;
         providerAttempted?: boolean;
+        latestRun?: {
+          provider?: string;
+          model?: string;
+        };
       }
     | null
     | undefined) ?? null;
   const plannerSource = String(plannerMeta?.calendarSource ?? "");
+  const generationMode = String(plannerMeta?.generationMode ?? "");
+  const generationAction = String(plannerMeta?.generationAction ?? "");
   const providerAttempted = Boolean(plannerMeta?.providerAttempted);
+  const latestRunProvider = String(plannerMeta?.latestRun?.provider ?? "");
+  const latestRunModel = String(plannerMeta?.latestRun?.model ?? "");
   const isImportedDeterministic =
     plannerSource === "chatgpt_import" || plannerMeta?.generationMode === "imported_deterministic";
   const calendarDiagnostics =
@@ -155,7 +170,20 @@ export default function Calendar() {
   const calendarIsTemplate = plannerSource === "fallback";
   const needsRegeneration = Boolean(calendarDiagnostics?.needsRegeneration);
   const showTemplateUi = calendarIsTemplate && providerAttempted && !needsRegeneration && !isImportedDeterministic;
+  const calendarFailure = ((planner?.metadata as Record<string, unknown> | null)?.calendarAiFailure ?? null) as
+    | {
+        message?: string;
+        failureClass?: string | null;
+        failureOrigin?: string | null;
+      }
+    | null;
+  const templateBannerCopy = getCalendarTemplateBannerCopy(calendarFailure);
   const allPosts = calendarData?.posts ?? [];
+  const calendarStartDate =
+    allPosts
+      .map((post) => post.date)
+      .filter(Boolean)
+      .sort()[0] ?? null;
   const filteredPosts = allPosts.filter((p) => {
     if (platformFilter && p.platform !== platformFilter) return false;
     if (pillarFilter && p.pillar !== pillarFilter) return false;
@@ -183,7 +211,10 @@ export default function Calendar() {
   const openPost = allPosts.find((p) => p.id === openPostId) ?? null;
   const openPillar = openPost ? pillars.find((p) => p.name === openPost.pillar) : null;
   const pillarCounts = countByKey(allPosts, (p) => p.pillar);
+  const formatCounts = countByKey(allPosts, (p) => normalizeCalendarFormatKey(p.format));
   const statusCounts = countByKey(allPosts, (p) => p.status);
+  const weekCounts = countByKey(allPosts, (p) => getWeekLabelFromDate(p.date));
+  const coverageSummary = buildMonthCoverageSummary(allPosts, planner?.month ?? null);
 
   function moveBoardPost(postId: string, toStatus: string) {
     const post = allPosts.find((p) => p.id === postId);
@@ -248,6 +279,11 @@ export default function Calendar() {
       tokenThreshold: 1900,
       byteThreshold: 48 * 1024,
     });
+  }
+
+  function openCalendarDialog(mode: "generate" | "regenerate") {
+    setCalendarDialogMode(mode);
+    setDialogOpen(true);
   }
 
   return (
@@ -317,17 +353,47 @@ export default function Calendar() {
               </Button>
             </Link>
             {planner && sow && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-2 w-full sm:w-auto"
-                disabled={isGenerating || missingSectionApprovals}
-                onClick={() => setDialogOpen(true)}
-                data-testid="new-month-button"
-              >
-                <RefreshCw className={`size-4 ${isGenerating ? "animate-spin" : ""}`} />
-                New month
-              </Button>
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-2 w-full sm:w-auto"
+                  onClick={() =>
+                    downloadCalendarMarkdown({
+                      clientName: clientData?.client.name ?? "Client",
+                      planner,
+                      posts: allPosts,
+                      coverageSummary,
+                    })
+                  }
+                  data-testid="export-calendar-markdown-button"
+                >
+                  <Download className="size-4" />
+                  Export markdown
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-2 w-full sm:w-auto"
+                  disabled={isGenerating || missingSectionApprovals}
+                  onClick={() => openCalendarDialog("regenerate")}
+                  data-testid="regenerate-calendar-button"
+                >
+                  <RefreshCw className={`size-4 ${isGenerating ? "animate-spin" : ""}`} />
+                  Regenerate calendar
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="gap-2 w-full sm:w-auto"
+                  disabled={isGenerating || missingSectionApprovals}
+                  onClick={() => openCalendarDialog("generate")}
+                  data-testid="new-month-button"
+                >
+                  <RefreshCw className={`size-4 ${isGenerating ? "animate-spin" : ""}`} />
+                  New month
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -391,7 +457,7 @@ export default function Calendar() {
             body={`We'll generate ${totalSowPosts} posts (per your SOW) across ${
               sow?.platforms.join(", ") ?? "your platforms"
             }, each with strategic intent, expected outcome, priority, and format-specific execution.`}
-            cta={<Button size="lg" onClick={() => setDialogOpen(true)} data-testid="plan-month-button">Plan the month</Button>}
+            cta={<Button size="lg" onClick={() => openCalendarDialog("generate")} data-testid="plan-month-button">Plan the month</Button>}
           />
         ) : (
           <div className="space-y-8">
@@ -401,7 +467,8 @@ export default function Calendar() {
                 <AlertDescription className="space-y-2">
                   <p>
                     The current calendar is from an older run ({calendarDiagnostics?.plannerSource ?? "unknown"}).
-                    Click <strong>Plan the month</strong> or <strong>New month</strong> to regenerate from your imported ChatGPT strategy.
+                    Click <strong>Regenerate calendar</strong> to replace it with a fresh run from your imported
+                    ChatGPT strategy.
                   </p>
                   {calendarDiagnostics?.reason ? (
                     <p className="text-xs font-mono opacity-80">diagnostic: {calendarDiagnostics.reason}</p>
@@ -416,11 +483,8 @@ export default function Calendar() {
               >
                 <AlertTitle>Not a production calendar</AlertTitle>
                 <AlertDescription className="space-y-2">
-                  <p>
-                    This month was generated as a <strong>dev / template fallback</strong> because the AI call did not
-                    return usable JSON, credits/limits blocked the request, or real AI is off. Do not treat these posts
-                    as client deliverables.
-                  </p>
+                  <p>{templateBannerCopy.summary}</p>
+                  {templateBannerCopy.detail ? <p className="text-sm">{templateBannerCopy.detail}</p> : null}
                   <p className="text-sm">
                     <strong>Next step:</strong> from Strategy, confirm a real model run, use{" "}
                     <strong>Plan the month</strong> again (or adjust goal/notes to reduce prompt size), or turn on
@@ -435,6 +499,44 @@ export default function Calendar() {
                 calendarIsTemplate={calendarIsTemplate}
                 providerAttempted={providerAttempted}
               />
+            )}
+            {planner && (
+              <div
+                className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+                data-testid="calendar-run-diagnostics"
+              >
+                Run diagnostics: source <span className="font-mono text-foreground">{plannerSource || "unknown"}</span>
+                {" · "}mode <span className="font-mono text-foreground">{generationMode || "unknown"}</span>
+                {" · "}action <span className="font-mono text-foreground">{generationAction || "unknown"}</span>
+                {" · "}provider attempted{" "}
+                <span className="font-mono text-foreground">{providerAttempted ? "yes" : "no"}</span>
+                {latestRunProvider ? (
+                  <>
+                    {" · "}provider <span className="font-mono text-foreground">{latestRunProvider}</span>
+                  </>
+                ) : null}
+                {latestRunModel ? (
+                  <>
+                    {" · "}model <span className="font-mono text-foreground">{latestRunModel}</span>
+                  </>
+                ) : null}
+              </div>
+            )}
+            {planner && coverageSummary && (
+              <div
+                className="rounded-lg border border-border/60 bg-card px-4 py-3 text-sm text-foreground/85"
+                data-testid="calendar-month-coverage-summary"
+              >
+                <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground mb-1">
+                  Month coverage
+                </p>
+                <p>
+                  {coverageSummary.plannedPosts} planned posts across {coverageSummary.monthDays} days in{" "}
+                  {coverageSummary.monthLabel}. {coverageSummary.activePostingDays} active posting days,{" "}
+                  {coverageSummary.multiPostDays} multi-post days, and {coverageSummary.emptyDays} empty days are expected
+                  with a non-daily cadence.
+                </p>
+              </div>
             )}
             <div
               className={
@@ -471,6 +573,7 @@ export default function Calendar() {
                 platformCounts={countByPlatform(allPosts)}
                 pillarCounts={pillarCounts}
                 statusCounts={statusCounts}
+                weekCounts={weekCounts}
               />
               {view === "calendar" ? (
                 <CalendarGrid
@@ -503,7 +606,7 @@ export default function Calendar() {
                   dragEnabled={!isTouchLike}
                 />
               ) : (
-                <PlannerSummary planner={planner} />
+                <PlannerSummary planner={planner} pillarCounts={pillarCounts} formatCounts={formatCounts} />
               )}
             </div>
           </div>
@@ -524,6 +627,11 @@ export default function Calendar() {
         onOpenChange={setDialogOpen}
         totalPosts={totalSowPosts}
         isPending={isGenerating}
+        mode={calendarDialogMode}
+        initialMonth={calendarDialogMode === "regenerate" ? planner?.month ?? null : null}
+        initialStartDate={calendarDialogMode === "regenerate" ? calendarStartDate : null}
+        initialGoal={calendarDialogMode === "regenerate" ? planner?.goal ?? null : null}
+        initialNotes={calendarDialogMode === "regenerate" ? planner?.notes ?? null : null}
         onConfirm={(input) => {
           if (!id) return;
           if (!confirmCalendarPreflight(input)) return;
@@ -534,6 +642,7 @@ export default function Calendar() {
               startDate: input.startDate,
               goal: input.goal,
               notes: input.notes,
+              regenerate: calendarDialogMode === "regenerate",
             },
           });
         }}
@@ -638,6 +747,202 @@ function countByKey<T>(items: T[], getKey: (item: T) => string | null | undefine
   return out;
 }
 
+function normalizeCalendarFormatKey(format: string | null | undefined): string {
+  const raw = String(format ?? "").trim().toLowerCase();
+  if (!raw) return "unknown";
+  if (raw.includes("pdf")) return "pdf_carousel";
+  if (raw.includes("carousel")) return "carousel";
+  if (raw.includes("story")) return "story";
+  if (raw.includes("reel")) return "reel";
+  if (raw.includes("static pin")) return "static_pin";
+  if (raw.includes("video pin")) return "video_pin";
+  if (raw.includes("pin")) return "static_pin";
+  if (raw.includes("community")) return "community_post";
+  if (raw.includes("long")) return "long_video";
+  if (raw.includes("short")) return "short_video";
+  if (raw.includes("video")) return "video";
+  if (raw.includes("thread")) return "thread";
+  if (raw.includes("image")) return "image_post";
+  if (raw.includes("text")) return "text_post";
+  if (raw.includes("static")) return "static";
+  return raw.replace(/\s+/g, "_");
+}
+
+function readPostMetadata(post: unknown): Record<string, unknown> {
+  const metadata = (post as { metadata?: unknown } | null | undefined)?.metadata;
+  return metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? (metadata as Record<string, unknown>)
+    : {};
+}
+
+function getPostTheme(post: { angle?: string | null; objective?: string | null; metadata?: unknown }): string {
+  const metadata = readPostMetadata(post);
+  const theme = typeof metadata.theme === "string" ? metadata.theme.trim() : "";
+  if (theme) return theme;
+  const angle = typeof post.angle === "string" ? post.angle.trim() : "";
+  if (angle) return angle;
+  const objective = typeof post.objective === "string" ? post.objective.trim() : "";
+  return objective || "Theme unavailable";
+}
+
+function buildMonthCoverageSummary(
+  posts: Array<{ date: string }>,
+  plannerMonth: string | null,
+): {
+  monthLabel: string;
+  monthDays: number;
+  plannedPosts: number;
+  emptyDays: number;
+  activePostingDays: number;
+  multiPostDays: number;
+} | null {
+  if (posts.length === 0) return null;
+  const sortedDates = posts.map((post) => post.date).filter(Boolean).sort();
+  const anchor = sortedDates[0] ? new Date(`${sortedDates[0]}T00:00:00Z`) : null;
+  if (!anchor || Number.isNaN(anchor.getTime())) return null;
+  const year = anchor.getUTCFullYear();
+  const month = anchor.getUTCMonth();
+  const monthStart = new Date(Date.UTC(year, month, 1));
+  const nextMonth = new Date(Date.UTC(year, month + 1, 1));
+  const monthDays = Math.round((nextMonth.getTime() - monthStart.getTime()) / (1000 * 60 * 60 * 24));
+  const counts = countByKey(sortedDates, (value) => value);
+  const activePostingDays = Object.keys(counts).length;
+  const multiPostDays = Object.values(counts).filter((count) => count > 1).length;
+  return {
+    monthLabel:
+      plannerMonth ||
+      monthStart.toLocaleDateString(undefined, {
+        month: "long",
+        year: "numeric",
+        timeZone: "UTC",
+      }),
+    monthDays,
+    plannedPosts: posts.length,
+    emptyDays: Math.max(monthDays - activePostingDays, 0),
+    activePostingDays,
+    multiPostDays,
+  };
+}
+
+function downloadCalendarMarkdown(input: {
+  clientName: string;
+  planner: Planner;
+  posts: Array<{
+    date: string;
+    platform: string;
+    pillar: string;
+    angle: string;
+    format: string;
+    objective: string;
+    hook: string;
+    cta: string;
+    caption?: string | null;
+    hashtags?: string[] | null;
+    status: string;
+    execution?: Record<string, unknown> | null;
+    metadata?: unknown;
+  }>;
+  coverageSummary: {
+    monthLabel: string;
+    monthDays: number;
+    plannedPosts: number;
+    emptyDays: number;
+    activePostingDays: number;
+    multiPostDays: number;
+  } | null;
+}) {
+  const distribution = (input.planner.distribution ?? {}) as Record<string, number>;
+  const platformSplit = (input.planner.platformSplit ?? {}) as Record<string, number>;
+  const lines: string[] = [
+    `# ${input.clientName} Content Calendar`,
+    "",
+    `## Summary`,
+    "",
+    `- Month: ${input.planner.month ?? input.coverageSummary?.monthLabel ?? "Unknown"}`,
+    `- Planned posts: ${input.coverageSummary?.plannedPosts ?? input.posts.length}`,
+    `- Month days: ${input.coverageSummary?.monthDays ?? "Unknown"}`,
+    `- Empty days: ${input.coverageSummary?.emptyDays ?? "Unknown"}`,
+    `- Active posting days: ${input.coverageSummary?.activePostingDays ?? "Unknown"}`,
+    `- Multi-post days: ${input.coverageSummary?.multiPostDays ?? "Unknown"}`,
+    `- Platform split: ${Object.entries(platformSplit)
+      .map(([platform, count]) => `${platform} ${count}`)
+      .join(", ")}`,
+    `- Bucket counts: ${Object.entries(distribution)
+      .map(([bucket, count]) => `${prettify(bucket)} ${count}`)
+      .join(", ")}`,
+    "",
+  ];
+
+  input.posts.forEach((post, index) => {
+    const theme = getPostTheme(post);
+    lines.push(`## Post ${index + 1}`);
+    lines.push("");
+    lines.push(`- Date: ${post.date ?? "Unknown"}`);
+    lines.push(`- Platform: ${post.platform ?? "Unknown"}`);
+    lines.push(`- Bucket: ${post.pillar ?? "Unknown"}`);
+    lines.push(`- Theme: ${theme}`);
+    lines.push(`- Format: ${post.format ?? "Unknown"}`);
+    lines.push(`- Objective: ${post.objective ?? ""}`);
+    lines.push(`- Hook: ${post.hook ?? ""}`);
+    lines.push(`- Caption direction: ${post.caption ?? "Skeleton only - not generated yet"}`);
+    lines.push(`- CTA: ${post.cta ?? ""}`);
+    lines.push(
+      `- Hashtags: ${
+        Array.isArray(post.hashtags) && post.hashtags.length > 0
+          ? post.hashtags.join(", ")
+          : "Not generated yet"
+      }`,
+    );
+    lines.push(`- Status: ${post.status ?? "draft"}`);
+    lines.push(`- Execution plan summary: ${summarizeExecution(post.execution)}`);
+    lines.push("");
+  });
+
+  const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${input.clientName.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${
+    (input.planner.month ?? input.coverageSummary?.monthLabel ?? "calendar").replace(/[^a-z0-9]+/gi, "-").toLowerCase()
+  }.md`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function summarizeExecution(execution: Record<string, unknown> | null | undefined): string {
+  if (!execution || typeof execution !== "object") return "No execution plan available";
+  const record = execution as Record<string, unknown>;
+  const notes: string[] = [];
+  const duration = typeof record.duration === "string" ? record.duration.trim() : "";
+  const shootType = typeof record.shoot_type === "string" ? record.shoot_type.trim() : "";
+  if (duration) notes.push(duration);
+  if (shootType) notes.push(shootType);
+
+  const reel = record.reel_execution as Record<string, unknown> | undefined;
+  if (reel && typeof reel === "object") {
+    const flow = Array.isArray(reel.flow) ? reel.flow.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+    if (flow.length > 0) notes.push(`Flow: ${flow.join(" -> ")}`);
+  }
+
+  const carousel = record.carousel_execution as { slide?: number; type?: string; text?: string }[] | undefined;
+  if (Array.isArray(carousel) && carousel.length > 0) {
+    notes.push(`Slides: ${carousel.length}`);
+  }
+
+  const story = record.story_execution as { frame?: number; type?: string; text?: string }[] | undefined;
+  if (Array.isArray(story) && story.length > 0) {
+    notes.push(`Frames: ${story.length}`);
+  }
+
+  const staticExecution = record.static_execution as Record<string, unknown> | undefined;
+  if (staticExecution && typeof staticExecution === "object") {
+    const visual = typeof staticExecution.visual_direction === "string" ? staticExecution.visual_direction.trim() : "";
+    if (visual) notes.push(`Visual: ${visual}`);
+  }
+
+  return notes.length > 0 ? notes.join(" | ") : "Execution plan available in app";
+}
+
 function PlatformFilter({
   platforms,
   active,
@@ -683,6 +988,7 @@ function SharedFilters({
   platformCounts,
   pillarCounts,
   statusCounts,
+  weekCounts,
 }: {
   platformOptions: string[];
   pillarOptions: string[];
@@ -698,6 +1004,7 @@ function SharedFilters({
   platformCounts: Record<string, number>;
   pillarCounts: Record<string, number>;
   statusCounts: Record<string, number>;
+  weekCounts: Record<string, number>;
 }) {
   const statusOptions: string[] = [
     "draft",
@@ -735,7 +1042,7 @@ function SharedFilters({
           onChange={onStatusChange}
           counts={statusCounts}
         />
-        <WeekFilter active={weekFilter} onChange={onWeekChange} options={weekOptions} />
+        <WeekFilter active={weekFilter} onChange={onWeekChange} options={weekOptions} counts={weekCounts} />
       </div>
     </div>
   );
@@ -745,16 +1052,18 @@ function WeekFilter({
   active,
   onChange,
   options,
+  counts,
 }: {
   active: string | null;
   onChange: (week: string | null) => void;
   options: string[];
+  counts: Record<string, number>;
 }) {
   return (
     <div className="flex flex-wrap gap-2 items-center">
       <FilterChip
         label="All weeks"
-        count={0}
+        count={Object.values(counts).reduce((a, b) => a + b, 0)}
         active={active === null}
         onClick={() => onChange(null)}
       />
@@ -762,7 +1071,7 @@ function WeekFilter({
         <FilterChip
           key={week}
           label={week}
-          count={0}
+          count={counts[week] ?? 0}
           active={active === week}
           onClick={() => onChange(week)}
         />
@@ -785,7 +1094,7 @@ function PillarsFilter({
   return (
     <div className="flex flex-wrap gap-2 items-center">
       <FilterChip
-        label="All pillars"
+        label="All buckets"
         count={Object.values(counts).reduce((a, b) => a + b, 0)}
         active={active === null}
         onClick={() => onChange(null)}
@@ -875,11 +1184,121 @@ function CalendarGenerationBanner({
 }) {
   const meta = ((planner as Planner & { metadata?: Record<string, unknown> | null }).metadata ?? null) as {
     calendarSource?: string;
-    calendarAiFailure?: { code?: string; message?: string; detail?: string };
+    latestRun?: {
+      provider?: string;
+      model?: string;
+    };
+    calendarAiFailure?: {
+      code?: string;
+      message?: string;
+      detail?: string;
+      failureClass?: string;
+      failureStage?: string | null;
+      failureOrigin?: string | null;
+      failedContextLabel?: string | null;
+      estimatedInputTokens?: number | null;
+      maxInputTokens?: number | null;
+      estimatedOutputTokens?: number | null;
+      estimatedTotalTokens?: number | null;
+      compactionTier?: number | null;
+      promptSegments?: Array<{ label: string; chars: number; estimatedTokens: number }> | null;
+      httpStatus?: number;
+      errorCode?: string;
+      repairAttempted?: boolean;
+      repairSucceeded?: boolean;
+      repairChanges?: Array<{
+        index?: number;
+        date?: string;
+        platform?: string;
+        format?: string;
+        fromBucket?: string;
+        toBucket?: string;
+        reason?: string;
+      }>;
+    };
+    calendarFallbackDiagnostics?: {
+      fallbackReason?: string;
+      failureOrigin?: string | null;
+      failedContextLabel?: string | null;
+      estimatedInputTokens?: number | null;
+      maxInputTokens?: number | null;
+      estimatedOutputTokens?: number | null;
+      estimatedTotalTokens?: number | null;
+      compactionTier?: number | null;
+      promptSegments?: Array<{ label: string; chars: number; estimatedTokens: number }> | null;
+      plannerBudget?: Record<string, unknown> | null;
+      weeklyBriefHashes?: Array<Record<string, unknown>> | null;
+      weekConcurrency?: number | null;
+      weekStaggerMs?: number | null;
+      lastAttemptedStage?: string | null;
+      failedWeekIndex?: number | null;
+      cumulativeEstimatedGroqTokens?: number | null;
+      delayMsApplied?: number | null;
+      weekRetryCount?: number | null;
+      beforeCompactionTokens?: number | null;
+      afterCompactionTokens?: number | null;
+      failedWeekIndex?: number | null;
+      cumulativeEstimatedGroqTokens?: number | null;
+      delayMsApplied?: number | null;
+      weekRetryCount?: number | null;
+      codePath?: string | null;
+      requestedProvider?: string | null;
+      resolvedProvider?: string | null;
+      resolvedModel?: string | null;
+      requestSizeBytes?: number;
+      expectedPlatformSplit?: Record<string, number>;
+      expectedTotalPosts?: number;
+      repairAttempted?: boolean;
+      repairSucceeded?: boolean;
+      repairChanges?: Array<{
+        index?: number;
+        date?: string;
+        platform?: string;
+        format?: string;
+        fromBucket?: string;
+        toBucket?: string;
+        reason?: string;
+      }>;
+    };
+    plannerBudget?: Record<string, unknown> | null;
+    weeklyBriefHashes?: Array<Record<string, unknown>> | null;
+    weekConcurrency?: number | null;
+    calendarGenerationTrace?: Record<string, unknown> | null;
+    codePath?: string | null;
   } | null;
   const isFallback = meta?.calendarSource === "fallback";
   const failure = meta?.calendarAiFailure;
+  const fallbackDiagnostics = meta?.calendarFallbackDiagnostics;
+  const budgetDiagnostics = fallbackDiagnostics ?? null;
+  const plannerBudget =
+    (meta?.plannerBudget as Record<string, unknown> | null | undefined) ??
+    (budgetDiagnostics?.plannerBudget as Record<string, unknown> | null | undefined) ??
+    null;
+  const weeklyBriefHashes =
+    meta?.weeklyBriefHashes ?? budgetDiagnostics?.weeklyBriefHashes ?? null;
+  const weekConcurrency = meta?.weekConcurrency ?? budgetDiagnostics?.weekConcurrency ?? null;
+  const weekStaggerMs = meta?.weekStaggerMs ?? budgetDiagnostics?.weekStaggerMs ?? null;
+  const failedWeekIndex = budgetDiagnostics?.failedWeekIndex ?? null;
+  const cumulativeEstimatedGroqTokens = budgetDiagnostics?.cumulativeEstimatedGroqTokens ?? null;
+  const delayMsApplied = budgetDiagnostics?.delayMsApplied ?? null;
+  const weekRetryCount = budgetDiagnostics?.weekRetryCount ?? null;
+  const estimatedInputTokens =
+    failure?.estimatedInputTokens ?? budgetDiagnostics?.estimatedInputTokens ?? null;
+  const maxInputTokens = failure?.maxInputTokens ?? budgetDiagnostics?.maxInputTokens ?? null;
+  const estimatedOutputTokens =
+    failure?.estimatedOutputTokens ?? budgetDiagnostics?.estimatedOutputTokens ?? null;
+  const estimatedTotalTokens = budgetDiagnostics?.estimatedTotalTokens ??
+    (estimatedInputTokens != null && estimatedOutputTokens != null
+      ? estimatedInputTokens + estimatedOutputTokens
+      : null);
+  const compactionTier = failure?.compactionTier ?? budgetDiagnostics?.compactionTier ?? null;
+  const lastAttemptedStage =
+    budgetDiagnostics?.lastAttemptedStage ?? budgetDiagnostics?.failedContextLabel ?? failure?.failedContextLabel ?? null;
+  const codePath = meta?.codePath ?? budgetDiagnostics?.codePath ?? null;
+
   if ((!isFallback && !failure?.message) || !providerAttempted) return null;
+  const isBucketValidationFailure =
+    failure?.failureClass === "validation_failed" || failure?.failureOrigin === "validation_failed / bucket_mismatch";
   return (
     <Alert className="border-sky-200 bg-sky-50/80 text-sky-950" data-testid="calendar-fallback-technical-banner">
       <AlertTitle>{calendarIsTemplate ? "Provider / request detail" : "Calendar: template or backup plan"}</AlertTitle>
@@ -891,18 +1310,147 @@ function CalendarGenerationBanner({
           </p>
         )}
         {failure?.message && <p className="text-xs opacity-90 font-mono">{failure.message}</p>}
+        {(failure?.failureClass || failure?.failureStage || failure?.httpStatus || meta?.calendarFallbackDiagnostics) && (
+          <p className="text-xs opacity-90 font-mono">
+            Failure: {failure?.failureClass ?? "unknown"}
+            {failure?.failureStage ? ` / stage: ${failure.failureStage}` : ""}
+            {failure?.failureOrigin ? ` / origin: ${failure.failureOrigin}` : ""}
+            {failure?.failedContextLabel ? ` / context: ${failure.failedContextLabel}` : ""}
+            {failure?.httpStatus ? ` / HTTP ${failure.httpStatus}` : ""}
+            {meta?.calendarFallbackDiagnostics?.expectedTotalPosts
+              ? ` / fallback target: ${meta.calendarFallbackDiagnostics.expectedTotalPosts} posts`
+              : ""}
+          </p>
+        )}
+        {(failure?.repairAttempted || meta?.calendarFallbackDiagnostics?.repairAttempted) && (
+          <p className="text-xs opacity-90 font-mono">
+            Repair: attempted
+            {(failure?.repairSucceeded ?? meta?.calendarFallbackDiagnostics?.repairSucceeded)
+              ? " / succeeded"
+              : " / failed"}
+            {((failure?.repairChanges ?? meta?.calendarFallbackDiagnostics?.repairChanges)?.length ?? 0) > 0
+              ? ` / changed ${((failure?.repairChanges ?? meta?.calendarFallbackDiagnostics?.repairChanges) ?? []).length} posts`
+              : ""}
+          </p>
+        )}
+        {(estimatedInputTokens ||
+          maxInputTokens ||
+          estimatedOutputTokens ||
+          estimatedTotalTokens ||
+          budgetDiagnostics?.resolvedProvider ||
+          meta?.latestRun?.provider) && (
+          <p className="text-xs opacity-90 font-mono">
+            Provider: {budgetDiagnostics?.resolvedProvider ?? meta?.latestRun?.provider ?? "unknown"}
+            {(budgetDiagnostics?.resolvedModel ?? meta?.latestRun?.model)
+              ? ` / model: ${budgetDiagnostics?.resolvedModel ?? meta?.latestRun?.model}`
+              : ""}
+            {budgetDiagnostics?.requestedProvider
+              ? ` / requested: ${budgetDiagnostics.requestedProvider}`
+              : ""}
+            {estimatedInputTokens != null && maxInputTokens != null
+              ? ` / prompt: ${estimatedInputTokens}/${maxInputTokens}`
+              : estimatedInputTokens != null
+                ? ` / prompt in: ${estimatedInputTokens}`
+                : ""}
+            {estimatedOutputTokens != null ? ` / max out: ${estimatedOutputTokens}` : ""}
+            {estimatedTotalTokens != null ? ` / est total: ${estimatedTotalTokens}` : ""}
+          </p>
+        )}
+        {(compactionTier != null ||
+          weekConcurrency != null ||
+          lastAttemptedStage ||
+          codePath ||
+          plannerBudget ||
+          (weeklyBriefHashes?.length ?? 0) > 0) && (
+          <p className="text-xs opacity-90 font-mono">
+            Budget: codePath={codePath ?? "unknown"}
+            {lastAttemptedStage ? ` / stage: ${lastAttemptedStage}` : ""}
+            {compactionTier != null ? ` / compactionTier: ${compactionTier}` : ""}
+            {weekConcurrency != null ? ` / weekConcurrency: ${weekConcurrency}` : ""}
+            {weekStaggerMs != null ? ` / weekDelayMs: ${weekStaggerMs}` : ""}
+            {failedWeekIndex != null ? ` / failedWeek: ${failedWeekIndex + 1}` : ""}
+            {cumulativeEstimatedGroqTokens != null
+              ? ` / cumulativeGroq: ${cumulativeEstimatedGroqTokens}`
+              : ""}
+            {delayMsApplied != null && delayMsApplied > 0 ? ` / delayApplied: ${delayMsApplied}ms` : ""}
+            {weekRetryCount != null && weekRetryCount > 0 ? ` / weekRetries: ${weekRetryCount}` : ""}
+            {budgetDiagnostics?.beforeCompactionTokens != null &&
+            budgetDiagnostics?.afterCompactionTokens != null
+              ? ` / compact: ${budgetDiagnostics.beforeCompactionTokens}→${budgetDiagnostics.afterCompactionTokens}`
+              : ""}
+            {plannerBudget &&
+            typeof plannerBudget.estimatedInputTokens === "number" &&
+            typeof plannerBudget.maxInputTokens === "number"
+              ? ` / planner: ${plannerBudget.estimatedInputTokens}/${plannerBudget.maxInputTokens}`
+              : ""}
+            {(weeklyBriefHashes?.length ?? 0) > 0
+              ? ` / weeks traced: ${weeklyBriefHashes?.length ?? 0}`
+              : ""}
+          </p>
+        )}
+        {(budgetDiagnostics?.promptSegments?.length ?? 0) > 0 && (
+          <p className="text-xs opacity-90 font-mono break-all">
+            Segments:{" "}
+            {(budgetDiagnostics?.promptSegments ?? [])
+              .map((segment) => `${segment.label}:${segment.estimatedTokens}`)
+              .join(" · ")}
+          </p>
+        )}
         <p className="text-xs text-muted-foreground">
-          Large monthly prompts can exceed provider limits or max output — try a roomier model, raise max tokens, or
-          shorten goal/notes.
+          {isBucketValidationFailure
+            ? "The provider returned a month, but the saved calendar was rejected because final bucket totals did not match the SOW plan."
+            : "Large monthly prompts can exceed provider limits or max output — try a roomier model, raise max tokens, or shorten goal/notes."}
         </p>
       </AlertDescription>
     </Alert>
   );
 }
 
-function PlannerSummary({ planner }: { planner: Planner }) {
-  const distribution = (planner.distribution ?? {}) as Record<string, number>;
-  const formats = (planner.formats ?? {}) as Record<string, number>;
+function getCalendarTemplateBannerCopy(
+  failure:
+    | {
+        message?: string;
+        failureClass?: string | null;
+        failureOrigin?: string | null;
+      }
+    | null
+    | undefined,
+): { summary: React.ReactNode; detail?: React.ReactNode } {
+  const isBucketValidationFailure =
+    failure?.failureClass === "validation_failed" || failure?.failureOrigin === "validation_failed / bucket_mismatch";
+  if (!isBucketValidationFailure) {
+    return {
+      summary: (
+        <>
+          This month was generated as a <strong>dev / template fallback</strong> because the AI call did not return
+          usable JSON, credits/limits blocked the request, or real AI is off. Do not treat these posts as client
+          deliverables.
+        </>
+      ),
+    };
+  }
+  return {
+    summary: (
+      <>
+        This month was generated as a <strong>dev / template fallback</strong> because the AI-produced calendar could
+        not be validated against the SOW bucket plan. Do not treat these posts as client deliverables.
+      </>
+    ),
+    detail: failure?.message ? <>{failure.message}</> : undefined,
+  };
+}
+
+function PlannerSummary({
+  planner,
+  pillarCounts,
+  formatCounts,
+}: {
+  planner: Planner;
+  pillarCounts: Record<string, number>;
+  formatCounts: Record<string, number>;
+}) {
+  const distribution = pillarCounts;
+  const formats = formatCounts;
   const platformSplit = (planner.platformSplit ?? {}) as Record<string, number>;
   const weeklyFlow = (planner.weeklyFlow ?? {}) as Record<string, string>;
   const hookStyles = (planner.hookStyles ?? []) as string[];

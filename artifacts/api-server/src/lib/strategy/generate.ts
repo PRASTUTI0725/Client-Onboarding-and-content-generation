@@ -18,7 +18,7 @@ export interface StructuredStrategy {
   brand_foundation: Record<string, unknown>;
   brand_philosophy: Record<string, unknown>;
   audience: Record<string, unknown>;
-  emotional_drivers: string[];
+  emotional_drivers: Array<string | Record<string, unknown>>;
   platform_strategy: Record<string, unknown>;
   content_strategy: Record<string, unknown>;
   kpis: Record<string, unknown>;
@@ -39,11 +39,56 @@ const STRUCTURED_SYSTEM = `You are a senior brand strategist producing the struc
 You must return STRICT JSON matching the requested schema. No prose outside JSON.
 
 Rules:
-- Be concise and specific; no filler.
-- emotional_drivers: 3-4 short phrases.
+- Be specific, section-aware, and commercially useful; no filler.
+- Each section must be distinct. Do not reuse the same sentence or idea across multiple sections.
+- Do not paste raw website copy, Instagram bio/captions, SOW text, or the one-line description verbatim into more than one section.
+- Never emit raw labels like "Website signals", "Instagram signals", "Business DNA", "Scope of Work", or "Deliverables" as final strategy content.
+- Treat active platforms, monthly post counts, content mix, and tone guidance as execution constraints, not optional hints.
+- Every narrative field should read like a strategist's synthesis, not notes or fragments.
+- emotional_drivers: 3-4 short trigger lines, each with a short explanation.
 - phases: 2-3 entries with compact fields.
 - asset_requirements: 4-6 entries.
-- Keep arrays short and practical; this is a fast core draft.`;
+- Keep arrays short and practical, but make them rich enough to support the final canonical sections.`;
+
+function normalizeSignalText(value: unknown): string {
+  return String(value ?? "").toLowerCase();
+}
+
+function buildServiceVocabularyGuard(raw: RawInput, enriched: EnrichedData): string {
+  const businessDnaCategory = normalizeSignalText(
+    (enriched.businessDna as { positioning?: { category?: unknown } } | undefined)?.positioning?.category,
+  );
+  const businessSignals = [
+    enriched.business_model,
+    enriched.positioning,
+    enriched.offer,
+    enriched.platform,
+    enriched.brand_tone,
+    raw.oneLineDescription,
+    businessDnaCategory,
+  ]
+    .map(normalizeSignalText)
+    .join(" ");
+
+  const looksServiceLike =
+    /\b(service|services|agency|consult|consulting|coach|coaching|saas|software|platform|b2b|studio|firm|expert|fractional)\b/.test(
+      businessSignals,
+    );
+  const hasExplicitEcommerceSignals =
+    /\b(d2c|dtc|ecommerce|e-commerce|shopify|shop|store|catalog|sku|skus|cart|checkout|purchase|order|orders|inventory|physical product|retail)\b/.test(
+      businessSignals,
+    );
+
+  if (!looksServiceLike || hasExplicitEcommerceSignals) {
+    return "";
+  }
+
+  return `SERVICE-TYPE VOCABULARY GUARD:
+- This business reads as service-, coaching-, agency-, or SaaS-led, and the source inputs do not support ecommerce framing.
+- Do not describe the offer using ecommerce or retail language such as "product", "purchase", "checkout", "cart", "D2C", "SKU", "merchandising", "inventory", or "store".
+- Use service-appropriate language instead: offer, service, engagement, program, advisory work, platform, software, subscription, pipeline, demo, consultation, or client journey, whichever best fits the evidence.
+- Only use ecommerce/product vocabulary if the provided source inputs clearly support it.`;
+}
 
 export async function generateStructuredStrategy(
   raw: RawInput,
@@ -58,7 +103,17 @@ export async function generateStructuredStrategy(
       topSections: SOWContextSection[];
     } | null;
   },
-  options?: { detailLevel?: StrategyDetailLevel },
+  options?: {
+    detailLevel?: StrategyDetailLevel;
+    strategyContext?: {
+      activePlatforms?: string[];
+      monthlyPostCounts?: Record<string, number>;
+      contentMixBreakdown?: Record<string, number>;
+      toneByPlatform?: Record<string, string>;
+      targetAudienceDefinition?: string;
+      businessObjectives?: string;
+    };
+  },
 ): Promise<StructuredStrategy> {
   const detailLevel = options?.detailLevel ?? "full";
   const tpl = TEMPLATES[templateType];
@@ -69,6 +124,10 @@ export async function generateStructuredStrategy(
     platform: String(enriched.platform ?? ""),
     target_audience: enriched.target_audience ?? {},
     competitors: Array.isArray(enriched.competitors) ? enriched.competitors.slice(0, 5) : [],
+    approved_jump_to_action:
+      enriched && typeof enriched === "object" && "approvedJumpToAction" in enriched
+        ? (enriched as Record<string, unknown>).approvedJumpToAction ?? null
+        : null,
   };
   const compactExtraction = {
     website: extraction?.websiteSummary
@@ -95,6 +154,15 @@ export async function generateStructuredStrategy(
         }
       : null,
   };
+  const explicitStrategyContext = {
+    active_platforms: options?.strategyContext?.activePlatforms ?? [],
+    monthly_post_counts: options?.strategyContext?.monthlyPostCounts ?? {},
+    content_mix_breakdown: options?.strategyContext?.contentMixBreakdown ?? {},
+    tone_by_platform: options?.strategyContext?.toneByPlatform ?? {},
+    target_audience_definition: options?.strategyContext?.targetAudienceDefinition ?? "",
+    key_business_objectives: options?.strategyContext?.businessObjectives ?? "",
+  };
+  const serviceVocabularyGuard = buildServiceVocabularyGuard(raw, enriched);
 
   const userPrompt = `BRAND PROFILE (compact):
 ${JSON.stringify(compactEnriched, null, 2)}
@@ -115,10 +183,47 @@ ${JSON.stringify(
   2,
 )}
 
+EXPLICIT STRATEGY CONTEXT:
+${JSON.stringify(explicitStrategyContext, null, 2)}
+
+${serviceVocabularyGuard}
+
 Generate the full structured_strategy JSON object with these exact top-level keys: market_narrative, problem_gap_solution, brand_foundation, brand_philosophy, audience, emotional_drivers, platform_strategy, content_strategy, kpis, tracking_plan, phases, asset_requirements.
 
-Every section must logically build on the previous one. Keep outputs compact for fast first paint.
-If detail level is "core", keep each section to high-signal bullets/phrases only.
+Use this structure inside each top-level key:
+- market_narrative: { category_context, market_shift, consumer_behavior, why_now }
+- problem_gap_solution: { problem, gap, solution }
+- brand_foundation: { mission, core_promise, differentiator, non_negotiables[] }
+- brand_philosophy: { archetype, belief_system, personality, tone, emotional_role, avoid_list[] }
+- audience: { primary_audience, priority_segments[], motivations[], pain_points[], desires[], objections[], buying_triggers[] }
+- emotional_drivers: 3-4 items, each either "Trigger — explanation" or { trigger, explanation }
+- platform_strategy: { platforms: [{ platform, role, objective, funnel_stage, content_behavior }], system_role }
+- content_strategy: { pillars: [{ name, angle }], hooks[], formats[], proof_angles[], repeatable_system }
+- kpis: { awareness[], engagement[], trust[], conversion[], retention[] }
+- tracking_plan: { weekly, bi_weekly, monthly, decision_triggers }
+- phases: [{ phase, objective, content_focus, success_signal }]
+- asset_requirements: [{ asset, purpose, proof_needed }]
+
+Quality requirements by section:
+- market_narrative must cover category context, market shift, audience expectations, why the brand matters now, and the specific whitespace or opportunity it can claim.
+- market_narrative must read as complete strategic language, not fragments, source notes, or detector phrases.
+- problem_gap_solution must clearly separate customer pain, market gap, and brand-specific solve.
+- brand_foundation must include mission, core promise, differentiator, and non-negotiables.
+- brand_foundation must transform product facts into brand language; do not restate the offer as a product descriptor.
+- brand_philosophy must include archetype, belief system, personality, emotional role, and avoid-list.
+- audience must go beyond demographics into motivations, objections, pains, desires, and buying triggers.
+- audience.motivations should reflect both aspirations and frustrations, not generic interests.
+- audience.pain_points, audience.desires, and audience.objections should be concrete enough to support bullet-ready canonical sections.
+- emotional_drivers must describe action-triggering emotions such as confidence, relief, belonging, aspiration, trust, urgency, or fear of making the wrong decision.
+- emotional_drivers must not collapse into tone, brand adjectives, or personality descriptors.
+- platform_strategy must respect only the active selected platforms and define each platform's role, objective, funnel motion, and behavior.
+- content_strategy must define pillars, hooks, formats, proof angles, and a repeatable content system.
+- kpis must separate awareness, engagement, trust, conversion, and retention metrics.
+- kpis entries must be business-facing metric language, never detector labels, proof labels, or raw source residue.
+
+Every section must logically build on the previous one.
+If detail level is "core", keep each field compact but still complete enough to support high-quality canonical sections.
+Do not repeat the one-line description or scraped source text across sections. Synthesize strategy from the evidence instead.
 Detail level: ${detailLevel}.`;
 
   assertPromptWithinBudget(
@@ -202,6 +307,7 @@ export async function generateStrategyDocument(
   },
 ): Promise<string> {
   const tpl = TEMPLATES[templateType];
+  const serviceVocabularyGuard = buildServiceVocabularyGuard(raw, enriched);
   const compactEnriched = {
     brand_name: String(enriched.brand_name ?? ""),
     offer: String(enriched.offer ?? ""),
@@ -259,6 +365,8 @@ ${JSON.stringify(
 
 TEMPLATE VOICE: ${tpl.name}
 - ${tpl.toneGuidance}
+
+${serviceVocabularyGuard}
 
 Return only the Markdown document. Begin with the H1 brand name.`;
 

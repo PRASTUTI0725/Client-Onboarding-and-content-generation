@@ -4,7 +4,9 @@ import { db } from "@workspace/db";
 import { sql } from "drizzle-orm";
 import {
   getAIFallbackUsed,
+  getLastFailureStage,
   getFallbackUsed,
+  getLatestProviderAttempts,
   getLastDebugAiFailure,
   getLatestAiUsage,
   getLatestOpenRouterCredits,
@@ -17,6 +19,7 @@ import {
   readProviderPriority,
   readUseRealAI,
 } from "../lib/llm/env.js";
+import { getProviderResolutionDiagnostics } from "../lib/llm/request-provider.js";
 
 const router: IRouter = Router();
 
@@ -41,6 +44,9 @@ router.get("/healthz", async (req, res) => {
   const showLastError = debugOn || process.env.NODE_ENV === "development";
   const lastError = showLastError ? getLastDebugAiFailure() : undefined;
   const lastUsage = getLatestAiUsage();
+  const providerResolution = getProviderResolutionDiagnostics();
+  const providerAttempts = showLastError ? getLatestProviderAttempts() : undefined;
+  const lastFailureStage = showLastError ? getLastFailureStage() : undefined;
   const credits = showLastError ? await fetchOpenRouterCreditsSnapshot() : undefined;
   const runtime = getAiRuntimeSummary();
   res.json({
@@ -60,6 +66,13 @@ router.get("/healthz", async (req, res) => {
     envAiProvider: runtime.envAiProviderRaw,
     openaiBaseIsLocal: runtime.openaiBaseIsLocal,
     aiProviderPriority: readProviderPriority(),
+    requestedProvider: providerResolution.requestedProvider,
+    requestedProviderSource: providerResolution.requestedProviderSource,
+    configuredProviderChain: providerResolution.configuredProviderChain,
+    eligibleProviders: providerResolution.eligibleProviders,
+    requestedProviderIncludedInChain: providerResolution.requestedProviderIncludedInChain,
+    requestedProviderExclusionReason: providerResolution.requestedProviderExclusionReason,
+    skippedProviders: providerResolution.skippedProviders,
     aiConfig: {
       openrouterKeyPresent: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
       groqKeyPresent: Boolean(process.env.GROQ_API_KEY?.trim()),
@@ -68,8 +81,12 @@ router.get("/healthz", async (req, res) => {
       ),
       geminiKeyPresent: Boolean(process.env.GEMINI_API_KEY?.trim()),
       openaiKeyPresent: Boolean(process.env.AI_INTEGRATIONS_OPENAI_API_KEY?.trim()),
+      llmJsonRetryEnabled: process.env.LLM_JSON_RETRY === "1",
+      llmJsonRepairEnabled: ["1", "true", "yes"].includes((process.env.LLM_JSON_REPAIR?.trim().toLowerCase() ?? "1")),
     },
     ...(lastUsage ? { aiUsage: lastUsage } : {}),
+    ...(providerAttempts ? { providerAttempts } : {}),
+    ...(lastFailureStage ? { lastFailureStage } : {}),
     ...(credits ? { openrouterCredits: credits } : {}),
     ...(lastError ? { lastError } : {}),
   });

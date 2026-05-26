@@ -38,6 +38,90 @@ export interface InstagramSummary {
   blocked?: boolean;
 }
 
+type FetchSummaryOptions = {
+  signal?: AbortSignal;
+};
+
+function createAbortError(reason?: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === "string" && reason ? reason : "Operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError(signal.reason);
+  }
+}
+
+function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const active = signals.filter(Boolean) as AbortSignal[];
+  if (active.length === 0) return undefined;
+  if (active.length === 1) return active[0];
+  const controller = new AbortController();
+  const abortFrom = (signal: AbortSignal) => {
+    if (controller.signal.aborted) return;
+    controller.abort(signal.reason);
+  };
+  for (const signal of active) {
+    if (signal.aborted) {
+      abortFrom(signal);
+      break;
+    }
+    signal.addEventListener("abort", () => abortFrom(signal), { once: true });
+  }
+  return controller.signal;
+}
+
+async function readResponseTextWithAbort(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<string> {
+  throwIfAborted(signal);
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return response.text();
+  }
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  const cancelReader = () => {
+    void reader.cancel(createAbortError(signal?.reason)).catch(() => {});
+  };
+  const readWithAbort = () => {
+    if (!signal) return reader.read();
+    return Promise.race<any>([
+      reader.read(),
+      new Promise((_resolve, reject) => {
+        const onAbort = () => {
+          signal.removeEventListener("abort", onAbort);
+          cancelReader();
+          reject(createAbortError(signal.reason));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
+    while (true) {
+      throwIfAborted(signal);
+      const { done, value } = (await readWithAbort()) as { done: boolean; value?: Uint8Array };
+      if (done) break;
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    throwIfAborted(signal);
+    return chunks.join("");
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+  }
+}
+
 export async function fetchWebsiteSummary(url: string): Promise<WebsiteSummary | null> {
   const u = url.trim();
   if (!u || !/^https?:\/\//i.test(u)) return null;
@@ -78,13 +162,22 @@ export async function fetchWebsiteSummary(url: string): Promise<WebsiteSummary |
 
 /**
  * Public HTML fetch of an Instagram profile (no auth). May return partial data on login walls.
+ * Known risk: this live fetch path can still hang when Instagram is slow or blocked; it is not
+ * fully bounded yet and rebuild routes should avoid depending on it for responsiveness.
  */
-async function tryInstagramOembed(profileUrl: string): Promise<Pick<InstagramSummary, "bio" | "followers" | "last_n_caption_snippets"> | null> {
+async function tryInstagramOembed(
+  profileUrl: string,
+  options?: FetchSummaryOptions,
+): Promise<Pick<InstagramSummary, "bio" | "followers" | "last_n_caption_snippets"> | null> {
   const oembed = `https://api.instagram.com/oembed?url=${encodeURIComponent(profileUrl)}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8_000);
   try {
-    const r = await fetch(oembed, { headers: { "User-Agent": UA }, signal: controller.signal });
+    throwIfAborted(options?.signal);
+    const r = await fetch(oembed, {
+      headers: { "User-Agent": UA },
+      signal: combineAbortSignals(controller.signal, options?.signal),
+    });
     if (!r.ok) {
       console.warn(`[instagram-fetch] oembed_failed url=${profileUrl} status=${r.status}`);
       return null;
@@ -94,7 +187,10 @@ async function tryInstagramOembed(profileUrl: string): Promise<Pick<InstagramSum
       console.warn(`[instagram-fetch] oembed_non_json url=${profileUrl} contentType=${contentType}`);
       return null;
     }
-    const j = (await r.json()) as { title?: string; author_name?: string };
+    const j = JSON.parse(await readResponseTextWithAbort(r, options?.signal)) as {
+      title?: string;
+      author_name?: string;
+    };
     const line = (j.title || j.author_name || "").trim();
     if (line.length < 3) {
       console.warn(`[instagram-fetch] oembed_empty url=${profileUrl}`);
@@ -102,6 +198,9 @@ async function tryInstagramOembed(profileUrl: string): Promise<Pick<InstagramSum
     }
     return { bio: line, followers: "", last_n_caption_snippets: [] };
   } catch (error) {
+    if (isAbortError(error) || options?.signal?.aborted) {
+      throw createAbortError(options?.signal?.reason ?? error);
+    }
     console.warn(
       `[instagram-fetch] oembed_error url=${profileUrl} reason=${
         error instanceof Error ? `${error.name}:${error.message}` : String(error)
@@ -113,28 +212,36 @@ async function tryInstagramOembed(profileUrl: string): Promise<Pick<InstagramSum
   }
 }
 
-export async function fetchPublicInstagramByHandle(handleRaw: string): Promise<InstagramSummary | null> {
+export async function fetchPublicInstagramByHandle(
+  handleRaw: string,
+  options?: FetchSummaryOptions,
+): Promise<InstagramSummary | null> {
+  // Known risk: callers can still hang here if Instagram is slow or blocked. We are only
+  // documenting that risk for now; behavior is intentionally unchanged outside rebuild.
   const handle = handleRaw.replace(/^@/, "").split(/[/?#]/)[0]?.trim();
   if (!handle) return null;
   const url = `https://www.instagram.com/${encodeURIComponent(handle)}/`;
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 12_000);
   try {
+    throwIfAborted(options?.signal);
     const response = await fetch(url, {
       headers: {
         "User-Agent": UA,
         Accept: "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
       },
-      signal: controller.signal,
+      signal: combineAbortSignals(controller.signal, options?.signal),
       redirect: "follow",
     });
     if (!response.ok) {
       console.warn(`[instagram-fetch] public_profile_failed handle=${handle} status=${response.status}`);
-      const o = await tryInstagramOembed(url);
+      throwIfAborted(options?.signal);
+      const o = await tryInstagramOembed(url, options);
       return o ? { ...o, blocked: false } : null;
     }
-    const html = await response.text();
+    const html = await readResponseTextWithAbort(response, options?.signal);
+    throwIfAborted(options?.signal);
 
     const bio = extractInstagramBio(html);
 
@@ -158,7 +265,8 @@ export async function fetchPublicInstagramByHandle(handleRaw: string): Promise<I
     }
     if (!bio && captionSnippets.length === 0 && !followers) {
       if (/log\s*in/i.test(html) && html.length < 30_000) {
-        const o = await tryInstagramOembed(url);
+        throwIfAborted(options?.signal);
+        const o = await tryInstagramOembed(url, options);
         if (o?.bio) {
           console.warn(`[instagram-fetch] login_wall_oembed_recovered handle=${handle}`);
           return { ...o, blocked: true };
@@ -166,18 +274,22 @@ export async function fetchPublicInstagramByHandle(handleRaw: string): Promise<I
         console.warn(`[instagram-fetch] login_wall_no_oembed handle=${handle}`);
         return { bio: "", followers: "", last_n_caption_snippets: [], blocked: true };
       }
-      const o = await tryInstagramOembed(url);
+      throwIfAborted(options?.signal);
+      const o = await tryInstagramOembed(url, options);
       if (!o) console.warn(`[instagram-fetch] no_extractable_public_data handle=${handle}`);
       return o ? { ...o, blocked: false } : null;
     }
     return { bio, followers, last_n_caption_snippets: captionSnippets };
   } catch (error) {
+    if (isAbortError(error) || options?.signal?.aborted) {
+      throw createAbortError(options?.signal?.reason ?? error);
+    }
     console.warn(
       `[instagram-fetch] public_profile_error handle=${handle} reason=${
         error instanceof Error ? `${error.name}:${error.message}` : String(error)
       }`,
     );
-    const o = await tryInstagramOembed(url);
+    const o = await tryInstagramOembed(url, options);
     return o ? { ...o, blocked: false } : null;
   } finally {
     clearTimeout(t);

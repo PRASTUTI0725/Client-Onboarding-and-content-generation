@@ -8,6 +8,11 @@ export type ProviderId =
   | "nvidia"
   | "gemini";
 
+export type ProviderChainEntry = {
+  provider: ProviderId;
+  model?: string;
+};
+
 export function normalizeProvider(raw: string | undefined): ProviderId {
   let s = (raw ?? "openai").trim() || "openai";
   const sl = s.toLowerCase();
@@ -42,6 +47,11 @@ export function readProviderId(): ProviderId {
 /** Raw AI_PROVIDER (before local→openai); for diagnostics only. */
 export function readEnvAiProviderRaw(): string {
   return process.env.AI_PROVIDER?.trim() || "";
+}
+
+export function isLocalProviderAlias(raw: string | undefined): boolean {
+  const value = (raw ?? "").trim().toLowerCase();
+  return ["local", "ollama", "lmstudio", "lm_studio", "openai-local"].includes(value);
 }
 
 export type AiRuntimeSummary = {
@@ -141,9 +151,36 @@ export function readProviderPriority(): ProviderId[] {
   return values.length ? values : defaultProviderPriority();
 }
 
+export function readProviderChainEntries(): ProviderChainEntry[] {
+  const raw = process.env.AI_PROVIDER_CHAIN?.trim();
+  if (!raw) {
+    return readProviderPriority().map((provider) => ({ provider }));
+  }
+  const entries: ProviderChainEntry[] = [];
+  for (const part of raw.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const [providerRaw, ...modelParts] = trimmed.split(":");
+    try {
+      const provider = normalizeProvider(providerRaw?.trim());
+      const model = modelParts.join(":").trim() || undefined;
+      entries.push({ provider, ...(model ? { model } : {}) });
+    } catch {
+      // Skip invalid chain token.
+    }
+  }
+  return entries.length ? entries : readProviderPriority().map((provider) => ({ provider }));
+}
+
 export function readUseRealAI(): boolean {
   const value = process.env.USE_REAL_AI?.trim().toLowerCase();
   if (!value) return true;
+  return value === "1" || value === "true" || value === "yes";
+}
+
+export function readForceRealAI(): boolean {
+  const value = process.env.AI_FORCE_REAL?.trim().toLowerCase();
+  if (!value) return false;
   return value === "1" || value === "true" || value === "yes";
 }
 
@@ -162,7 +199,7 @@ export function readCodexModel(): string {
 }
 
 export function readOpenRouterModel(): string {
-  return process.env.AI_MODEL_OPENROUTER?.trim() || "google/gemini-flash-1.5-8b";
+  return process.env.AI_MODEL_OPENROUTER?.trim() || "openai/gpt-4o-mini";
 }
 
 export function readGroqModel(): string {
@@ -170,7 +207,7 @@ export function readGroqModel(): string {
 }
 
 export function readGeminiModel(): string {
-  return process.env.AI_MODEL_GEMINI?.trim() || "gemini-1.5-flash-latest";
+  return process.env.AI_MODEL_GEMINI?.trim() || "gemini-2.0-flash";
 }
 
 export function readNvidiaModel(): string {
@@ -179,8 +216,7 @@ export function readNvidiaModel(): string {
 
 /** OpenAI-compatible NVIDIA NIM (build.nvidia.com, nvapi-… keys). Never log the key. */
 export function readNvidiaCredentials(): { baseURL: string; apiKey: string } {
-  const apiKey =
-    process.env.NVIDIA_API_KEY?.trim() ?? process.env.AI_INTEGRATIONS_NVIDIA_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("nvidia")[0];
   if (!apiKey) {
     throw new Error("NVIDIA provider requires NVIDIA_API_KEY or AI_INTEGRATIONS_NVIDIA_API_KEY");
   }
@@ -193,6 +229,9 @@ export function readNvidiaCredentials(): { baseURL: string; apiKey: string } {
 
 function defaultProviderPriority(): ProviderId[] {
   const defaults: ProviderId[] = ["groq", "openrouter", "gemini", "nvidia"];
+  if (isLocalProviderAlias(readEnvAiProviderRaw()) && hasProviderCredentials("openai")) {
+    return ["openai", ...defaults];
+  }
   const localBase = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL?.trim() ?? "";
   if (/localhost|127\.0\.0\.1|192\.168\.|10\./i.test(localBase)) {
     defaults.push("openai");
@@ -205,7 +244,7 @@ const OPENAI_OFFICIAL_HOST = "api.openai.com";
 export function readOpenAICredentials(): { baseURL: string; apiKey: string } {
   const baseURL =
     process.env.AI_INTEGRATIONS_OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1";
-  const rawKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY?.trim();
+  const rawKey = readProviderApiKeys("openai")[0];
   const isOfficialOpenAI = baseURL.includes(OPENAI_OFFICIAL_HOST);
   if (isOfficialOpenAI && !rawKey) {
     throw new Error(
@@ -218,11 +257,68 @@ export function readOpenAICredentials(): { baseURL: string; apiKey: string } {
   return { baseURL, apiKey };
 }
 
+function readKeyList(singleKeys: Array<string | undefined>, multiKeys: Array<string | undefined>): string[] {
+  const values = [
+    ...multiKeys.flatMap((value) => String(value ?? "").split(",").map((item) => item.trim())),
+    ...singleKeys.map((value) => String(value ?? "").trim()),
+  ].filter(Boolean);
+  return Array.from(new Set(values));
+}
+
+export function readProviderApiKeys(id: ProviderId): string[] {
+  switch (id) {
+    case "openai":
+      return readKeyList(
+        [process.env.AI_INTEGRATIONS_OPENAI_API_KEY],
+        [process.env.AI_INTEGRATIONS_OPENAI_API_KEYS],
+      );
+    case "claude":
+      return readKeyList(
+        [process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY],
+        [process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEYS],
+      );
+    case "codex":
+      return readKeyList(
+        [process.env.AI_INTEGRATIONS_CODEX_API_KEY],
+        [process.env.AI_INTEGRATIONS_CODEX_API_KEYS],
+      );
+    case "perplexity":
+      return readKeyList(
+        [process.env.PERPLEXITY_API_KEY, process.env.AI_INTEGRATIONS_PERPLEXITY_API_KEY],
+        [process.env.PERPLEXITY_API_KEYS, process.env.AI_INTEGRATIONS_PERPLEXITY_API_KEYS],
+      );
+    case "openrouter":
+      return readKeyList(
+        [process.env.OPENROUTER_API_KEY],
+        [process.env.OPENROUTER_API_KEYS],
+      );
+    case "groq":
+      return readKeyList(
+        [process.env.GROQ_API_KEY],
+        [process.env.GROQ_API_KEYS],
+      );
+    case "nvidia":
+      return readKeyList(
+        [process.env.NVIDIA_API_KEY, process.env.AI_INTEGRATIONS_NVIDIA_API_KEY],
+        [process.env.NVIDIA_API_KEYS, process.env.AI_INTEGRATIONS_NVIDIA_API_KEYS],
+      );
+    case "gemini":
+      return readKeyList(
+        [process.env.GEMINI_API_KEY],
+        [process.env.GEMINI_API_KEYS],
+      );
+    default: {
+      const _e: never = id;
+      return _e;
+    }
+  }
+}
+
 export function readClaudeCredentials(): {
   baseURL: string;
   apiKey: string;
 } {
-  const apiKey = process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("claude")[0];
   if (!apiKey) {
     throw new Error(
       "Claude provider requires AI_INTEGRATIONS_ANTHROPIC_API_KEY",
@@ -236,7 +332,7 @@ export function readClaudeCredentials(): {
 
 export function readCodexCredentials(): { baseURL: string; apiKey: string } {
   const baseURL = process.env.AI_INTEGRATIONS_CODEX_BASE_URL?.trim();
-  const apiKey = process.env.AI_INTEGRATIONS_CODEX_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("codex")[0];
   if (!baseURL || !apiKey) {
     throw new Error(
       "Codex provider requires AI_INTEGRATIONS_CODEX_BASE_URL and AI_INTEGRATIONS_CODEX_API_KEY (OpenAI-compatible Chat Completions API)",
@@ -246,9 +342,7 @@ export function readCodexCredentials(): { baseURL: string; apiKey: string } {
 }
 
 export function readPerplexityCredentials(): { baseURL: string; apiKey: string } {
-  const apiKey =
-    process.env.PERPLEXITY_API_KEY?.trim() ??
-    process.env.AI_INTEGRATIONS_PERPLEXITY_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("perplexity")[0];
   const baseURL =
     process.env.AI_INTEGRATIONS_PERPLEXITY_BASE_URL?.trim() ?? "https://api.perplexity.ai";
   if (!apiKey) {
@@ -261,7 +355,7 @@ export function readPerplexityCredentials(): { baseURL: string; apiKey: string }
 
 export function readOpenRouterCredentials(): { baseURL: string; apiKey: string } {
   const baseURL = process.env.AI_INTEGRATIONS_OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
-  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("openrouter")[0];
   if (!apiKey) {
     throw new Error("OpenRouter provider requires OPENROUTER_API_KEY");
   }
@@ -270,7 +364,7 @@ export function readOpenRouterCredentials(): { baseURL: string; apiKey: string }
 
 export function readGroqCredentials(): { baseURL: string; apiKey: string } {
   const baseURL = process.env.AI_INTEGRATIONS_GROQ_BASE_URL?.trim() || "https://api.groq.com/openai/v1";
-  const apiKey = process.env.GROQ_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("groq")[0];
   if (!apiKey) {
     throw new Error("Groq provider requires GROQ_API_KEY");
   }
@@ -278,7 +372,7 @@ export function readGroqCredentials(): { baseURL: string; apiKey: string } {
 }
 
 export function readGeminiCredentials(): { apiKey: string } {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  const apiKey = readProviderApiKeys("gemini")[0];
   if (!apiKey) {
     throw new Error("Gemini provider requires GEMINI_API_KEY");
   }
@@ -288,6 +382,7 @@ export function readGeminiCredentials(): { apiKey: string } {
 /** True if this provider can be constructed without missing-credential errors. Perplexity is excluded when keys are unset. */
 export function hasProviderCredentials(id: ProviderId): boolean {
   try {
+    if (readProviderApiKeys(id).length > 0) return true;
     switch (id) {
       case "openai": {
         readOpenAICredentials();

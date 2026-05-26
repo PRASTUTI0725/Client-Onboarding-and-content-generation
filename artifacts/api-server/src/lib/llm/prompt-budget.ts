@@ -4,6 +4,35 @@ export interface PromptBudgetStats {
   maxInputTokens: number;
   maxOutputTokens: number;
   estimatedTotalTokens: number;
+  segments?: PromptBudgetSegment[];
+}
+
+export interface PromptBudgetSegment {
+  label: string;
+  chars: number;
+  estimatedTokens: number;
+}
+
+export type PromptBudgetPart = unknown | { label: string; value: unknown };
+
+export class PromptBudgetError extends Error {
+  readonly label: string;
+  readonly estimatedInputTokens: number;
+  readonly maxInputTokens: number;
+  readonly maxOutputTokens: number;
+  readonly segments?: PromptBudgetSegment[];
+
+  constructor(stats: PromptBudgetStats) {
+    super(
+      `Prompt too large for free tier - upgrade credits or shorten inputs (${stats.label}: estimated ${stats.estimatedInputTokens} input tokens, max ${stats.maxInputTokens}).`,
+    );
+    this.name = "PromptBudgetError";
+    this.label = stats.label;
+    this.estimatedInputTokens = stats.estimatedInputTokens;
+    this.maxInputTokens = stats.maxInputTokens;
+    this.maxOutputTokens = stats.maxOutputTokens;
+    this.segments = stats.segments;
+  }
 }
 
 const CHARS_PER_TOKEN = 4;
@@ -33,31 +62,44 @@ export function trimToTokenBudget(text: string, maxTokens: number): string {
 
 export function buildPromptBudgetStats(
   label: string,
-  parts: unknown[],
+  parts: PromptBudgetPart[],
   maxInputTokens: number,
   maxOutputTokens: number,
 ): PromptBudgetStats {
-  const estimatedInputTokens = parts.reduce<number>((sum, part) => sum + estimateTokens(part), 0);
+  const segments = parts.map((part, index) => {
+    const named = isNamedPromptBudgetPart(part);
+    const value = named ? part.value : part;
+    const text = value == null ? "" : typeof value === "string" ? value : JSON.stringify(value);
+    return {
+      label: named ? part.label : `part_${index + 1}`,
+      chars: text.length,
+      estimatedTokens: estimateTokens(text),
+    };
+  });
+  const estimatedInputTokens = segments.reduce<number>((sum, segment) => sum + segment.estimatedTokens, 0);
   return {
     label,
     estimatedInputTokens,
     maxInputTokens,
     maxOutputTokens,
     estimatedTotalTokens: estimatedInputTokens + maxOutputTokens,
+    segments,
   };
 }
 
 export function assertPromptWithinBudget(
   label: string,
-  parts: unknown[],
+  parts: PromptBudgetPart[],
   maxInputTokens: number,
   maxOutputTokens: number,
 ): PromptBudgetStats {
   const stats = buildPromptBudgetStats(label, parts, maxInputTokens, maxOutputTokens);
   if (stats.estimatedInputTokens > maxInputTokens) {
-    throw new Error(
-      `Prompt too large for free tier - upgrade credits or shorten inputs (${label}: estimated ${stats.estimatedInputTokens} input tokens, max ${maxInputTokens}).`,
-    );
+    throw new PromptBudgetError(stats);
   }
   return stats;
+}
+
+function isNamedPromptBudgetPart(part: PromptBudgetPart): part is { label: string; value: unknown } {
+  return part != null && typeof part === "object" && "label" in part && "value" in part;
 }

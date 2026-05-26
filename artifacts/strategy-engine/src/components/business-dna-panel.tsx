@@ -1,3 +1,4 @@
+﻿import * as React from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
@@ -8,18 +9,46 @@ import {
   humanizeAttributionItem,
   humanizeFieldSourceToken,
 } from "@/lib/dna-display";
+import { Badge } from "@/components/ui/badge";
+import { Textarea } from "@/components/ui/textarea";
+import { Check, Pencil, X } from "lucide-react";
 
 type Props = {
   enrichedData: Record<string, unknown> | null | undefined;
   rawInput?: Record<string, unknown> | null | undefined;
+  sow?: Record<string, unknown> | null | undefined;
   instagramSummaryNotesDraft?: string | null | undefined;
   onJumpToStrategy?: (() => void) | undefined;
+  editable?: boolean | undefined;
+  savingFieldPath?: string | null | undefined;
+  onPatchField?: ((path: string, value: unknown) => Promise<void> | void) | undefined;
 };
+
+type EditableFieldKind = "text" | "list";
 
 function formatFieldSources(sources: string[] | undefined): string | null {
   if (!sources || sources.length === 0) return null;
   const labels = [...new Set(sources.map((s) => humanizeFieldSourceToken(s)))];
   return labels.join(" · ");
+}
+
+function editableValueToString(value: unknown, kind: EditableFieldKind): string {
+  if (kind === "list") {
+    return Array.isArray(value)
+      ? value.map((item) => String(item ?? "").trim()).filter(Boolean).join("\n")
+      : "";
+  }
+  return str(value);
+}
+
+function normalizeEditedValue(value: string, kind: EditableFieldKind): string | string[] {
+  if (kind === "list") {
+    return value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return value.trim();
 }
 
 function field(label: string, value: string, sources?: string[]) {
@@ -34,7 +63,7 @@ function field(label: string, value: string, sources?: string[]) {
           </p>
         )}
       </div>
-      <p className="text-sm leading-relaxed text-foreground/95 whitespace-pre-wrap">
+      <p className="text-sm leading-relaxed text-foreground/95 whitespace-pre-wrap break-words">
         {value || <span className="text-muted-foreground italic">Not available from current inputs</span>}
       </p>
     </div>
@@ -145,9 +174,15 @@ function CardText({ title, children }: { title: string; children: React.ReactNod
 export function BusinessDnaPanel({
   enrichedData,
   rawInput,
+  sow,
   instagramSummaryNotesDraft,
   onJumpToStrategy,
+  editable = false,
+  savingFieldPath = null,
+  onPatchField,
 }: Props) {
+  const [editingPath, setEditingPath] = React.useState<string | null>(null);
+  const [draftValue, setDraftValue] = React.useState("");
   const explicitInstagramSummaryNotes =
     typeof instagramSummaryNotesDraft === "string" && instagramSummaryNotesDraft.trim().length > 0
       ? instagramSummaryNotesDraft.trim()
@@ -160,6 +195,8 @@ export function BusinessDnaPanel({
     typeof rawInput?.oneLineDescription === "string" && rawInput.oneLineDescription.trim().length > 0 ||
     explicitInstagramSummaryNotes,
   );
+  const approvedSnapshot = asRecord((sow as Record<string, unknown> | null | undefined)?.__approvedContextSnapshot);
+  const isApprovalLocked = !approvedSnapshot;
 
   if (!enrichedData) {
     return (
@@ -169,9 +206,11 @@ export function BusinessDnaPanel({
           <h2 className="text-2xl font-bold tracking-tight mt-0.5">Foundation</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          {hasSavedContext
-            ? "Business DNA is processing from the saved website, Instagram, and onboarding context. This section will populate automatically when the profile is ready."
-            : "Add website, Instagram, or a business summary to let the app build Business DNA automatically."}
+          {isApprovalLocked
+            ? "Approve SOW to generate final Business DNA and Jump-to-Action."
+            : hasSavedContext
+            ? "Approved context is ready, but final Business DNA has not been generated yet. Use the workspace action to generate it from the approved inputs."
+            : "Add website, Instagram, or a business summary to make Business DNA possible after approval."}
         </p>
       </div>
     );
@@ -192,15 +231,17 @@ export function BusinessDnaPanel({
           <h2 className="text-2xl font-bold tracking-tight mt-0.5">Foundation</h2>
         </div>
         <p className="text-sm text-muted-foreground">
-          {dnaPendingTimedOut
-            ? "Failed to generate Business DNA automatically within the expected time."
+          {isApprovalLocked
+            ? "Approve SOW to generate final Business DNA and Jump-to-Action."
+            : dnaPendingTimedOut
+            ? "Business DNA generation did not finish within the expected time. Retry from the workspace action."
             : dnaBackgroundStatus === "pending"
-            ? "Business DNA is generating in the background from the latest onboarding, website, Instagram, and SOW context. This section will switch to the full profile as soon as it is ready."
+            ? "Business DNA is generating in the background from the approved website, Instagram, and SOW context. This section will switch to the full profile as soon as it is ready."
             : dnaBackgroundStatus === "failed"
-              ? "Background Business DNA generation did not complete."
+              ? "Business DNA generation failed. Retry from the workspace action."
               : hasSavedContext
-                ? "Business DNA has not rendered yet, but the saved onboarding context is available. This section should populate automatically after processing."
-                : "Add website, Instagram, or a business summary to let the app build Business DNA automatically."}
+                ? "Approved context is available, but Business DNA is still missing. Generate it from the workspace action to unlock the next step."
+                : "Add website, Instagram, or a business summary to make Business DNA possible after approval."}
         </p>
       </div>
     );
@@ -223,18 +264,108 @@ export function BusinessDnaPanel({
   const proof = asRecord(dna?.proofAndEvidence);
   const attr = asRecord(dna?.sourceAttribution);
   const fieldSources = (dna as { fieldSources?: Record<string, string[]> } | null | undefined)?.fieldSources;
+  const manualEdits =
+    asRecord(asRecord(dna?.__meta)?.manualEdits) as Record<string, { editedAt?: string; source?: string }> | null;
   const instagramSummaryNotes = explicitInstagramSummaryNotes;
   const visLegacy = asRecord((dna as Record<string, unknown>)?.visual_identity);
   const psWeb = asRecord(platformSig?.website);
   const psIg = asRecord(platformSig?.instagram);
+  const psIgStatus = asRecord(psIg?.status);
+  const paletteSource = asRecord(vis?.paletteSource);
   const hasInstagramSignals =
     Boolean(str(psIg?.handle)) ||
     formatList(psIg?.bioSignals) !== "" ||
     formatList(psIg?.contentPatterns) !== "" ||
     formatList(psIg?.engagementSignals) !== "";
   const hasManualInstagramNotes = instagramSummaryNotes.length > 0;
-  const instagramEnrichmentOk = instaOk || hasInstagramSignals;
+  const instagramHandleAttached = Boolean(str(psIg?.handle)) || Boolean(rawInput?.instagramHandle);
+  const instagramSourceReached =
+    Boolean(psIgStatus?.sourceReached) || instaOk || Boolean(ig?.source || ig?.note);
+  const instagramSignalsExtracted = Boolean(psIgStatus?.signalsExtracted) || hasInstagramSignals;
   const showJumpToStrategyCta = false && typeof onJumpToStrategy === "function";
+
+  async function saveFieldEdit(path: string, kind: EditableFieldKind) {
+    if (!onPatchField) return;
+    await onPatchField(path, normalizeEditedValue(draftValue, kind));
+    setEditingPath(null);
+    setDraftValue("");
+  }
+
+  function renderEditableField(
+    label: string,
+    rawValue: unknown,
+    sources: string[] | undefined,
+    path: string,
+    kind: EditableFieldKind,
+  ) {
+    const displayValue = kind === "list" ? formatList(rawValue) : str(rawValue);
+    const src = formatFieldSources(sources);
+    const isEditing = editingPath === path;
+    const isSaving = savingFieldPath === path;
+    const isManual = Boolean(manualEdits?.[path]);
+    return (
+      <div className="space-y-1">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{label}</p>
+          {src ? (
+            <p className="text-[11px] text-muted-foreground/90" title="Data sources for this field">
+              {src}
+            </p>
+          ) : null}
+          {isManual ? <Badge variant="outline" className="text-[10px]">Manually edited</Badge> : null}
+          {editable && onPatchField ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-6"
+              onClick={() => {
+                setEditingPath(path);
+                setDraftValue(editableValueToString(rawValue, kind));
+              }}
+              disabled={Boolean(editingPath && editingPath !== path) || Boolean(savingFieldPath)}
+              aria-label={`Edit ${label}`}
+            >
+              <Pencil className="size-3.5" />
+            </Button>
+          ) : null}
+        </div>
+        {isEditing ? (
+          <div className="space-y-2">
+            <Textarea
+              value={draftValue}
+              onChange={(event) => setDraftValue(event.target.value)}
+              rows={kind === "list" ? 5 : 3}
+              className="text-sm"
+            />
+            <div className="flex items-center gap-2">
+              <Button type="button" size="sm" onClick={() => void saveFieldEdit(path, kind)} disabled={isSaving}>
+                <Check className="size-4 mr-1" />
+                {isSaving ? "Saving..." : "Save"}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setEditingPath(null);
+                  setDraftValue("");
+                }}
+                disabled={isSaving}
+              >
+                <X className="size-4 mr-1" />
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm leading-relaxed text-foreground/95 whitespace-pre-wrap break-words">
+            {displayValue || <span className="text-muted-foreground italic">Not available from current inputs</span>}
+          </p>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -249,6 +380,12 @@ export function BusinessDnaPanel({
         Percentages show how much each area is tied to your website, SOW, and public social text—not sales potential
         or copy quality.
       </p>
+
+      <div className={`rounded-xl border p-4 text-sm ${isApprovalLocked ? "border-amber-300 bg-amber-50 text-amber-950" : "border-border/70 bg-muted/30 text-foreground"}`}>
+        {isApprovalLocked
+          ? "Approve SOW to generate Business DNA and Jump-to-Action. Any existing DNA shown here should be treated as draft preview only."
+          : "This Business DNA is tied to the approved SOW snapshot for this client."}
+      </div>
 
       {showJumpToStrategyCta ? (
         <div className="-mt-1">
@@ -275,21 +412,29 @@ export function BusinessDnaPanel({
             <div>
               <p className="text-xs text-muted-foreground mb-1">Instagram</p>
               <StatusPill
-                ok={instagramEnrichmentOk}
+                ok={instagramSignalsExtracted}
                 label={
-                  instagramEnrichmentOk
-                    ? "Data attached"
-                    : hasManualInstagramNotes
-                      ? "Manual context available"
-                      : "Data unavailable"
+                  instagramSignalsExtracted
+                    ? "Signals extracted"
+                    : instagramSourceReached
+                      ? "Source reached"
+                      : instagramHandleAttached
+                        ? "Handle attached"
+                        : hasManualInstagramNotes
+                          ? "Manual context available"
+                          : "No usable Instagram signals"
                 }
                 detail={
-                  instagramEnrichmentOk
-                    ? "Profile and content signals are included below."
-                    : "Instagram details were not returned in this run. Add manual context to continue."
+                  instagramSignalsExtracted
+                    ? "Usable Instagram bio or content signals are included below."
+                    : instagramSourceReached
+                      ? "Instagram responded, but usable parsed signals were too thin or blocked."
+                      : instagramHandleAttached
+                        ? "Only the handle is attached so far. This is not the same as extracted Instagram signals."
+                        : "Instagram details were not returned in this run. Add manual context to continue."
                 }
               />
-              {!instagramEnrichmentOk && (
+              {!instagramSignalsExtracted && (
                 <p className="text-[11px] text-muted-foreground mt-1.5 leading-snug">
                   Paste the profile bio, voice, or brand notes under <strong>Instagram positioning</strong>.
                 </p>
@@ -321,13 +466,13 @@ export function BusinessDnaPanel({
           </CardText>
         ) : null}
         <CardText title="Purpose">
-          {field("Statement", str(dna?.purpose), fieldSources?.purpose)}
+          {renderEditableField("Statement", dna?.purpose, fieldSources?.purpose, "purpose", "text")}
         </CardText>
         <CardText title="Mission">
-          {field("Statement", str(dna?.mission), fieldSources?.mission)}
+          {renderEditableField("Statement", dna?.mission, fieldSources?.mission, "mission", "text")}
         </CardText>
         <CardText title="Vision">
-          {field("Statement", str(dna?.vision), fieldSources?.vision)}
+          {renderEditableField("Statement", dna?.vision, fieldSources?.vision, "vision", "text")}
         </CardText>
         <CardText title="Core values">
           {field("Values", formatList(dna?.coreValues), fieldSources?.coreValues)}
@@ -336,48 +481,48 @@ export function BusinessDnaPanel({
           {field("Archetype", str(dna?.brandArchetype), fieldSources?.brandArchetype)}
         </CardText>
         <CardText title="Personality traits">
-          {field("Traits", formatList(dna?.personalityTraits), fieldSources?.personalityTraits)}
+          {renderEditableField("Traits", dna?.personalityTraits, fieldSources?.personalityTraits, "personalityTraits", "list")}
         </CardText>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <CardText title="Tone of voice">
           <div className="space-y-2">
-            {field("Style", formatList(tov?.style), fieldSources?.toneOfVoice)}
-            {field("Do’s", formatList(tov && (tov as { dos?: unknown }).dos), fieldSources?.toneOfVoice)}
-            {field("Don’ts", formatList(tov && (tov as { donts?: unknown }).donts), fieldSources?.toneOfVoice)}
-            {field("Sample phrases", formatList(tov?.samplePhrases), fieldSources?.toneOfVoice)}
+            {renderEditableField("Style", tov?.style, fieldSources?.toneOfVoice, "toneOfVoice.style", "list")}
+            {renderEditableField("Do's", tov && (tov as { dos?: unknown }).dos, fieldSources?.toneOfVoice, "toneOfVoice.dos", "list")}
+            {renderEditableField("Don'ts", tov && (tov as { donts?: unknown }).donts, fieldSources?.toneOfVoice, "toneOfVoice.donts", "list")}
+            {renderEditableField("Sample phrases", tov?.samplePhrases, fieldSources?.toneOfVoice, "toneOfVoice.samplePhrases", "list")}
           </div>
         </CardText>
         <CardText title="Target audience">
-          {field("Segments", formatList(aud?.segments), fieldSources?.targetAudience)}
-          {field("Demographics", formatList(aud?.demographics), fieldSources?.targetAudience)}
-          {field("Psychographics", formatList(aud?.psychographics), fieldSources?.targetAudience)}
-          {field("Geographies", formatList(aud?.geographies), fieldSources?.targetAudience)}
-          {field("Pains", formatList(aud?.pains), fieldSources?.targetAudience)}
-          {field("Desires", formatList(aud?.desires), fieldSources?.targetAudience)}
-          {field("Objections", formatList(aud?.objections), fieldSources?.targetAudience)}
+          {renderEditableField("Segments", aud?.segments, fieldSources?.targetAudience, "targetAudience.segments", "list")}
+          {renderEditableField("Demographics", aud?.demographics, fieldSources?.targetAudience, "targetAudience.demographics", "list")}
+          {renderEditableField("Psychographics", aud?.psychographics, fieldSources?.targetAudience, "targetAudience.psychographics", "list")}
+          {renderEditableField("Geographies", aud?.geographies, fieldSources?.targetAudience, "targetAudience.geographies", "list")}
+          {renderEditableField("Pains", aud?.pains, fieldSources?.targetAudience, "targetAudience.pains", "list")}
+          {renderEditableField("Desires", aud?.desires, fieldSources?.targetAudience, "targetAudience.desires", "list")}
+          {renderEditableField("Objections", aud?.objections, fieldSources?.targetAudience, "targetAudience.objections", "list")}
         </CardText>
         <CardText title="Positioning">
-          {field("Category", str(pos?.category), fieldSources?.positioning)}
-          {field("Value proposition", str(pos?.valueProposition), fieldSources?.positioning)}
-          {field("Differentiators", formatList(pos?.differentiators), fieldSources?.positioning)}
-          {field("Competitor references", formatList(pos?.competitorReferences), fieldSources?.positioning)}
-          {field("Market angle", str(pos?.marketAngle), fieldSources?.positioning)}
-          {field("Reasons to believe", formatList(pos?.reasonToBelieve), fieldSources?.positioning)}
+          {renderEditableField("Category", pos?.category, fieldSources?.positioning, "positioning.category", "text")}
+          {renderEditableField("Value proposition", pos?.valueProposition, fieldSources?.positioning, "positioning.valueProposition", "text")}
+          {renderEditableField("Differentiators", pos?.differentiators, fieldSources?.positioning, "positioning.differentiators", "list")}
+          {renderEditableField("Competitor references", pos?.competitorReferences, fieldSources?.positioning, "positioning.competitorReferences", "list")}
+          {renderEditableField("Market angle", pos?.marketAngle, fieldSources?.positioning, "positioning.marketAngle", "text")}
+          {renderEditableField("Reasons to believe", pos?.reasonToBelieve, fieldSources?.positioning, "positioning.reasonToBelieve", "list")}
         </CardText>
         <CardText title="Offers">
-          {field("Primary offers", formatList(off?.primaryOffers), fieldSources?.offers)}
-          {field("Pricing signals", formatList(off?.pricingSignals), fieldSources?.offers)}
-          {field("Transformation promise", str(off?.transformationPromise), fieldSources?.offers)}
-          {field("Urgency style", str(off?.urgencyStyle), fieldSources?.offers)}
+          {renderEditableField("Primary offers", off?.primaryOffers, fieldSources?.offers, "offers.primaryOffers", "list")}
+          {renderEditableField("Pricing signals", off?.pricingSignals, fieldSources?.offers, "offers.pricingSignals", "list")}
+          {renderEditableField("Transformation promise", off?.transformationPromise, fieldSources?.offers, "offers.transformationPromise", "text")}
+          {renderEditableField("Urgency style", off?.urgencyStyle, fieldSources?.offers, "offers.urgencyStyle", "text")}
         </CardText>
         <CardText title="Content strategy">
-          {field("Pillars", formatList(cs?.contentPillars))}
-          {field("Themes", formatList(cs?.themes))}
-          {field("Hooks that fit", formatList(cs?.hooksThatFitBrand))}
-          {field("Topics to avoid", formatList(cs?.topicsToAvoid))}
-          {field("Trust signals to repeat", formatList(cs?.trustSignalsToRepeat))}
+          {renderEditableField("Pillars", cs?.contentPillars, undefined, "contentStrategy.contentPillars", "list")}
+          {renderEditableField("Themes", cs?.themes, undefined, "contentStrategy.themes", "list")}
+          {renderEditableField("Hooks that fit", cs?.hooksThatFitBrand, undefined, "contentStrategy.hooksThatFitBrand", "list")}
+          {renderEditableField("Topics to avoid", cs?.topicsToAvoid, undefined, "contentStrategy.topicsToAvoid", "list")}
+          {renderEditableField("Trust signals to repeat", cs?.trustSignalsToRepeat, undefined, "contentStrategy.trustSignalsToRepeat", "list")}
         </CardText>
         <CardText title="Language style">
           {field("Reading level", str(lang?.readingLevel))}
@@ -397,9 +542,14 @@ export function BusinessDnaPanel({
         {Array.isArray(vis?.colors) && (vis?.colors as { name?: string; hex?: string; meaning?: string }[]).length > 0 && (
           <Card className="border-border/80 md:col-span-2">
             <CardHeader>
-              <CardTitle className="text-base font-bold">Visual identity — palette</CardTitle>
+              <CardTitle className="text-base font-bold">Visual identity — website color candidates</CardTitle>
             </CardHeader>
             <CardContent>
+              <p className="text-xs text-muted-foreground mb-3">
+                {paletteSource?.detail
+                  ? String(paletteSource.detail)
+                  : "Extracted website color provenance unavailable."}
+              </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 {(vis?.colors as { name?: string; hex?: string; meaning?: string }[]).map((c, i) => (
                   <ColorSwatch key={i} name={c.name} hex={c.hex} note={c.meaning} />
@@ -408,8 +558,18 @@ export function BusinessDnaPanel({
             </CardContent>
           </Card>
         )}
+        {(!Array.isArray(vis?.colors) || (vis?.colors as { name?: string; hex?: string; meaning?: string }[]).length === 0) && (
+          <CardText title="Visual identity — website color candidates">
+            {field(
+              "Status",
+              paletteSource?.detail
+                ? String(paletteSource.detail)
+                : "No reliable website color candidates detected from current public signals.",
+            )}
+          </CardText>
+        )}
         <CardText title="Platform signals — website">
-          {field("Website signals analyzed", "Homepage copy, search preview text, and key page headings")}
+          {field("Website signals analyzed", formatList(psWeb?.pagesAnalyzed) || "Homepage copy, search preview text, and key page headings")}
           {field("Messaging patterns", formatList(psWeb?.messagingPatterns))}
           {field("Trust elements", formatList(psWeb?.trustElements))}
           {field("Conversion elements", formatList(psWeb?.conversionElements))}

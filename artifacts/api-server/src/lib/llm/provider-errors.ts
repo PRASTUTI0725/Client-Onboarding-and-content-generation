@@ -1,3 +1,5 @@
+import { JsonStageFailureError } from "./json-retry.js";
+
 type ErrorKind = "transient" | "permanent";
 
 export class ProviderRequestError extends Error {
@@ -28,11 +30,62 @@ export function classifyProviderError(err: unknown): {
   httpStatus?: number;
   errorCode?: string;
   message: string;
+  retrySameProvider: boolean;
+  failoverEligible: boolean;
+  terminalForChain: boolean;
 } {
+  if (err instanceof JsonStageFailureError) {
+    return {
+      kind: "permanent",
+      reason: "invalid_json_after_retry",
+      errorCode: err.errorCode,
+      message: err.message,
+      retrySameProvider: false,
+      failoverEligible: true,
+      terminalForChain: false,
+    };
+  }
   const message = err instanceof Error ? err.message : String(err);
   const lower = message.toLowerCase();
   const status = getHttpStatus(err, message);
   const code = getErrorCode(err);
+
+  const requestTooLarge =
+    status === 413 ||
+    lower.includes("prompt too large") ||
+    lower.includes("request too large") ||
+    lower.includes("context length") ||
+    lower.includes("context window") ||
+    lower.includes("maximum context length") ||
+    lower.includes("maximum input tokens") ||
+    lower.includes("too many tokens") ||
+    lower.includes("token limit") ||
+    lower.includes("tokens per minute") ||
+    lower.includes("tpm") ||
+    lower.includes("input too long") ||
+    lower.includes("prompt is too long");
+  const authFailure =
+    status === 401 ||
+    status === 403 ||
+    lower.includes("invalid api key") ||
+    lower.includes("incorrect api key") ||
+    lower.includes("authentication") ||
+    lower.includes("unauthorized") ||
+    lower.includes("forbidden");
+  const malformedRequest =
+    status === 400 &&
+    (
+      lower.includes("invalid_request_error") ||
+      lower.includes("malformed request") ||
+      lower.includes("unsupported parameter") ||
+      lower.includes("unexpected field") ||
+      lower.includes("invalid type") ||
+      lower.includes("failed to parse") ||
+      lower.includes("json body") ||
+      lower.includes("must be of type") ||
+      lower.includes("messages[") ||
+      lower.includes("response_format")
+    );
 
   if (isTransientStatus(status)) {
     return {
@@ -41,6 +94,9 @@ export function classifyProviderError(err: unknown): {
       httpStatus: status,
       errorCode: code,
       message,
+      retrySameProvider: true,
+      failoverEligible: true,
+      terminalForChain: false,
     };
   }
 
@@ -51,6 +107,48 @@ export function classifyProviderError(err: unknown): {
       httpStatus: status,
       errorCode: code,
       message,
+      retrySameProvider: false,
+      failoverEligible: true,
+      terminalForChain: false,
+    };
+  }
+
+  if (requestTooLarge) {
+    return {
+      kind: "permanent",
+      reason: "provider_request_limit",
+      httpStatus: status,
+      errorCode: code,
+      message,
+      retrySameProvider: false,
+      failoverEligible: true,
+      terminalForChain: false,
+    };
+  }
+
+  if (authFailure) {
+    return {
+      kind: "permanent",
+      reason: "authentication_failed",
+      httpStatus: status,
+      errorCode: code,
+      message,
+      retrySameProvider: false,
+      failoverEligible: true,
+      terminalForChain: false,
+    };
+  }
+
+  if (malformedRequest) {
+    return {
+      kind: "permanent",
+      reason: "malformed_request",
+      httpStatus: status,
+      errorCode: code,
+      message,
+      retrySameProvider: false,
+      failoverEligible: false,
+      terminalForChain: true,
     };
   }
 
@@ -72,6 +170,9 @@ export function classifyProviderError(err: unknown): {
       httpStatus: status,
       errorCode: code,
       message,
+      retrySameProvider: false,
+      failoverEligible: true,
+      terminalForChain: false,
     };
   }
 
@@ -82,6 +183,9 @@ export function classifyProviderError(err: unknown): {
     httpStatus: status,
     errorCode: code,
     message,
+    retrySameProvider: false,
+    failoverEligible: true,
+    terminalForChain: false,
   };
 }
 

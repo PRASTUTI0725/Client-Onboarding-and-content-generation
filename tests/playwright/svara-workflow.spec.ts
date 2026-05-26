@@ -68,10 +68,22 @@ test.describe("svara full workflow", () => {
         status: "approved",
       },
     });
-    await request.post(`${apiUrl}/clients/${client.id}/calendar/generate`, {
+    const calendarGenerate = await request.post(`${apiUrl}/clients/${client.id}/calendar/generate`, {
       headers,
       data: { month: "July 2026", startDate: "2026-07-01", goal: "Svara launch month" },
     });
+    const generatedCalendar = (await calendarGenerate.json()) as {
+      planner?: { platformSplit?: Record<string, number> };
+      posts?: Array<{ platform?: string }>;
+    };
+    expect(generatedCalendar.posts).toHaveLength(16);
+    expect(generatedCalendar.planner?.platformSplit).toMatchObject({ Instagram: 12, Pinterest: 4 });
+    const generatedPlatformCounts = (generatedCalendar.posts ?? []).reduce<Record<string, number>>((acc, post) => {
+      const platform = post.platform ?? "unknown";
+      acc[platform] = (acc[platform] ?? 0) + 1;
+      return acc;
+    }, {});
+    expect(generatedPlatformCounts).toMatchObject({ Instagram: 12, Pinterest: 4 });
 
     await page.goto(`clients/${client.id}`);
     await expect(page.getByText("Jump to section")).toBeVisible();

@@ -9,6 +9,8 @@ import {
   extractRomanIndustryFromSectionI,
   extractRomanTargetAudience,
   isJunkAutofillIndustry,
+  isJunkAutofillTargetAudience,
+  isRomanOrSectionHeadingLine,
 } from "./sow-field-qualify.js";
 
 const SCOPE_START =
@@ -493,8 +495,15 @@ function buildNormalizedClassicSections(input: {
 function summarizeRelevantLines(inputs: string[], matcher: RegExp, maxLines: number): string {
   const lines = inputs
     .flatMap((value) => toMeaningfulLines(value))
+    .filter((line) => !isRomanOrSectionHeadingLine(line))
+    .filter((line) => !isJunkAutofillIndustry(line))
+    .filter((line) => !isJunkAutofillTargetAudience(line))
     .filter((line) => matcher.test(line));
-  const fallback = inputs.flatMap((value) => toMeaningfulLines(value));
+  const fallback = inputs
+    .flatMap((value) => toMeaningfulLines(value))
+    .filter((line) => !isRomanOrSectionHeadingLine(line))
+    .filter((line) => !isJunkAutofillIndustry(line))
+    .filter((line) => !isJunkAutofillTargetAudience(line));
   const picked = (lines.length > 0 ? lines : fallback).slice(0, maxLines);
   return dedupeAndJoin(picked);
 }
@@ -509,12 +518,25 @@ function toMeaningfulLines(value: string): string[] {
 }
 
 function dedupeAndJoin(lines: string[]): string {
-  const seen = new Set<string>();
+  const seen: string[] = [];
   const unique: string[] = [];
   for (const line of lines) {
-    const normalized = line.toLowerCase();
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
+    const normalized = line
+      .toLowerCase()
+      .replace(/^[^a-z0-9]+/, "")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+    if (!normalized) continue;
+    if (
+      seen.some(
+        (existing) =>
+          existing === normalized ||
+          (normalized.length > 32 && (existing.includes(normalized) || normalized.includes(existing))),
+      )
+    ) {
+      continue;
+    }
+    seen.push(normalized);
     unique.push(line);
   }
   return unique.join("\n");

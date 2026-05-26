@@ -7,18 +7,114 @@ import { pickFirstDnaNarrativeLineFromBlock, pickLabeledPurposeLineFromUnderstan
 import { decodeHtmlEntities, fetchPublicInstagramByHandle } from "./extraction/summaries.js";
 
 const UA = "Mozilla/5.0 (compatible; ClientOnboardingBot/1.0; +https://example.com)";
+const WEBSITE_FETCH_TIMEOUT_MS = 15_000;
+const INSTAGRAM_FETCH_TIMEOUT_MS = 15_000;
+const INSTAGRAM_BUDGET_TIMEOUT_REASON = "business_dna_instagram_budget_timeout";
 
-async function withStepTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
+export type BusinessDnaDiagnosticEvent = {
+  step:
+    | "website_fetch"
+    | "website_parse"
+    | "instagram_fetch"
+    | "instagram_parse"
+    | "dna_assemble";
+  phase: "start" | "end" | "error";
+  detail?: Record<string, unknown>;
+};
+
+function emitDiagnostic(
+  diagnostic: ((event: BusinessDnaDiagnosticEvent) => void) | undefined,
+  event: BusinessDnaDiagnosticEvent,
+): void {
+  if (!diagnostic) return;
   try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms (${label})`)), timeoutMs);
+    diagnostic(event);
+  } catch {
+    // Diagnostics are best-effort only.
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+function createAbortError(reason?: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === "string" && reason ? reason : "Operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError(signal.reason);
+  }
+}
+
+function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const active = signals.filter(Boolean) as AbortSignal[];
+  if (active.length === 0) return undefined;
+  if (active.length === 1) return active[0];
+  const controller = new AbortController();
+  const abortFrom = (signal: AbortSignal) => {
+    if (controller.signal.aborted) return;
+    controller.abort(signal.reason);
+  };
+  for (const signal of active) {
+    if (signal.aborted) {
+      abortFrom(signal);
+      break;
+    }
+    signal.addEventListener("abort", () => abortFrom(signal), { once: true });
+  }
+  return controller.signal;
+}
+
+async function readResponseTextWithAbort(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<string> {
+  throwIfAborted(signal);
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return response.text();
+  }
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  const cancelReader = () => {
+    void reader.cancel(createAbortError(signal?.reason)).catch(() => {});
+  };
+  const readWithAbort = () => {
+    if (!signal) return reader.read();
+    return Promise.race<any>([
+      reader.read(),
+      new Promise((_resolve, reject) => {
+        const onAbort = () => {
+          signal.removeEventListener("abort", onAbort);
+          cancelReader();
+          reject(createAbortError(signal.reason));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
       }),
     ]);
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
+    while (true) {
+      throwIfAborted(signal);
+      const { done, value } = (await readWithAbort()) as { done: boolean; value?: Uint8Array };
+      if (done) break;
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    throwIfAborted(signal);
+    return chunks.join("");
   } finally {
-    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", cancelReader);
   }
 }
 
@@ -59,6 +155,19 @@ type InstagramSignalSummary = {
   contentPatterns: string[];
   visualPatterns: string[];
   engagementSignals: string[];
+};
+
+type StructuredInstagramInput = {
+  handle: string;
+  bio: string;
+  offerSummary: string;
+  recentCaptionSnippets: string[];
+  recurringTopics: string[];
+  ctaPatterns?: string[];
+  proofSignals?: string[];
+  followerCount?: string;
+  category?: string;
+  visualStyleNotes?: string;
 };
 
 export type BusinessDna = {
@@ -121,6 +230,10 @@ export type BusinessDna = {
     designMotifs: string[];
     logoStyle: string;
     layoutStyle: string;
+    paletteSource?: {
+      classification: "extracted" | "inferred" | "fallback" | "missing";
+      detail: string;
+    };
   };
   platformSignals: {
     website: {
@@ -135,6 +248,13 @@ export type BusinessDna = {
       contentPatterns: string[];
       visualPatterns: string[];
       engagementSignals: string[];
+      status?: {
+        handleAttached: boolean;
+        sourceReached: boolean;
+        signalsExtracted: boolean;
+        classification: "extracted" | "inferred" | "fallback" | "missing";
+        detail: string;
+      };
     };
   };
   proofAndEvidence: {
@@ -167,6 +287,11 @@ export type BusinessDna = {
     instagram: { ok: boolean; source?: string; error?: string; note?: string; detail?: string };
   };
   raw?: { siteTitle?: string; heroExcerpt?: string; metaDescription?: string };
+  provenanceSummary?: {
+    websiteSignals: "extracted" | "inferred" | "fallback" | "missing";
+    instagramSignals: "extracted" | "inferred" | "fallback" | "missing";
+    palette: "extracted" | "inferred" | "fallback" | "missing";
+  };
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -176,6 +301,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function stringOrEmpty(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function lowerFirst(value: unknown): string {
+  const text = stringOrEmpty(value);
+  if (!text) return "";
+  return text.charAt(0).toLowerCase() + text.slice(1);
 }
 
 function firstNonEmpty(...values: Array<unknown>): string {
@@ -236,6 +367,15 @@ function dedupeStringsByNorm(items: string[]): string[] {
     out.push(t);
   }
   return out;
+}
+
+function toFallbackSnippets(...inputs: Array<string | null | undefined>): string[] {
+  return dedupeStringsByNorm(
+    inputs
+      .flatMap((value) => String(value ?? "").split(/\n+|(?<=[.?!])\s+/))
+      .map((part) => part.replace(/^[-•*]\s*/, "").replace(/\s+/g, " ").trim())
+      .filter((part) => part.length >= 18 && part.length <= 160),
+  );
 }
 
 function stripHtmlForMetrics(html: string): string {
@@ -317,16 +457,6 @@ function pickColors(html: string, pageUrl: string): string[] {
   });
   if (out.length < 2) {
     out = Array.from(set).filter((h) => /^#[0-9a-f]{6}$/.test(h));
-  }
-  try {
-    const host = new URL(pageUrl).hostname.toLowerCase();
-    const blob = (host + html.toLowerCase()).slice(0, 500_000);
-    if (/svara|swara|svaraonline/.test(blob)) {
-      const swara = ["#0f766e", "#14b8a6", "#fdba74", "#1c1917", "#fafaf9"];
-      out = uniqueStrings([...swara, ...out]);
-    }
-  } catch {
-    /* ignore */
   }
   return out.slice(0, 6);
 }
@@ -501,6 +631,54 @@ function parseInstagramMcpData(value: unknown, fallbackHandle: string): Instagra
   };
 }
 
+function mapStructuredInstagramToSignals(
+  instagram: StructuredInstagramInput | null | undefined,
+  fallbackHandle: string,
+): InstagramSignalSummary | null {
+  if (!instagram) return null;
+  const hasBio = instagram.bio.trim().length > 0;
+  const hasSupportingContent =
+    instagram.offerSummary.trim().length > 0 ||
+    instagram.recentCaptionSnippets.length > 0 ||
+    instagram.recurringTopics.length > 0;
+  if (!hasBio || !hasSupportingContent) return null;
+  const handle = stringOrEmpty(instagram.handle || fallbackHandle).replace(/^@/, "").trim();
+  const bioSignals = uniqueStrings([
+    instagram.bio,
+    instagram.offerSummary,
+    instagram.category ? `Category: ${instagram.category}` : "",
+  ]);
+  const contentPatterns = uniqueStrings([
+    ...instagram.recentCaptionSnippets,
+    ...instagram.recurringTopics.map((topic) => `Topic: ${topic}`),
+    ...(instagram.ctaPatterns ?? []).map((pattern) => `CTA: ${pattern}`),
+    ...(instagram.proofSignals ?? []).map((signal) => `Proof: ${signal}`),
+  ]);
+  const visualPatterns = uniqueStrings([
+    instagram.visualStyleNotes,
+  ]);
+  const engagementSignals = uniqueStrings([
+    instagram.followerCount,
+    ...(instagram.proofSignals ?? []),
+  ]);
+  if (
+    !handle &&
+    bioSignals.length === 0 &&
+    contentPatterns.length === 0 &&
+    visualPatterns.length === 0 &&
+    engagementSignals.length === 0
+  ) {
+    return null;
+  }
+  return {
+    handle,
+    bioSignals,
+    contentPatterns,
+    visualPatterns,
+    engagementSignals,
+  };
+}
+
 function pickMcpToolPayload(mcpData: Record<string, unknown> | null | undefined, keywords: string[]): unknown {
   if (!mcpData) return null;
   const entry = Object.entries(mcpData).find(([key]) =>
@@ -516,8 +694,8 @@ function detectCategory(text: string): string {
   if (/\bdental|clinic|doctor|health|patient\b/.test(lowered)) return "Healthcare";
   if (/\brealty|property|investor|home\b/.test(lowered)) return "Real Estate";
   if (/\bcafe|restaurant|menu|brunch|bakery\b/.test(lowered)) return "Hospitality";
+  if (/\bconsult|agency|studio|service|marketing|social media\b/.test(lowered)) return "Services";
   if (/\bsaas|software|platform|b2b\b/.test(lowered)) return "B2B Software / Services";
-  if (/\bconsult|agency|studio|service\b/.test(lowered)) return "Services";
   return "";
 }
 
@@ -550,39 +728,22 @@ function colorMeaning(hex: string): string {
     const r = parseInt(h.slice(0, 2), 16);
     const g = parseInt(h.slice(2, 4), 16);
     const b = parseInt(h.slice(4, 6), 16);
-    if (g > 110 && r < 100 && b < 120 && g > r) return "Calm, oceanic trust (brand green)";
-    if (r > 200 && g > 160 && b < 200 && r > b) return "Soft warmth (peach / coral accent)";
-    if (r < 30 && g < 30 && b < 30) return "High-contrast ink / type";
-    if (r > 245 && g > 245 && b > 240) return "Clean canvas / paper white";
+    if (r < 30 && g < 30 && b < 30) return "Dark neutral candidate from website color literals";
+    if (r > 245 && g > 245 && b > 240) return "Light neutral candidate from website color literals";
   }
-  const lowered = hex.toLowerCase();
-  if (/^#?0f172a|^#?111827|^#?1f2937/.test(lowered)) return "Authority and trust";
-  if (/^#?3b82f6|^#?2563eb/.test(lowered)) return "Clarity and digital confidence";
-  if (/^#?10b981|^#?059669|^#?0d9488|^#?0f766e/.test(lowered)) return "Freshness and growth";
-  if (/^#?f59e0b|^#?f97316|^#?fdba74/.test(lowered)) return "Energy and warmth";
-  if (/^#?ec4899|^#?db2777/.test(lowered)) return "Emotion and lifestyle expression";
-  return "";
+  return "Website color candidate extracted from CSS/meta; verify before treating as a brand color.";
 }
 
-function colorName(hex: string): string {
+function colorName(hex: string, index = 0): string {
   const h = hex.replace("#", "").toLowerCase();
   if (h.length === 6) {
     const r = parseInt(h.slice(0, 2), 16);
     const g = parseInt(h.slice(2, 4), 16);
     const b = parseInt(h.slice(4, 6), 16);
-    if (g > 110 && r < 100 && b < 120 && g > r) return "Ocean green";
-    if (r > 200 && g > 150 && b < 200) return "Peach coral";
-    if (r < 32 && g < 32 && b < 32) return "Ink black";
-    if (r > 245 && g > 245 && b > 238) return "Warm white";
+    if (r < 32 && g < 32 && b < 32) return "Dark neutral";
+    if (r > 245 && g > 245 && b > 238) return "Light neutral";
   }
-  const lowered = hex.toLowerCase();
-  if (/^#?0f172a|^#?111827|^#?1f2937/.test(lowered)) return "Deep navy";
-  if (/^#?3b82f6|^#?2563eb/.test(lowered)) return "Clear blue";
-  if (/^#?10b981|^#?059669|^#?0d9488|^#?0f766e|^#?14b8a6/.test(lowered)) return "Ocean green";
-  if (/^#?f59e0b|^#?f97316/.test(lowered)) return "Warm amber";
-  if (/^#?fdba74|^#?fb7185/.test(lowered)) return "Peach coral";
-  if (/^#?ec4899|^#?db2777/.test(lowered)) return "Expressive pink";
-  return "Brand color";
+  return `Extracted color ${index + 1}`;
 }
 
 function clampScore(value: number): number {
@@ -603,7 +764,7 @@ function buildConfidenceScores(input: {
   return { overall, voice, audience, positioning, visualIdentity };
 }
 
-function createEmptyBusinessDna(): BusinessDna {
+export function createEmptyBusinessDna(): BusinessDna {
   return {
     purpose: "",
     mission: "",
@@ -719,6 +880,7 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   name: string;
   websiteUrl: string;
   instagramHandle: string;
+  structuredInstagram?: StructuredInstagramInput | null;
   oneLineDescription?: string | null;
   /** Manual operator notes; merged with highest priority for prompts and platform signals. */
   instagramSummaryNotes?: string | null;
@@ -727,6 +889,9 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   mcpData?: Record<string, unknown> | null;
   sowSections?: { understandingOfRequirements?: string; scopeOfWork?: string } | null;
   skipInstagramFetch?: boolean;
+  instagramFetchBudgetMs?: number;
+  diagnostic?: (event: BusinessDnaDiagnosticEvent) => void;
+  abortSignal?: AbortSignal;
 }): Promise<BusinessDna> {
   const base = createEmptyBusinessDna();
   const fieldSources: Record<string, string[]> = {};
@@ -746,6 +911,10 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   const instagramToolResult = pickMcpToolPayload(params.mcpData, ["instagram", "social"]);
   const directWebsiteMcp = parseWebsiteMcpData(websiteToolResult, params.websiteUrl);
   const directInstagramMcp = parseInstagramMcpData(instagramToolResult, params.instagramHandle);
+  const structuredInstagramSignals = mapStructuredInstagramToSignals(
+    params.structuredInstagram,
+    params.instagramHandle,
+  );
   console.info(
     `[instagram-mcp-raw] present=${instagramToolResult != null} keys=${
       asRecord(instagramToolResult) ? Object.keys(asRecord(instagramToolResult) ?? {}).join(",") : "(non-object)"
@@ -755,38 +924,101 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   const url = params.websiteUrl?.trim();
   let fetchedWebsite: WebsiteSignalSummary | null = null;
   let websiteData: string | null = null;
-  console.log("Step 1: Starting website scrape...");
   if (url && /^https?:\/\//i.test(url)) {
+    emitDiagnostic(params.diagnostic, {
+      step: "website_fetch",
+      phase: "start",
+      detail: { urlHost: safeUrlHostname(url) },
+    });
     try {
+      throwIfAborted(params.abortSignal);
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12_000);
-      const response = await fetch(url, {
-        headers: { "User-Agent": UA },
-        signal: controller.signal,
-        redirect: "follow",
-      });
-      clearTimeout(timeout);
-      if (response.ok) {
-        websiteData = await response.text();
-        fetchedWebsite = extractWebsiteSignals(websiteData, url, params.name);
-      } else {
-        base.mcp.website = { ok: false, error: `HTTP ${response.status}` };
+      const timeout = setTimeout(() => controller.abort(), WEBSITE_FETCH_TIMEOUT_MS);
+      try {
+        const combinedSignal = combineAbortSignals(controller.signal, params.abortSignal);
+        const response = await fetch(url, {
+          headers: { "User-Agent": UA },
+          signal: combinedSignal,
+          redirect: "follow",
+        });
+        if (response.ok) {
+          websiteData = await readResponseTextWithAbort(response, combinedSignal);
+          throwIfAborted(params.abortSignal);
+          emitDiagnostic(params.diagnostic, {
+            step: "website_fetch",
+            phase: "end",
+            detail: { ok: true, status: response.status, bytes: websiteData.length },
+          });
+          emitDiagnostic(params.diagnostic, {
+            step: "website_parse",
+            phase: "start",
+            detail: { bytes: websiteData.length },
+          });
+          fetchedWebsite = extractWebsiteSignals(websiteData, url, params.name);
+          emitDiagnostic(params.diagnostic, {
+            step: "website_parse",
+            phase: "end",
+            detail: {
+              titlePresent: Boolean(fetchedWebsite.title),
+              metaPresent: Boolean(fetchedWebsite.metaDescription),
+              trustElements: fetchedWebsite.trustElements.length,
+              conversionElements: fetchedWebsite.conversionElements.length,
+            },
+          });
+        } else {
+          base.mcp.website = { ok: false, error: `HTTP ${response.status}` };
+          emitDiagnostic(params.diagnostic, {
+            step: "website_fetch",
+            phase: "end",
+            detail: { ok: false, status: response.status },
+          });
+          emitDiagnostic(params.diagnostic, {
+            step: "website_parse",
+            phase: "end",
+            detail: { skipped: true, reason: "non_ok_response" },
+          });
+        }
+      } finally {
+        clearTimeout(timeout);
       }
     } catch (error) {
-      base.mcp.website = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      if (isAbortError(error) || params.abortSignal?.aborted) {
+        throw createAbortError(params.abortSignal?.reason ?? error);
+      }
+      const message = errorMessage(error);
+      base.mcp.website = { ok: false, error: message };
+      emitDiagnostic(params.diagnostic, {
+        step: "website_fetch",
+        phase: "error",
+        detail: { message },
+      });
+      emitDiagnostic(params.diagnostic, {
+        step: "website_parse",
+        phase: "end",
+        detail: { skipped: true, reason: "fetch_error" },
+      });
     }
   } else {
     base.mcp.website = { ok: false, error: "Invalid website URL" };
+    emitDiagnostic(params.diagnostic, {
+      step: "website_fetch",
+      phase: "end",
+      detail: { skipped: true, reason: url ? "invalid_website_url" : "missing_website_url" },
+    });
+    emitDiagnostic(params.diagnostic, {
+      step: "website_parse",
+      phase: "end",
+      detail: { skipped: true, reason: url ? "invalid_website_url" : "missing_website_url" },
+    });
   }
-  console.log("Website scrape result:", websiteData?.length || "EMPTY/FAILED");
 
   const websiteSignals = directWebsiteMcp ?? fetchedWebsite;
 
   let fetchedIg: InstagramSignalSummary | null = null;
-  console.log("Step 2: Starting Instagram scrape...");
   /** When public fetch can’t build `fetchedIg`, preserve messaging for `mcp.instagram`. */
   let instagramFetchNote: string | undefined;
   let instagramFetchSource: string | undefined;
+  let instagramFetchTimedOut = false;
   const siteNormSet = new Set<string>();
   if (websiteSignals) {
     for (const chunk of [
@@ -798,13 +1030,76 @@ export async function buildBusinessDnaFromPublicSignals(params: {
       if (n.length > 12) siteNormSet.add(n);
     }
   }
-  if (!directInstagramMcp && params.instagramHandle?.trim() && !params.skipInstagramFetch) {
+  if (!structuredInstagramSignals && !directInstagramMcp && params.instagramHandle?.trim() && !params.skipInstagramFetch) {
+    emitDiagnostic(params.diagnostic, {
+      step: "instagram_fetch",
+      phase: "start",
+      detail: { handle: params.instagramHandle.replace(/^@/, "").trim() },
+    });
     try {
-      const pack = await withStepTimeout(
-        fetchPublicInstagramByHandle(params.instagramHandle),
-        15_000,
-        `instagram scrape ${params.instagramHandle}`,
+      throwIfAborted(params.abortSignal);
+      const instagramBudgetMs = Math.max(1, params.instagramFetchBudgetMs ?? INSTAGRAM_FETCH_TIMEOUT_MS);
+      const instagramBudgetController = new AbortController();
+      const instagramSignal = combineAbortSignals(params.abortSignal, instagramBudgetController.signal);
+      const packPromise = fetchPublicInstagramByHandle(params.instagramHandle, {
+        signal: instagramSignal,
+      });
+      const packOutcomePromise: Promise<
+        { type: "result"; pack: Awaited<ReturnType<typeof fetchPublicInstagramByHandle>> } | { type: "error"; error: unknown }
+      > = packPromise.then(
+        (pack) => ({ type: "result", pack }),
+        (error: unknown) => ({ type: "error", error }),
       );
+      let budgetTimer: ReturnType<typeof setTimeout> | null = null;
+      const packResult: { type: "result"; pack: Awaited<ReturnType<typeof fetchPublicInstagramByHandle>> } | { type: "error"; error: unknown } | { type: "timeout" } =
+        await Promise.race([
+        packOutcomePromise,
+        new Promise<{ type: "timeout" }>((resolve) => {
+          budgetTimer = setTimeout(() => {
+            instagramBudgetController.abort(INSTAGRAM_BUDGET_TIMEOUT_REASON);
+            resolve({ type: "timeout" });
+          }, instagramBudgetMs);
+        }),
+      ]);
+      if (budgetTimer) clearTimeout(budgetTimer);
+      throwIfAborted(params.abortSignal);
+      if (packResult.type === "timeout") {
+        instagramFetchTimedOut = true;
+        instagramFetchSource = "timed-out";
+        instagramFetchNote =
+          "Instagram public fetch exceeded the rebuild budget, so we continued with website and SOW signals.";
+        emitDiagnostic(params.diagnostic, {
+          step: "instagram_fetch",
+          phase: "end",
+          detail: { ok: false, timedOut: true, budgetMs: instagramBudgetMs },
+        });
+        emitDiagnostic(params.diagnostic, {
+          step: "instagram_parse",
+          phase: "end",
+          detail: { skipped: true, reason: "instagram_fetch_timed_out", budgetMs: instagramBudgetMs },
+        });
+        void packPromise.catch(() => {});
+      } else {
+        if (packResult.type === "error") {
+          throw packResult.error;
+        }
+        const pack = packResult.pack;
+      emitDiagnostic(params.diagnostic, {
+        step: "instagram_fetch",
+        phase: "end",
+        detail: {
+          ok: Boolean(pack),
+          blocked: Boolean(pack?.blocked),
+          bioPresent: Boolean(pack?.bio),
+          captionCount: pack?.last_n_caption_snippets?.length ?? 0,
+          followerPresent: Boolean(pack?.followers),
+        },
+      });
+      emitDiagnostic(params.diagnostic, {
+        step: "instagram_parse",
+        phase: "start",
+        detail: { hasPack: Boolean(pack) },
+      });
       if (pack?.blocked && !pack.bio && !(pack.last_n_caption_snippets?.length)) {
         instagramFetchNote =
           "We couldn’t read the public profile (login wall or restrictions). Add a paste-in bio in onboarding or use MCP from a connected workspace.";
@@ -813,9 +1108,10 @@ export async function buildBusinessDnaFromPublicSignals(params: {
         const h = params.instagramHandle.replace(/^@/, "").trim();
         const bioList = pack.bio ? [pack.bio] : [];
         const bioSignals = bioList.filter((b) => !siteNormSet.has(normalizeForDedupe(b)));
-        const captions = (pack.last_n_caption_snippets ?? []).filter(
-          (c) => !siteNormSet.has(normalizeForDedupe(c)) && !siteNormSet.has(normalizeForDedupe(c.slice(0, 100))),
-        );
+          const captions = (pack.last_n_caption_snippets ?? []).filter(
+            (c: string) =>
+              !siteNormSet.has(normalizeForDedupe(c)) && !siteNormSet.has(normalizeForDedupe(c.slice(0, 100))),
+          );
         fetchedIg = {
           handle: h,
           bioSignals,
@@ -835,7 +1131,23 @@ export async function buildBusinessDnaFromPublicSignals(params: {
           `[instagram-fetch] unavailable handle=${params.instagramHandle} reason=no_public_html_or_oembed_data`,
         );
       }
+      emitDiagnostic(params.diagnostic, {
+        step: "instagram_parse",
+        phase: "end",
+        detail: {
+          extracted: Boolean(fetchedIg),
+          bioSignals: fetchedIg?.bioSignals.length ?? 0,
+          contentPatterns: fetchedIg?.contentPatterns.length ?? 0,
+          engagementSignals: fetchedIg?.engagementSignals.length ?? 0,
+          note: instagramFetchNote ?? null,
+        },
+      });
+      }
     } catch (error) {
+      if (isAbortError(error) || params.abortSignal?.aborted) {
+        throw createAbortError(params.abortSignal?.reason ?? error);
+      }
+      const message = errorMessage(error);
       console.warn(
         `[instagram-fetch] failed handle=${params.instagramHandle} reason=${
           error instanceof Error ? `${error.name}:${error.message}` : String(error)
@@ -844,19 +1156,45 @@ export async function buildBusinessDnaFromPublicSignals(params: {
       instagramFetchNote =
         "We couldn’t read the public profile; add a paste-in bio or use MCP from a connected workspace.";
       instagramFetchSource = "public-html";
+      emitDiagnostic(params.diagnostic, {
+        step: "instagram_fetch",
+        phase: "error",
+        detail: { message },
+      });
+      emitDiagnostic(params.diagnostic, {
+        step: "instagram_parse",
+        phase: "end",
+        detail: { skipped: true, reason: "fetch_error" },
+      });
     }
   } else if (params.skipInstagramFetch) {
-    instagramFetchNote = "Background Instagram scrape skipped to keep automatic Business DNA generation responsive.";
+    instagramFetchNote = "Live Instagram fetch was skipped for this rebuild to keep Business DNA generation responsive.";
     instagramFetchSource = "skipped-background";
+    emitDiagnostic(params.diagnostic, {
+      step: "instagram_fetch",
+      phase: "end",
+      detail: { skipped: true, reason: "skip_instagram_fetch" },
+    });
+    emitDiagnostic(params.diagnostic, {
+      step: "instagram_parse",
+      phase: "end",
+      detail: { skipped: true, reason: "skip_instagram_fetch" },
+    });
+  } else {
+    emitDiagnostic(params.diagnostic, {
+      step: "instagram_fetch",
+      phase: "end",
+      detail: { skipped: true, reason: directInstagramMcp ? "mcp_data_present" : "missing_instagram_handle" },
+    });
+    emitDiagnostic(params.diagnostic, {
+      step: "instagram_parse",
+      phase: "end",
+      detail: { skipped: true, reason: directInstagramMcp ? "mcp_data_present" : "missing_instagram_handle" },
+    });
   }
-  const instagramDataLength =
-    (fetchedIg?.bioSignals.join(" ").length ?? 0) +
-    (fetchedIg?.contentPatterns.join(" ").length ?? 0) +
-    (fetchedIg?.engagementSignals.join(" ").length ?? 0);
-  console.log("Instagram scrape result:", instagramDataLength || "EMPTY/FAILED");
-  const instagramSignals = directInstagramMcp ?? fetchedIg;
+  const instagramSignals = structuredInstagramSignals ?? directInstagramMcp ?? fetchedIg;
   console.info(
-    `[instagram-merge] direct=${!!directInstagramMcp} fetched=${!!fetchedIg} final=${!!instagramSignals} bio=${instagramSignals?.bioSignals.length ?? 0} content=${instagramSignals?.contentPatterns.length ?? 0} engagement=${instagramSignals?.engagementSignals.length ?? 0}`,
+    `[instagram-merge] structured=${!!structuredInstagramSignals} direct=${!!directInstagramMcp} fetched=${!!fetchedIg} final=${!!instagramSignals} bio=${instagramSignals?.bioSignals.length ?? 0} content=${instagramSignals?.contentPatterns.length ?? 0} engagement=${instagramSignals?.engagementSignals.length ?? 0}`,
   );
 
   const uor = typeof params.sowSections?.understandingOfRequirements === "string" ? params.sowSections.understandingOfRequirements.trim() : "";
@@ -888,6 +1226,7 @@ export async function buildBusinessDnaFromPublicSignals(params: {
 
   if (params.oneLineDescription?.trim()) appendUnique(attribution.fromOnboarding, "oneLineDescription");
   if (params.instagramHandle?.trim()) appendUnique(attribution.fromOnboarding, "instagramHandle");
+  if (structuredInstagramSignals) appendUnique(attribution.fromOnboarding, "instagram.structured");
   if (websiteSignals?.metaDescription) appendUnique(attribution.fromWebsite, "website.metaDescription");
   if (websiteSignals?.heroExcerpt) appendUnique(attribution.fromWebsite, "website.heroExcerpt");
   if (websiteSignals?.title) appendUnique(attribution.fromWebsite, "website.title");
@@ -895,6 +1234,17 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   if ((instagramSignals?.bioSignals.length ?? 0) > 0) appendUnique(attribution.fromInstagram, "instagram.bioSignals");
   if ((instagramSignals?.contentPatterns.length ?? 0) > 0)
     appendUnique(attribution.fromInstagram, "instagram.contentPatterns");
+
+  emitDiagnostic(params.diagnostic, {
+    step: "dna_assemble",
+    phase: "start",
+    detail: {
+      websiteSignals: Boolean(websiteSignals),
+      instagramSignals: Boolean(instagramSignals),
+      descriptionPresent: Boolean(params.oneLineDescription?.trim()),
+      sowPresent: Boolean(params.sowSections?.understandingOfRequirements || params.sowSections?.scopeOfWork),
+    },
+  });
 
   const sowUorFromLabel = uor.length > 0 ? pickLabeledPurposeLineFromUnderstanding(uor) : "";
   const sowUorHead =
@@ -908,10 +1258,10 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     websiteSignals?.metaDescription,
   );
   base.mission = firstNonEmpty(
-    sowScopeHead,
     enriched.positioning,
     websiteSignals?.heroExcerpt,
     params.oneLineDescription,
+    sowScopeHead,
   );
   const visionCandidate = firstNonEmpty(
     stringOrEmpty(websiteSignals?.heroExcerpt),
@@ -1028,24 +1378,30 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     : [];
   base.positioning.marketAngle = firstNonEmpty(websiteSignals?.heroExcerpt, params.oneLineDescription);
   base.positioning.reasonToBelieve = uniqueStrings([
-    ...websiteSignals?.trustElements ?? [],
-    /\btestimonial/.test(websiteSignals?.html?.toLowerCase() ?? "") ? "Testimonials present on site" : "",
+    ...(websiteSignals?.trustElements ?? []).filter(
+      (entry) => !/testimonial|case stud|review|trusted by/i.test(entry),
+    ),
+    ...(params.structuredInstagram?.proofSignals ?? []),
   ]);
 
   base.offers.primaryOffers = uniqueStrings([stringOrEmpty(enriched.offer), params.oneLineDescription]);
-  base.offers.pricingSignals = splitSignals(enriched.price_range).filter(
-    (s) => !/^\$[\d,]+/.test(s),
-  );
+  const explicitPriceRange = stringOrEmpty(enriched.price_range);
+  base.offers.pricingSignals =
+    /\b(price|pricing|package|retainer|starting at|from|per month|per project|usd|inr|aud|gbp)\b|[$₹£€]/i.test(
+      explicitPriceRange,
+    )
+      ? splitSignals(explicitPriceRange).filter((s) => !/^\$[\d,]+/.test(s))
+      : [];
   base.offers.transformationPromise = firstNonEmpty(description, enriched.offer);
-  base.offers.urgencyStyle = websiteSignals?.conversionElements?.some(
-    (c) => /book|consult|now|limited/i.test(c),
+  base.offers.urgencyStyle = /\blimited time|offer ends|spots are limited|exclusive offer|discount|promo\b/i.test(
+    websiteSignals?.html ?? "",
   )
     ? "Limited-time availability framing"
     : "";
 
   base.contentStrategy.contentPillars = uniqueStrings([
+    ...(params.structuredInstagram?.recurringTopics ?? []),
     ...splitSignals((params.existing as Record<string, unknown> | null | undefined)?.content_patterns),
-    ...instagramSignals?.contentPatterns ?? [],
     /\bproof|testimonial/.test(fullText.toLowerCase()) ? "Proof and case-backed content" : "",
     /\beducation|explain|how-to/.test(fullText.toLowerCase()) ? "Educational content" : "",
   ]).slice(0, 6);
@@ -1055,16 +1411,24 @@ export async function buildBusinessDnaFromPublicSignals(params: {
       .map((l) => l.replace(/^[-•*]\s*/, "").trim())
       .filter((l) => l.length > 10 && l.length < 200),
   ).slice(0, 4);
+  const sparseFallbackSnippets = toFallbackSnippets(
+    manualIgNotes,
+    params.sowSections?.understandingOfRequirements,
+    params.sowSections?.scopeOfWork,
+    params.oneLineDescription,
+    websiteSignals?.heroExcerpt,
+    websiteSignals?.metaDescription,
+  );
   base.contentStrategy.themes = dedupeStringsByNorm([
     ...sowThemeLines,
     ...(websiteSignals?.messagingPatterns ?? []),
+    ...(params.structuredInstagram?.recurringTopics ?? []),
     ...(manualIgNotes ? [manualIgNotes] : []),
-    ...(instagramSignals?.bioSignals ?? []),
   ]).slice(0, 6);
   base.contentStrategy.hooksThatFitBrand = uniqueStrings([
-    base.targetAudience.pains[0] ? `Start from pain: ${base.targetAudience.pains[0]}` : "",
-    base.targetAudience.desires[0] ? `Promise desire: ${base.targetAudience.desires[0]}` : "",
-    base.positioning.differentiators[0] ? `Lead with differentiator: ${base.positioning.differentiators[0]}` : "",
+    base.targetAudience.pains[0] ? `When ${lowerFirst(base.targetAudience.pains[0])}, choose a brand that leads with clarity.` : "",
+    base.targetAudience.desires[0] ? `For audiences chasing ${lowerFirst(base.targetAudience.desires[0])}, show the simplest next step.` : "",
+    base.positioning.differentiators[0] ? `Why this brand stands out: ${base.positioning.differentiators[0]}.` : "",
   ]);
   base.contentStrategy.topicsToAvoid = uniqueStrings([
     base.toneOfVoice.donts[0] ?? "",
@@ -1072,16 +1436,34 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   base.contentStrategy.trustSignalsToRepeat = uniqueStrings([
     ...websiteSignals?.trustElements ?? [],
     ...base.positioning.reasonToBelieve,
+    ...(params.structuredInstagram?.proofSignals ?? []),
   ]);
+  if (base.targetAudience.pains.length === 0 && sparseFallbackSnippets[0]) {
+    base.targetAudience.pains = [sparseFallbackSnippets[0]];
+  }
+  if (base.targetAudience.desires.length === 0 && sparseFallbackSnippets[1]) {
+    base.targetAudience.desires = [sparseFallbackSnippets[1]];
+  } else if (base.targetAudience.desires.length === 0 && sparseFallbackSnippets[0]) {
+    base.targetAudience.desires = [sparseFallbackSnippets[0]];
+  }
+  if (base.contentStrategy.themes.length === 0) {
+    base.contentStrategy.themes = sparseFallbackSnippets.slice(0, 3);
+  }
+  if (base.contentStrategy.hooksThatFitBrand.length === 0) {
+    base.contentStrategy.hooksThatFitBrand = uniqueStrings([
+      base.targetAudience.pains[0] ? `Lead with audience tension: ${base.targetAudience.pains[0]}` : "",
+      base.targetAudience.desires[0] ? `Lead with audience goal: ${base.targetAudience.desires[0]}` : "",
+      base.contentStrategy.themes[0] ? `Lead with SOW theme: ${base.contentStrategy.themes[0]}` : "",
+    ]);
+  }
 
-  base.visualIdentity.colors = (websiteSignals?.colors ?? []).map((hex) => ({
-    name: colorName(hex),
+  base.visualIdentity.colors = (websiteSignals?.colors ?? []).map((hex, index) => ({
+    name: colorName(hex, index),
     hex,
     meaning: colorMeaning(hex),
   }));
   base.visualIdentity.typography = {
     primary: firstNonEmpty(
-      stringOrEmpty((params.existing as Record<string, unknown> | null | undefined)?.visual_identity && asRecord((params.existing as Record<string, unknown>).visual_identity)?.fonts && (asRecord((params.existing as Record<string, unknown>).visual_identity)?.fonts as string[] | undefined)?.[0]),
       "system / unknown",
     ),
     secondary: "",
@@ -1091,7 +1473,7 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   };
   base.visualIdentity.imageryStyle = uniqueStrings([
     ...instagramSignals?.visualPatterns ?? [],
-    base.visualIdentity.colors.length > 0 ? "Brand-consistent color-led imagery" : "",
+    base.visualIdentity.colors.length > 0 ? "Website color-candidate imagery direction" : "",
   ]);
   base.visualIdentity.designMotifs = uniqueStrings([
     websiteSignals?.heroExcerpt ? "Homepage hero-led layout" : "",
@@ -1103,6 +1485,16 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     : websiteSignals?.messagingPatterns.length
       ? "Message-led layout"
       : "";
+  base.visualIdentity.paletteSource =
+    base.visualIdentity.colors.length > 0
+      ? {
+          classification: "extracted",
+          detail: "Extracted from website CSS/meta color literals. May include theme, utility, or layout colors.",
+        }
+      : {
+          classification: "missing",
+          detail: "No reliable palette was detected from the public website markup.",
+        };
 
   base.platformSignals.website = {
     pagesAnalyzed: websiteSignals?.pagesAnalyzed ?? [],
@@ -1120,6 +1512,41 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     contentPatterns: instagramSignals?.contentPatterns ?? [],
     visualPatterns: instagramSignals?.visualPatterns ?? [],
     engagementSignals: instagramSignals?.engagementSignals ?? [],
+    status: {
+      handleAttached: Boolean(params.instagramHandle?.trim()),
+      sourceReached: Boolean(
+        directInstagramMcp ||
+          fetchedIg ||
+          instagramFetchSource === "oembed-embed" ||
+          instagramFetchSource === "public-profile-fetch",
+      ),
+      signalsExtracted: mergedIgBios.length > 0 ||
+        (instagramSignals?.contentPatterns.length ?? 0) > 0 ||
+        (instagramSignals?.visualPatterns.length ?? 0) > 0 ||
+        (instagramSignals?.engagementSignals.length ?? 0) > 0,
+      classification:
+        instagramFetchTimedOut
+          ? "fallback"
+          : mergedIgBios.length > 0 ||
+        (instagramSignals?.contentPatterns.length ?? 0) > 0 ||
+        (instagramSignals?.visualPatterns.length ?? 0) > 0 ||
+        (instagramSignals?.engagementSignals.length ?? 0) > 0
+          ? "extracted"
+          : params.instagramHandle?.trim()
+            ? "missing"
+            : "missing",
+      detail:
+        instagramFetchTimedOut
+          ? instagramFetchNote || "Instagram public fetch timed out for this rebuild."
+          : mergedIgBios.length > 0 ||
+        (instagramSignals?.contentPatterns.length ?? 0) > 0 ||
+        (instagramSignals?.visualPatterns.length ?? 0) > 0 ||
+        (instagramSignals?.engagementSignals.length ?? 0) > 0
+          ? "Usable Instagram bio or content signals were extracted."
+          : params.skipInstagramFetch
+            ? "Instagram handle is attached, but automatic extraction was intentionally skipped for this run."
+            : instagramFetchNote || "No usable Instagram signals were found for this handle.",
+    },
   };
 
   const loweredHtml = websiteSignals?.html?.toLowerCase() ?? "";
@@ -1182,7 +1609,7 @@ export async function buildBusinessDnaFromPublicSignals(params: {
   if (base.targetAudience.segments.length === 0) {
     base.targetAudience.segments = uniqueStrings([
       stringOrEmpty(asRecord(enriched.target_audience)?.who),
-      params.name ? `Shoppers and fans aligned with ${params.name}` : "",
+      params.name ? `People already looking for ${params.name}'s category of support` : "",
     ]);
   }
 
@@ -1248,6 +1675,17 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     visualStrength,
   });
   base.updatedAt = new Date().toISOString();
+  emitDiagnostic(params.diagnostic, {
+    step: "dna_assemble",
+    phase: "end",
+    detail: {
+      purposePresent: Boolean(base.purpose),
+      missionPresent: Boolean(base.mission),
+      websiteMessages: base.platformSignals.website.messagingPatterns.length,
+      instagramBioSignals: base.platformSignals.instagram.bioSignals.length,
+      confidenceOverall: base.confidenceScores.overall,
+    },
+  });
 
   base.visual_identity = {
     colors: base.visualIdentity.colors.map((color) => color.hex),
@@ -1275,6 +1713,14 @@ export async function buildBusinessDnaFromPublicSignals(params: {
                 : "enriched",
           ...(instagramFetchNote ? { note: instagramFetchNote } : {}),
         }
+      : instagramFetchTimedOut
+        ? {
+            ok: false,
+            source: "timed-out",
+            error: "Instagram signals timed out",
+            note: "Instagram fetch timed out for this rebuild, so the artifact was assembled from website and SOW signals.",
+            detail: instagramFetchNote,
+          }
       : instagramFetchNote
         ? {
             ok: false,
@@ -1295,6 +1741,21 @@ export async function buildBusinessDnaFromPublicSignals(params: {
     siteTitle: siteTitle,
     heroExcerpt: websiteSignals?.heroExcerpt ?? "",
     metaDescription: websiteSignals?.metaDescription ?? "",
+  };
+  base.provenanceSummary = {
+    websiteSignals: websiteSignals ? "extracted" : "missing",
+    instagramSignals:
+      instagramFetchTimedOut
+        ? "fallback"
+        : mergedIgBios.length > 0 ||
+      (instagramSignals?.contentPatterns.length ?? 0) > 0 ||
+      (instagramSignals?.visualPatterns.length ?? 0) > 0 ||
+      (instagramSignals?.engagementSignals.length ?? 0) > 0
+        ? "extracted"
+        : params.instagramHandle?.trim()
+          ? "missing"
+          : "missing",
+    palette: base.visualIdentity.colors.length > 0 ? "extracted" : "missing",
   };
 
   if (params.existing) {

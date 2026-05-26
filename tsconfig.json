@@ -5,6 +5,8 @@
   "references": [
     { "path": "./lib/db" },
     { "path": "./lib/api-client-react" },
-    { "path": "./lib/api-zod" }
+    { "path": "./lib/api-zod" },
+    { "path": "./lib/research-brief" },
+    { "path": "./lib/research-brief" }
   ]
 }

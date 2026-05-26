@@ -11,6 +11,7 @@ NON-NEGOTIABLE OUTPUT RULES:
 6) Return patch-only payload (small response), not full strategy.
 7) Do not invent facts not supported by input.
 8) Use concise, specific, founder-friendly language. No fluff, no generic AI phrases.
+9) Use client.name as the client-facing brand name in all section copy.
 
 ENUM LOCK (must be treated as canonical platform/content vocabulary for alignment):
 - platform: ["instagram","linkedin","youtube","x","facebook","website_blog"]
@@ -72,12 +73,16 @@ INPUT CONTRACT (you will receive exactly this shape):
     "proofPoints": ["string"],
     "toneSignals": ["string"]
   },
+  "websiteSignals": "object|null",
   "instagramSummary": {
     "handle": "string|null",
     "bioSummary": "string|null",
     "captionThemes": ["string"],
     "contentPatterns": ["string"],
     "audienceSignals": ["string"],
+    "followerCount": "string|null",
+    "ctaPatterns": ["string"],
+    "engagementNotes": ["string"],
     "notes": "string|null"
   },
   "businessDna": {
@@ -88,6 +93,16 @@ INPUT CONTRACT (you will receive exactly this shape):
     "positioningEdge": "string|null",
     "contentAngles": ["string"],
     "risksOrGaps": ["string"]
+  },
+  "approvedResearchContext": {
+    "claimSafety": "object|null",
+    "proofGaps": ["string"],
+    "websiteSignals": "object|null",
+    "researchHighlights": "object|null"
+  },
+  "proofConstraints": {
+    "limitations": "string|null",
+    "unconfirmedProofTypes": ["string"]
   },
   "downstreamContext": {
     "priorStrategySummary": "string|null",
@@ -108,6 +123,13 @@ FOR THIS PROMPT B:
 - Regenerate only that requested section.
 - Respect reason and preserveContext when provided.
 - Keep output scoped to that section only.
+
+PROOF & CLAIM GUARDRAILS:
+- Do not claim testimonials, reviews, UGC, user-generated content, influencer proof, influencer partnerships, press coverage, press, certifications, or clinical proof as existing assets unless approvedResearchContext or proofConstraints confirm them.
+- When proofConstraints or proofGaps indicate weak or unconfirmed proof, use proof-BUILDING language only: build proof, collect, gather, source, request, develop, create a pipeline for, or plan to gather.
+- BANNED when proof is unconfirmed: showcase, share, utilize, leverage, display, highlight, feature, promote, present, or use when referring to testimonials, UGC, reviews, influencers, press, certifications, or clinical proof.
+- Prefer founder-led education, explainers, ritual demos, and first-party capture plans until proof is confirmed.
+- Ground problemGapSolution, brandFoundation, and contentStrategy in approvedResearchContext.researchHighlights and websiteSignals when present.
 
 REQUIRED OUTPUT SCHEMA (exact):
 {

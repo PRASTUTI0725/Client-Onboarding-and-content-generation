@@ -1,10 +1,15 @@
 import type { Request } from "express";
-import { createLLMProvider, createLLMProviderChain } from "./factory.js";
+import { createLLMProvider, createLLMProviderChainFromEntries } from "./factory.js";
 import {
+  readProviderApiKeys,
   filterProvidersWithCredentials,
+  isLocalProviderAlias,
   normalizeProvider,
+  readForceRealAI,
   readProviderId,
-  readProviderPriority,
+  readProviderChainEntries,
+  readEnvAiProviderRaw,
+  type ProviderChainEntry,
   readUseRealAI,
   hasProviderCredentials,
   type ProviderId,
@@ -30,38 +35,168 @@ export function getNoUsableAiProviderUserMessage(): string {
   return NO_USABLE_USER_MESSAGE;
 }
 
-function buildProviderChainFromIds(
-  chainIds: readonly ProviderId[],
-  overrides?: { apiKey?: string; model?: string },
-): LLMProvider {
-  const providers: LLMProvider[] = [];
-  let first = true;
-  for (const id of chainIds) {
+export type RequestedProviderSource =
+  | "explicit_header"
+  | "explicit_model_header"
+  | "explicit_api_key"
+  | "env_alias"
+  | "env_provider"
+  | "default";
+
+export type ProviderResolutionDiagnostics = {
+  requestedProvider: ProviderId;
+  requestedProviderSource: RequestedProviderSource;
+  forceReal: boolean;
+  configuredProviderChain: Array<{ provider: string; model: string; keySlots?: number }>;
+  eligibleProviders: Array<{ provider: string; model: string; keySlots?: number }>;
+  requestedProviderIncludedInChain: boolean;
+  requestedProviderExclusionReason: string | null;
+  skippedNoCredentials: ProviderId[];
+  skippedProviders: Array<{ provider: string; reason: string }>;
+};
+
+function describeProviderChain(chainEntries: readonly ProviderChainEntry[]): Array<{ provider: string; model: string; keySlots?: number }> {
+  return chainEntries.flatMap((entry) => {
     try {
-      providers.push(
-        createLLMProvider(
-          id,
-          first && overrides && (overrides.apiKey || overrides.model)
-            ? {
-                ...(overrides.apiKey ? { apiKey: overrides.apiKey } : {}),
-                ...(overrides.model ? { model: overrides.model } : {}),
-              }
-            : undefined,
-        ),
-      );
-      first = false;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[llm.resolve] skip provider id=${id} reason=${msg}`);
+      const provider = createLLMProvider(entry.provider, entry.model ? { model: entry.model } : undefined);
+      const info = provider.describe?.() ?? { provider: provider.id, model: entry.model ?? "default" };
+      return [{ provider: info.provider, model: entry.model ?? info.model, keySlots: Math.max(readProviderApiKeys(entry.provider).length, 1) }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function resolveRequestedProviderSource(
+  headerRaw: string | undefined,
+  apiKeyHeader: string | undefined,
+  modelHeader: string | undefined,
+): RequestedProviderSource {
+  if (headerRaw) return "explicit_header";
+  if (apiKeyHeader) return "explicit_api_key";
+  if (modelHeader) return "explicit_model_header";
+  const rawEnv = readEnvAiProviderRaw();
+  if (!rawEnv) return "default";
+  return isLocalProviderAlias(rawEnv) ? "env_alias" : "env_provider";
+}
+
+function computeProviderResolution(
+  input?: { headerRaw?: string; apiKeyHeader?: string; modelHeader?: string },
+): {
+  requested: ProviderId;
+  requestedSource: RequestedProviderSource;
+  chainEntries: ProviderChainEntry[];
+  skippedNoCreds: ProviderId[];
+  requestedProviderIncludedInChain: boolean;
+  requestedProviderExclusionReason: string | null;
+} {
+  const headerRaw = input?.headerRaw?.trim();
+  const apiKeyHeader = input?.apiKeyHeader?.trim();
+  const modelHeader = input?.modelHeader?.trim();
+  const hasExplicit = Boolean(headerRaw || apiKeyHeader || modelHeader);
+
+  let requested: ProviderId;
+  try {
+    requested = headerRaw ? normalizeProvider(headerRaw) : readProviderId();
+  } catch {
+    requested = "groq";
+  }
+
+  const requestedSource = resolveRequestedProviderSource(headerRaw, apiKeyHeader, modelHeader);
+  const priorityEntries = readProviderChainEntries();
+  const priorityAll = priorityEntries.map((entry) => entry.provider);
+  const skippedNoCreds = priorityAll.filter((id) => !hasProviderCredentials(id));
+  const usablePriority = filterProvidersWithCredentials(priorityAll);
+
+  const chainEntries: ProviderChainEntry[] = [];
+  if (hasExplicit) {
+    if (apiKeyHeader || hasProviderCredentials(requested)) {
+      chainEntries.push({ provider: requested, ...(modelHeader ? { model: modelHeader } : {}) });
+    }
+    for (const entry of priorityEntries) {
+      if (!usablePriority.includes(entry.provider)) continue;
+      if (!chainEntries.some((item) => item.provider === entry.provider && item.model === entry.model)) {
+        chainEntries.push(entry);
+      }
+    }
+  } else {
+    if (hasProviderCredentials(requested)) {
+      chainEntries.push({ provider: requested });
+    }
+    for (const entry of priorityEntries) {
+      if (!usablePriority.includes(entry.provider)) continue;
+      if (!chainEntries.some((item) => item.provider === entry.provider && item.model === entry.model)) {
+        chainEntries.push(entry);
+      }
     }
   }
-  if (providers.length === 0) {
+
+  const requestedProviderIncludedInChain = chainEntries.some((entry) => entry.provider === requested);
+  let requestedProviderExclusionReason: string | null = null;
+  if (!requestedProviderIncludedInChain) {
+    requestedProviderExclusionReason = hasProviderCredentials(requested)
+      ? "configured_but_not_in_priority"
+      : "missing_credentials";
+  }
+
+  return {
+    requested,
+    requestedSource,
+    chainEntries,
+    skippedNoCreds,
+    requestedProviderIncludedInChain,
+    requestedProviderExclusionReason,
+  };
+}
+
+export function getProviderResolutionDiagnostics(): ProviderResolutionDiagnostics {
+  const resolved = computeProviderResolution();
+  return {
+    requestedProvider: resolved.requested,
+    requestedProviderSource: resolved.requestedSource,
+    forceReal: readForceRealAI(),
+    configuredProviderChain: describeProviderChain(resolved.chainEntries),
+    eligibleProviders: describeProviderChain(resolved.chainEntries.filter((entry) => hasProviderCredentials(entry.provider))),
+    requestedProviderIncludedInChain: resolved.requestedProviderIncludedInChain,
+    requestedProviderExclusionReason: resolved.requestedProviderExclusionReason,
+    skippedNoCredentials: resolved.skippedNoCreds,
+    skippedProviders: resolved.skippedNoCreds.map((provider) => ({ provider, reason: "missing_credentials" })),
+  };
+}
+
+export function getProviderResolutionDiagnosticsForRequest(req: Request): ProviderResolutionDiagnostics {
+  const resolved = computeProviderResolution({
+    headerRaw: req.header("x-ai-provider")?.trim(),
+    apiKeyHeader: req.header("x-ai-api-key")?.trim(),
+    modelHeader: req.header("x-ai-model")?.trim(),
+  });
+  return {
+    requestedProvider: resolved.requested,
+    requestedProviderSource: resolved.requestedSource,
+    forceReal: readForceRealAI(),
+    configuredProviderChain: describeProviderChain(resolved.chainEntries),
+    eligibleProviders: describeProviderChain(resolved.chainEntries.filter((entry) => hasProviderCredentials(entry.provider))),
+    requestedProviderIncludedInChain: resolved.requestedProviderIncludedInChain,
+    requestedProviderExclusionReason: resolved.requestedProviderExclusionReason,
+    skippedNoCredentials: resolved.skippedNoCreds,
+    skippedProviders: resolved.skippedNoCreds.map((provider) => ({ provider, reason: "missing_credentials" })),
+  };
+}
+
+function buildProviderChainFromIds(
+  chainEntries: readonly ProviderChainEntry[],
+  overrides?: { apiKey?: string; model?: string },
+  options?: { forceReal?: boolean },
+): LLMProvider {
+  try {
+    return createLLMProviderChainFromEntries(chainEntries, overrides, options);
+  } catch {
     throw new NoUsableAiProviderError();
   }
-  return new FallbackProvider(providers);
 }
 
 export function shouldUseRealAI(req: Request): boolean {
+  if (readForceRealAI()) return true;
   const header = req.header("x-use-real-ai")?.trim().toLowerCase();
   if (header === "true" || header === "1" || header === "yes") return true;
   if (header === "false" || header === "0" || header === "no") return false;
@@ -77,75 +212,53 @@ export function getRequestLLMProvider(req: Request): LLMProvider {
   const headerRaw = req.header("x-ai-provider")?.trim();
   const apiKeyHeader = req.header("x-ai-api-key")?.trim();
   const modelHeader = req.header("x-ai-model")?.trim();
-  const hasExplicit = Boolean(headerRaw || apiKeyHeader || modelHeader);
+  const resolved = computeProviderResolution({ headerRaw, apiKeyHeader, modelHeader });
 
-  let requested: ProviderId;
-  try {
-    requested = headerRaw ? normalizeProvider(headerRaw) : readProviderId();
-  } catch {
-    requested = "groq";
-  }
-
-  const priorityAll = readProviderPriority();
-  const skippedNoCreds: ProviderId[] = [];
-  for (const id of priorityAll) {
-    if (!hasProviderCredentials(id)) {
-      skippedNoCreds.push(id);
-    }
-  }
-  if (skippedNoCreds.length) {
+  if (resolved.skippedNoCreds.length) {
     console.info(
       `[llm.resolve] env_priority: providers with no server credentials (excluded from automatic selection): ${JSON.stringify(
-        skippedNoCreds,
+        resolved.skippedNoCreds,
       )}`,
     );
   }
 
-  const usableSet = new Set(filterProvidersWithCredentials(priorityAll));
-
-  if (hasExplicit) {
-    const chain: ProviderId[] = [];
+  if (headerRaw || apiKeyHeader || modelHeader) {
     if (apiKeyHeader) {
-      chain.push(requested);
       console.info(
-        `[llm.resolve] mode=explicit with client API key; primary=${requested} (key applies to first provider in chain)`,
+        `[llm.resolve] mode=explicit with client API key; primary=${resolved.requested} (key applies to first provider in chain)`,
       );
-    } else if (usableSet.has(requested)) {
-      chain.push(requested);
-      console.info(`[llm.resolve] mode=explicit header model=${Boolean(modelHeader)} primary=${requested}`);
+    } else if (resolved.requestedProviderIncludedInChain) {
+      console.info(`[llm.resolve] mode=explicit header model=${Boolean(modelHeader)} primary=${resolved.requested}`);
     } else {
       console.warn(
-        `[llm.resolve] x-ai-provider=${requested} has no valid server credentials and no x-ai-api-key; will use other configured providers only`,
+        `[llm.resolve] x-ai-provider=${resolved.requested} has no valid server credentials and no x-ai-api-key; will use other configured providers only`,
       );
     }
-    for (const id of priorityAll) {
-      if (!chain.includes(id) && usableSet.has(id)) {
-        chain.push(id);
-      }
-    }
-    if (chain.length === 0) {
+    if (resolved.chainEntries.length === 0) {
       throw new NoUsableAiProviderError();
     }
-    return buildProviderChainFromIds(chain, { apiKey: apiKeyHeader, model: modelHeader });
+    return buildProviderChainFromIds(
+      resolved.chainEntries,
+      { apiKey: apiKeyHeader, model: modelHeader },
+      { forceReal: readForceRealAI() },
+    );
   }
 
-  if (usableSet.has(requested)) {
-    const ordered = [requested, ...priorityAll.filter((p) => p !== requested && usableSet.has(p))];
-    console.info(`[llm.resolve] mode=default primary=${requested} chain=${JSON.stringify(ordered)}`);
-    return buildProviderChainFromIds(ordered, undefined);
+  if (resolved.requestedProviderIncludedInChain) {
+    console.info(`[llm.resolve] mode=default primary=${resolved.requested} chain=${JSON.stringify(resolved.chainEntries)}`);
+    return buildProviderChainFromIds(resolved.chainEntries, undefined, { forceReal: readForceRealAI() });
   }
 
-  const fallbackChain = filterProvidersWithCredentials(priorityAll);
-  if (fallbackChain.length === 0) {
+  if (resolved.chainEntries.length === 0) {
     console.warn(
-      `[llm.resolve] default provider=${requested} has no credentials and no other configured providers`,
+      `[llm.resolve] default provider=${resolved.requested} has no credentials and no other configured providers`,
     );
     throw new NoUsableAiProviderError();
   }
   console.warn(
-    `[llm.resolve] default provider id=${requested} not usable (no server credentials); chain=${JSON.stringify(
-      fallbackChain,
+    `[llm.resolve] default provider id=${resolved.requested} not usable (no server credentials); chain=${JSON.stringify(
+      resolved.chainEntries,
     )}`,
   );
-  return buildProviderChainFromIds(fallbackChain, undefined);
+  return buildProviderChainFromIds(resolved.chainEntries, undefined, { forceReal: readForceRealAI() });
 }

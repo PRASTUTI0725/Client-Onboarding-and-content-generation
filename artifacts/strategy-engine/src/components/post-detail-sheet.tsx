@@ -37,6 +37,7 @@ interface PostLike {
   expectedReason?: string | null;
   priority?: "high" | "medium" | "low" | string | null;
   execution?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
   comments?: Array<{ author?: string; text: string; createdAt?: string }>;
 }
 
@@ -167,7 +168,7 @@ export function PostDetailSheet({
             </div>
           </Field>
 
-          <Field label="Caption">
+          <Field label={detail.isSkeletonPlan ? "Caption direction" : "Caption"}>
             <div className="space-y-3" data-testid="post-detail-caption">
               <div className="flex flex-wrap gap-2">
                 {detail.caption.structure.map((step) => (
@@ -179,6 +180,11 @@ export function PostDetailSheet({
                   </span>
                 ))}
               </div>
+              {detail.isSkeletonPlan && (
+                <p className="text-xs text-muted-foreground">
+                  Monthly planning mode shows the post skeleton only. Final caption copy has not been generated yet.
+                </p>
+              )}
               <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
                 <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
                   {detail.caption.text}
@@ -189,13 +195,24 @@ export function PostDetailSheet({
 
           <Field label="Hashtags">
             <div className="space-y-3" data-testid="post-detail-hashtags">
-              <HashtagGroup label="Niche" tags={detail.hashtags.niche} testId="post-detail-hashtags-niche" />
-              <HashtagGroup
-                label="Problem"
-                tags={detail.hashtags.problem}
-                testId="post-detail-hashtags-problem"
-              />
-              <HashtagGroup label="Broad" tags={detail.hashtags.broad} testId="post-detail-hashtags-broad" />
+              {detail.isSkeletonPlan &&
+              detail.hashtags.niche.length === 0 &&
+              detail.hashtags.problem.length === 0 &&
+              detail.hashtags.broad.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 p-4 text-sm text-muted-foreground">
+                  Hashtags not generated yet.
+                </div>
+              ) : (
+                <>
+                  <HashtagGroup label="Niche" tags={detail.hashtags.niche} testId="post-detail-hashtags-niche" />
+                  <HashtagGroup
+                    label="Problem"
+                    tags={detail.hashtags.problem}
+                    testId="post-detail-hashtags-problem"
+                  />
+                  <HashtagGroup label="Broad" tags={detail.hashtags.broad} testId="post-detail-hashtags-broad" />
+                </>
+              )}
             </div>
           </Field>
 
@@ -283,8 +300,8 @@ export function PostDetailSheet({
                 </p>
               )}
               <p className="text-xs leading-relaxed text-muted-foreground">
-                Supports the {humanizeDisplay(post.pillar).toLowerCase()} pillar via the{" "}
-                <span className="text-foreground/80">{post.angle}</span> angle.
+                Supports the {humanizeDisplay(post.pillar).toLowerCase()} bucket via the{" "}
+                <span className="text-foreground/80">{detail.theme}</span> theme.
               </p>
             </div>
           </Field>

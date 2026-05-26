@@ -3,11 +3,15 @@
   "compilerOptions": {
     "outDir": "dist",
     "rootDir": "src",
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@workspace/research-brief": ["../../lib/research-brief/src/index.ts"]
+    }
   },
   "include": ["src"],
   "references": [
     { "path": "../../lib/db" },
-    { "path": "../../lib/api-zod" }
+    { "path": "../../lib/api-zod" },
+    { "path": "../../lib/research-brief" }
   ]
 }

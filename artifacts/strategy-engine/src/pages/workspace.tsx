@@ -45,7 +45,6 @@ import { BusinessDnaPanel } from "@/components/business-dna-panel";
 import { RuntimeModeBanner } from "@/components/runtime-mode-banner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
-  allSectionsApproved,
   CANONICAL_SECTION_LABELS,
   CANONICAL_STRATEGY_SECTIONS,
   getPendingApprovalSections,
@@ -55,7 +54,9 @@ import {
   type SectionApprovals,
   type SowLike,
 } from "@/lib/strategy-workflow";
+import { formatInstagramListPreview } from "@/lib/instagram-intake";
 import { confirmPreflightLimit, estimateBytes, estimateTokens } from "@/lib/request-preflight";
+import { formatProviderAttemptsSummary, readDnaFallbackDetails } from "@/lib/dna-fallback-details";
 
 type TemplateChoice =
   | "auto"
@@ -63,6 +64,211 @@ type TemplateChoice =
   | "performance_marketing"
   | "personal_brand"
   | "d2c_growth";
+
+const TEMPLATE_CHOICES: TemplateChoice[] = [
+  "auto",
+  "brand_building",
+  "performance_marketing",
+  "personal_brand",
+  "d2c_growth",
+];
+
+type StructuredInstagramInput = {
+  handle: string;
+  bio: string;
+  offerSummary: string;
+  recentCaptionSnippets: string[];
+  recurringTopics: string[];
+  additionalInstagramNotes?: string;
+  ctaPatterns?: string[];
+  proofSignals?: string[];
+  followerCount?: string;
+  category?: string;
+  visualStyleNotes?: string;
+};
+
+type ApprovalMeta = {
+  approved?: boolean;
+  approvedAt?: string | null;
+  approvedSnapshotId?: string | null;
+  approvalVersion?: string;
+};
+
+type ValidationMeta = {
+  status?: string;
+  note?: string;
+};
+
+type ProviderAttemptDiagnostic = {
+  provider?: string;
+  model?: string;
+  status?: string;
+  reason?: string;
+  errorClass?: string;
+  httpStatus?: number | null;
+  errorCode?: string | null;
+  attempt?: number;
+};
+
+type RunDiagnosticsMeta = {
+  useRealAI?: boolean;
+  requestedProvider?: string | null;
+  requestedModel?: string | null;
+  clientApiKeyPresent?: boolean;
+  configuredProviderChain?: Array<{ provider?: string; model?: string }>;
+  providerAttempts?: ProviderAttemptDiagnostic[];
+  repairAttempted?: boolean;
+  repairSucceeded?: boolean;
+  fallbackReason?: string | null;
+  failureStage?: string | null;
+};
+
+type LatestRunMeta = {
+  provider?: string;
+  model?: string;
+  generationMode?: string;
+  validation?: ValidationMeta;
+  timestamp?: string;
+  snapshotId?: string | null;
+  diagnostics?: RunDiagnosticsMeta;
+};
+
+type BusinessDnaMeta = {
+  stale?: boolean;
+  snapshotId?: string | null;
+  currentSnapshotId?: string | null;
+  approval?: ApprovalMeta;
+  validationStatus?: string;
+  validationIssues?: string[];
+  generationMode?: string;
+  provider?: string;
+  model?: string;
+  fallbackReason?: string;
+  generatedAt?: string;
+  latestRun?: LatestRunMeta;
+  businessType?: {
+    primary?: string;
+    confidence?: string;
+  };
+};
+
+type JtaMeta = {
+  strategySource?: string;
+  aiFailure?: { message?: string };
+  snapshotState?: string;
+  approval?: ApprovalMeta;
+  validationStatus?: string;
+  validationIssues?: string[];
+  generationMode?: string;
+  provider?: string;
+  model?: string;
+  fallbackReason?: string;
+  generatedAt?: string;
+  snapshotId?: string | null;
+  latestRun?: LatestRunMeta;
+  businessType?: {
+    primary?: string;
+    confidence?: string;
+  };
+};
+
+function readStructuredInstagram(value: unknown): StructuredInstagramInput | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const readList = (entry: unknown) =>
+    Array.isArray(entry) ? entry.map((item) => String(item ?? "").trim()).filter(Boolean) : [];
+  const instagram: StructuredInstagramInput = {
+    handle: String(record.handle ?? "").trim(),
+    bio: String(record.bio ?? "").trim(),
+    offerSummary: String(record.offerSummary ?? "").trim(),
+    recentCaptionSnippets: readList(record.recentCaptionSnippets),
+    recurringTopics: readList(record.recurringTopics),
+    ...(String(record.additionalInstagramNotes ?? "").trim()
+      ? { additionalInstagramNotes: String(record.additionalInstagramNotes ?? "").trim() }
+      : {}),
+    ...(readList(record.ctaPatterns).length > 0 ? { ctaPatterns: readList(record.ctaPatterns) } : {}),
+    ...(readList(record.proofSignals).length > 0 ? { proofSignals: readList(record.proofSignals) } : {}),
+    ...(String(record.followerCount ?? "").trim() ? { followerCount: String(record.followerCount ?? "").trim() } : {}),
+    ...(String(record.category ?? "").trim() ? { category: String(record.category ?? "").trim() } : {}),
+    ...(String(record.visualStyleNotes ?? "").trim()
+      ? { visualStyleNotes: String(record.visualStyleNotes ?? "").trim() }
+      : {}),
+  };
+  const hasBio = instagram.bio.length > 0;
+  const hasSupportingContent =
+    instagram.offerSummary.length > 0 ||
+    instagram.recentCaptionSnippets.length > 0 ||
+    instagram.recurringTopics.length > 0;
+  return hasBio && hasSupportingContent ? instagram : null;
+}
+
+function deriveInstagramSummaryNotes(instagram: StructuredInstagramInput | null): string {
+  if (!instagram) return "";
+  return [
+    instagram.bio ? `Bio: ${instagram.bio}` : "",
+    instagram.offerSummary ? `Offer: ${instagram.offerSummary}` : "",
+    instagram.additionalInstagramNotes ? `Additional Instagram notes: ${instagram.additionalInstagramNotes}` : "",
+    instagram.recurringTopics.length > 0 ? `Recurring topics: ${instagram.recurringTopics.join(", ")}` : "",
+    instagram.recentCaptionSnippets.length > 0
+      ? `Recent captions or themes: ${instagram.recentCaptionSnippets.join(" | ")}`
+      : "",
+    (instagram.ctaPatterns?.length ?? 0) > 0 ? `CTA patterns: ${instagram.ctaPatterns!.join(", ")}` : "",
+    (instagram.proofSignals?.length ?? 0) > 0 ? `Proof signals: ${instagram.proofSignals!.join(", ")}` : "",
+    instagram.category ? `Category: ${instagram.category}` : "",
+    instagram.followerCount ? `Follower count: ${instagram.followerCount}` : "",
+    instagram.visualStyleNotes ? `Visual style: ${instagram.visualStyleNotes}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function readApprovalState(
+  approval: ApprovalMeta | null | undefined,
+): { label: string; tone: "default" | "secondary" | "outline" } {
+  if (approval?.approved) {
+    return { label: "Approved", tone: "secondary" };
+  }
+  return { label: "Unapproved", tone: "outline" };
+}
+
+function getRunGenerationMode(meta: { generationMode?: string; latestRun?: LatestRunMeta } | null | undefined): string | null {
+  const direct = typeof meta?.generationMode === "string" ? meta.generationMode.trim() : "";
+  if (direct) return direct;
+  const latest = typeof meta?.latestRun?.generationMode === "string" ? meta.latestRun.generationMode.trim() : "";
+  return latest || null;
+}
+
+function getRunValidationStatus(
+  meta: { validationStatus?: string; latestRun?: LatestRunMeta } | null | undefined,
+): string | null {
+  const direct = typeof meta?.validationStatus === "string" ? meta.validationStatus.trim() : "";
+  if (direct) return direct;
+  const latest = typeof meta?.latestRun?.validation?.status === "string"
+    ? meta.latestRun.validation.status.trim()
+    : "";
+  return latest || null;
+}
+
+function getRunProvider(meta: { provider?: string; latestRun?: LatestRunMeta } | null | undefined): string | null {
+  const direct = typeof meta?.provider === "string" ? meta.provider.trim() : "";
+  if (direct) return direct;
+  const latest = typeof meta?.latestRun?.provider === "string" ? meta.latestRun.provider.trim() : "";
+  return latest || null;
+}
+
+function getRunModel(meta: { model?: string; latestRun?: LatestRunMeta } | null | undefined): string | null {
+  const direct = typeof meta?.model === "string" ? meta.model.trim() : "";
+  if (direct) return direct;
+  const latest = typeof meta?.latestRun?.model === "string" ? meta.latestRun.model.trim() : "";
+  return latest || null;
+}
+
+function getRunTimestamp(meta: { generatedAt?: string; latestRun?: LatestRunMeta } | null | undefined): string | null {
+  const direct = typeof meta?.generatedAt === "string" ? meta.generatedAt.trim() : "";
+  if (direct) return direct;
+  const latest = typeof meta?.latestRun?.timestamp === "string" ? meta.latestRun.timestamp.trim() : "";
+  return latest || null;
+}
 
 export default function Workspace() {
   const params = useParams<{ id: string }>();
@@ -84,16 +290,22 @@ export default function Workspace() {
   const [isImportingChatGpt, setIsImportingChatGpt] = useState(false);
   const [chatGptImportOk, setChatGptImportOk] = useState(false);
   const [chatGptImportMessage, setChatGptImportMessage] = useState<string | null>(null);
+  const [savingBusinessDnaFieldPath, setSavingBusinessDnaFieldPath] = useState<string | null>(null);
   const [isBootstrappingStrategy, setIsBootstrappingStrategy] = useState(false);
-  const bootstrapAttemptRef = useRef<string | null>(null);
+  const [isGeneratingBusinessDna, setIsGeneratingBusinessDna] = useState(false);
+  const [isApprovingBusinessDna, setIsApprovingBusinessDna] = useState(false);
+  const [isApprovingJumpToAction, setIsApprovingJumpToAction] = useState(false);
 
   const { data, isLoading, isError, error, refetch } = useGetClient(id, {
     query: {
       enabled: !!id,
       queryKey: getGetClientQueryKey(id),
       staleTime: 0,
+      retry: (failureCount, err) => isRetryableClientQueryError(err) && failureCount < 3,
+      retryDelay: (attempt) => Math.min(500 * 2 ** Math.max(0, attempt - 1), 2_000),
       refetchOnMount: true,
       refetchOnWindowFocus: true,
+      refetchIntervalInBackground: false,
       refetchInterval: (query) => {
         if (isGeneratingStrategy) return 2000;
         return shouldPollForBusinessDna(query.state.data) ? 3000 : false;
@@ -104,7 +316,33 @@ export default function Workspace() {
 
   const [igNotesDraft, setIgNotesDraft] = useState("");
   const [igNotesSaving, setIgNotesSaving] = useState(false);
-  const [template, setTemplate] = useState<TemplateChoice>("auto");
+  const [template, setTemplate] = useState<TemplateChoice | null>(null);
+  
+  const persistedTemplate =
+    (data?.strategy?.templateType as string | null | undefined) ??
+    (typeof ((data?.client?.sow as unknown as Record<string, unknown> | null | undefined))?.__templatePreference === "string"
+      ? String((data?.client?.sow as unknown as Record<string, unknown>).__templatePreference)
+      : typeof ((data?.client?.sow as unknown as Record<string, unknown> | null | undefined))?.__approvedContextSnapshot === "object" &&
+          (data?.client?.sow as unknown as Record<string, unknown>).__approvedContextSnapshot &&
+          typeof (((data?.client?.sow as unknown as Record<string, unknown>).__approvedContextSnapshot as Record<string, unknown>))
+            .templateType === "string"
+        ? String(
+            (((data?.client?.sow as unknown as Record<string, unknown>).__approvedContextSnapshot as Record<string, unknown>))
+              .templateType,
+          )
+        : null);
+  useEffect(() => {
+    setTemplate(null);
+  }, [id]);
+  useEffect(() => {
+    if (isLoading || !id) return;
+    if (persistedTemplate && TEMPLATE_CHOICES.includes(persistedTemplate as TemplateChoice)) {
+      setTemplate(persistedTemplate as TemplateChoice);
+      return;
+    }
+    setTemplate("auto");
+  }, [id, isLoading, persistedTemplate]);
+  
   const [editingSection, setEditingSection] =
     useState<CanonicalSectionKey | null>(null);
   const [draftSectionValue, setDraftSectionValue] = useState("");
@@ -156,6 +394,28 @@ export default function Workspace() {
         }),
     },
   });
+
+  const templateUpdate = useUpdateStrategy();
+
+  const handleTemplateChange = async (newTemplate: string) => {
+    if (!TEMPLATE_CHOICES.includes(newTemplate as TemplateChoice)) return;
+    setTemplate(newTemplate as TemplateChoice);
+    try {
+      await customFetch(`/api/clients/${id}/template`, {
+        method: "PATCH",
+        body: JSON.stringify({ templateType: newTemplate }),
+      });
+      if (data?.strategy?.id) {
+        await templateUpdate.mutateAsync({
+          clientId: id,
+          data: { templateType: newTemplate },
+        });
+      }
+      await queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(id), exact: true });
+    } catch (err) {
+      console.warn("Failed to save template selection", err);
+    }
+  };
 
   const del = useDeleteClient({
     mutation: {
@@ -216,8 +476,11 @@ export default function Workspace() {
   }, [data?.strategy, sections]);
 
   useEffect(() => {
-    const r = onboardingData?.rawInput as { instagramSummaryNotes?: string } | undefined;
-    setIgNotesDraft(typeof r?.instagramSummaryNotes === "string" ? r.instagramSummaryNotes : "");
+    const r = onboardingData?.rawInput as { instagramSummaryNotes?: string; instagram?: unknown } | undefined;
+    const structured = readStructuredInstagram(r?.instagram);
+    const fallbackNotes =
+      typeof r?.instagramSummaryNotes === "string" ? r.instagramSummaryNotes : deriveInstagramSummaryNotes(structured);
+    setIgNotesDraft(fallbackNotes);
   }, [onboardingData?.rawInput]);
 
   useEffect(() => {
@@ -245,7 +508,6 @@ export default function Workspace() {
     setIsImportingChatGpt(false);
     setChatGptImportOk(false);
     setChatGptImportMessage(null);
-    bootstrapAttemptRef.current = null;
   }, [id]);
 
   const businessDna = useMemo(
@@ -257,41 +519,28 @@ export default function Workspace() {
     [data?.onboarding?.enrichedData],
   );
   const sowFromClient = ((data?.client?.sow ?? null) as Record<string, unknown> | null) ?? null;
+  const approvedSnapshot =
+    sowFromClient && typeof sowFromClient.__approvedContextSnapshot === "object" && sowFromClient.__approvedContextSnapshot
+      ? (sowFromClient.__approvedContextSnapshot as Record<string, unknown>)
+      : null;
   const sowForWorkspace = useMemo(
     () => buildSowFromBusinessDna(sowFromClient, businessDna),
     [sowFromClient, businessDna],
   );
+  const approvedStructuredInstagram = readStructuredInstagram(
+    approvedSnapshot?.sow && (approvedSnapshot.sow as Record<string, unknown>).instagram,
+  );
+  const draftStructuredInstagram = readStructuredInstagram(
+    (onboardingData?.rawInput as Record<string, unknown> | undefined)?.instagram,
+  );
+  const structuredInstagram = approvedStructuredInstagram ?? draftStructuredInstagram;
+  const structuredInstagramTopicPreview = structuredInstagram
+    ? formatInstagramListPreview(structuredInstagram.recurringTopics, 4)
+    : null;
+  const structuredInstagramCaptionPreview = structuredInstagram
+    ? formatInstagramListPreview(structuredInstagram.recentCaptionSnippets, 4)
+    : null;
   const businessDnaReady = !!businessDna && Object.keys(businessDna).length > 0;
-
-  useEffect(() => {
-    if (!id || !data || data.strategy || !businessDnaReady || isBootstrappingStrategy) return;
-    if (bootstrapAttemptRef.current === id) return;
-    bootstrapAttemptRef.current = id;
-    setIsBootstrappingStrategy(true);
-    void customFetch(`/api/clients/${id}/strategy/bootstrap`, {
-      method: "POST",
-      body: JSON.stringify({
-        templateType: template === "auto" ? "brand_building" : template,
-      }),
-    })
-      .then(async () => {
-        await queryClient.invalidateQueries({
-          queryKey: getGetClientQueryKey(id),
-          exact: true,
-        });
-      })
-      .catch((err) => {
-        bootstrapAttemptRef.current = `failed:${id}`;
-        toast({
-          title: "Could not prepare Jump to Action",
-          description: String(err),
-          variant: "destructive",
-        });
-      })
-      .finally(() => {
-        setIsBootstrappingStrategy(false);
-      });
-  }, [businessDnaReady, data, id, isBootstrappingStrategy, queryClient, template, toast]);
 
   if (isLoading) {
     return (
@@ -338,7 +587,7 @@ export default function Workspace() {
     );
   }
 
-  if (isError) {
+  if (isError && !data) {
     return (
       <div className="min-h-[100dvh] bg-background">
         <main className="max-w-3xl mx-auto px-4 sm:px-6 py-16">
@@ -386,12 +635,66 @@ export default function Workspace() {
 
   const { client, onboarding, strategy } = data;
   const isGenerating = generate.isPending;
+  const backgroundFetchError = isError
+    ? String(error ?? "Temporary connection issue while refreshing workspace data.")
+    : null;
+  const businessDnaArtifactMeta =
+    businessDna && typeof businessDna === "object"
+      ? (((businessDna.__meta as BusinessDnaMeta | undefined) ??
+          (businessDna.__artifactMeta as BusinessDnaMeta | undefined)) ??
+        undefined)
+      : undefined;
+  const dnaApprovalSnapshotMatches =
+    !approvedSnapshot?.id ||
+    !businessDnaArtifactMeta?.approval?.approvedSnapshotId ||
+    businessDnaArtifactMeta.approval.approvedSnapshotId === approvedSnapshot.id;
+  const businessDnaStale = Boolean(businessDnaArtifactMeta?.stale) || !dnaApprovalSnapshotMatches;
+  const dnaApproved = Boolean(businessDnaArtifactMeta?.approval?.approved) && dnaApprovalSnapshotMatches && !businessDnaStale;
+  const dnaNeedsGeneration = Boolean(approvedSnapshot && (!businessDnaReady || businessDnaStale));
+  const showGenerateBusinessDna = Boolean(approvedSnapshot && dnaNeedsGeneration);
+  const canGenerateJumpToAction = Boolean(
+    approvedSnapshot && businessDnaReady && !businessDnaStale && dnaApproved,
+  );
 
   const strategyMeta = strategy?.structuredStrategy
-    ? ((strategy.structuredStrategy as Record<string, unknown>).__meta as
-        | { strategySource?: string; aiFailure?: { message?: string } }
-        | undefined)
+    ? ((strategy.structuredStrategy as Record<string, unknown>).__meta as JtaMeta | undefined)
     : undefined;
+  const showDebugMeta =
+    typeof window !== "undefined" && new URLSearchParams(window.location.search).has("debugMeta");
+  const dnaGenerationMode = getRunGenerationMode(businessDnaArtifactMeta);
+  const dnaValidationStatus = getRunValidationStatus(businessDnaArtifactMeta);
+  const dnaValidationFailed = dnaValidationStatus === "failed";
+  const dnaValidationWarning = dnaValidationStatus === "warning";
+  const dnaApprovalState = readApprovalState(dnaApproved ? businessDnaArtifactMeta?.approval : { approved: false });
+  const dnaProvider = getRunProvider(businessDnaArtifactMeta);
+  const dnaModel = getRunModel(businessDnaArtifactMeta);
+  const dnaGeneratedAt = getRunTimestamp(businessDnaArtifactMeta);
+  const dnaFallbackVisible = Boolean(dnaGenerationMode && dnaGenerationMode !== "llm");
+  const dnaFallbackDetails = readDnaFallbackDetails(businessDnaArtifactMeta);
+  const dnaProviderAttemptsSummary = formatProviderAttemptsSummary(dnaFallbackDetails.providerAttempts);
+  const jtaGenerationMode = getRunGenerationMode(strategyMeta);
+  const jtaValidationStatus = getRunValidationStatus(strategyMeta);
+  const jtaValidationFailed = jtaValidationStatus === "failed";
+  const jtaValidationWarning = jtaValidationStatus === "warning";
+  const jtaApprovalSnapshotMatches =
+    !approvedSnapshot?.id ||
+    !strategyMeta?.approval?.approvedSnapshotId ||
+    strategyMeta.approval.approvedSnapshotId === approvedSnapshot.id;
+  const jtaStale = Boolean(strategyMeta?.snapshotState === "stale") || !jtaApprovalSnapshotMatches;
+  const jtaApproved = Boolean(strategyMeta?.approval?.approved) && jtaApprovalSnapshotMatches && !jtaStale;
+  const jtaApprovalState = readApprovalState(jtaApproved ? strategyMeta?.approval : { approved: false });
+  const jtaProvider = getRunProvider(strategyMeta);
+  const jtaModel = getRunModel(strategyMeta);
+  const jtaGeneratedAt = getRunTimestamp(strategyMeta);
+  const showGenerateJumpToAction = Boolean(
+    canGenerateJumpToAction && (!strategy || jtaStale),
+  );
+  const jtaFallbackVisible =
+    Boolean(
+      (jtaGenerationMode && jtaGenerationMode !== "llm") ||
+        strategyMeta?.strategySource === "fallback" ||
+        strategyMeta?.aiFailure,
+    );
 
   type CopyPromptResponse = {
     templateName: "strategy/v1-full";
@@ -424,6 +727,593 @@ export default function Workspace() {
       setIgNotesSaving(false);
     }
   }
+
+  async function generateBusinessDna() {
+    if (!id || !approvedSnapshot || isGeneratingBusinessDna) return;
+    setIsGeneratingBusinessDna(true);
+    try {
+      await customFetch(`/api/clients/${id}/onboarding/business-dna/rebuild`, {
+        method: "POST",
+      });
+      await queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(id), exact: true });
+      toast({ title: "Business DNA ready" });
+    } catch (err) {
+      toast({
+        title: "Could not generate Business DNA",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setIsGeneratingBusinessDna(false);
+    }
+  }
+
+  async function approveBusinessDna() {
+    if (!id || !approvedSnapshot || !businessDnaReady || businessDnaStale || dnaValidationFailed || isApprovingBusinessDna) {
+      return;
+    }
+    setIsApprovingBusinessDna(true);
+    try {
+      await customFetch(`/api/clients/${id}/onboarding/business-dna/approve`, {
+        method: "POST",
+      });
+      await queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(id), exact: true });
+      toast({ title: "Business DNA approved" });
+    } catch (err) {
+      toast({
+        title: "Could not approve Business DNA",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setIsApprovingBusinessDna(false);
+    }
+  }
+
+  async function saveBusinessDnaField(path: string, value: unknown) {
+    if (!id) return;
+    try {
+      setSavingBusinessDnaFieldPath(path);
+      const response = await customFetch(`/api/clients/${id}/onboarding`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          businessDnaPatch: { path, value },
+        }),
+      }) as {
+        enrichedData?: { businessDna?: { __meta?: { validationStatus?: string } } };
+        jtaMarkedStale?: boolean;
+      };
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(id) }),
+        queryClient.invalidateQueries({ queryKey: getGetCalendarQueryKey(id) }),
+      ]);
+      const validationStatus = response?.enrichedData?.businessDna?.__meta?.validationStatus ?? null;
+      if (validationStatus === "failed") {
+        toast({
+          title: "Business DNA field saved",
+          description: "The edited draft now needs review before it should be treated as approved.",
+          variant: "destructive",
+        });
+        return;
+      }
+      toast({
+        title: "Business DNA field saved",
+        description: response?.jtaMarkedStale
+          ? "Business DNA changed. Regenerate Jump-to-Action."
+          : "The selected field was updated.",
+      });
+    } catch (err) {
+      toast({
+        title: "Could not save Business DNA field",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setSavingBusinessDnaFieldPath(null);
+    }
+  }
+
+  async function generateJumpToAction() {
+    if (!id || !approvedSnapshot || !businessDnaReady || businessDnaStale || !dnaApproved || isBootstrappingStrategy) return;
+    setIsBootstrappingStrategy(true);
+    try {
+      await customFetch(`/api/clients/${id}/strategy/bootstrap`, {
+        method: "POST",
+        body: JSON.stringify({
+          templateType: template,
+        }),
+      });
+      await queryClient.invalidateQueries({
+        queryKey: getGetClientQueryKey(id),
+        exact: true,
+      });
+      toast({ title: "Jump-to-Action ready" });
+    } catch (err) {
+      toast({
+        title: "Could not prepare Jump-to-Action",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setIsBootstrappingStrategy(false);
+    }
+  }
+
+  async function approveJumpToAction() {
+    if (
+      !id ||
+      !approvedSnapshot ||
+      !strategy ||
+      jtaStale ||
+      jtaValidationFailed ||
+      isApprovingJumpToAction
+    ) {
+      return;
+    }
+    setIsApprovingJumpToAction(true);
+    try {
+      await customFetch(`/api/clients/${id}/strategy/bootstrap/approve`, {
+        method: "POST",
+      });
+      await queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(id), exact: true });
+      toast({ title: "Jump-to-Action approved" });
+    } catch (err) {
+      toast({
+        title: "Could not approve Jump-to-Action",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setIsApprovingJumpToAction(false);
+    }
+  }
+
+  function renderStrategySetupCard() {
+    const setupCopy = !sowReady
+      ? {
+          eyebrow: "Workflow setup",
+          title: "Approve SOW first",
+          description:
+            "After approval, Business DNA can be generated from the approved SOW, website, and Instagram context. Once Business DNA is approved, Jump-to-Action will unlock.",
+        }
+      : !approvedSnapshot
+        ? {
+            eyebrow: "Workflow setup",
+            title: "Approved SOW is syncing",
+            description:
+              "The approved SOW snapshot is saving. Business DNA generation will unlock as soon as the approved context is visible.",
+          }
+        : showGenerateBusinessDna
+          ? {
+              eyebrow: "Business DNA",
+              title: "Generate Business DNA",
+              description:
+                "Use the approved SOW, website, and Instagram context to generate the Business DNA.",
+            }
+          : businessDnaReady && !businessDnaStale && !dnaApproved
+            ? {
+                eyebrow: "Business DNA",
+                title: "Approve Business DNA",
+                description: "Review and approve Business DNA before generating Jump-to-Action.",
+              }
+            : showGenerateJumpToAction
+              ? {
+                  eyebrow: "Jump-to-Action",
+                  title: "Generate Jump-to-Action",
+                  description:
+                    "Business DNA is approved. Generate Jump-to-Action as the working strategy draft.",
+                }
+              : strategy && !jtaStale && !jtaApproved
+                ? {
+                    eyebrow: "Jump-to-Action",
+                    title: "Jump-to-Action review and approval",
+                    description:
+                      "Review the current Jump-to-Action and approve it as the working strategy baseline.",
+                  }
+                : strategy && jtaApproved
+                  ? {
+                      eyebrow: "Strategy foundations",
+                      title: "Strategy foundations approved",
+                      description:
+                        "SOW, Business DNA, and Jump-to-Action are approved. Strategy and calendar steps can continue.",
+                    }
+                  : {
+                      eyebrow: "Workflow setup",
+                      title: "Continue setup",
+                      description: "Continue with the next visible workflow action for this client.",
+                    };
+
+    return (
+    <section className="rounded-xl border border-border bg-card p-5 shadow-sm min-w-0">
+      <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">
+            {setupCopy.eyebrow}
+          </p>
+          <h3 className="font-serif text-lg font-semibold tracking-tight">{setupCopy.title}</h3>
+          <p className="text-sm text-muted-foreground mt-1 max-w-2xl">
+            {setupCopy.description}
+          </p>
+        </div>
+        <div className="w-full lg:w-80 min-w-0 space-y-2">
+          <label className="text-xs uppercase tracking-wider text-muted-foreground">Strategy type</label>
+          <Select
+            value={template ?? undefined}
+            onValueChange={(v) => void handleTemplateChange(v)}
+            disabled={template === null}
+          >
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Loading strategy type..." />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">Auto-select</SelectItem>
+              <SelectItem value="brand_building">Brand Building</SelectItem>
+              <SelectItem value="performance_marketing">Performance Marketing</SelectItem>
+              <SelectItem value="personal_brand">Personal Brand</SelectItem>
+              <SelectItem value="d2c_growth">D2C Growth</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="mt-5 rounded-lg border border-border/70 bg-muted/20 p-4 space-y-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={dnaApprovalState.tone}>Business DNA: {dnaApprovalState.label}</Badge>
+          <Badge variant={jtaApprovalState.tone}>
+            Jump-to-Action: {strategy ? jtaApprovalState.label : "Not generated"}
+          </Badge>
+          {dnaGenerationMode ? <Badge variant="outline">DNA mode: {dnaGenerationMode}</Badge> : null}
+          {dnaValidationStatus ? <Badge variant="outline">DNA validation: {dnaValidationStatus}</Badge> : null}
+          {strategy && jtaGenerationMode ? <Badge variant="outline">JTA mode: {jtaGenerationMode}</Badge> : null}
+          {strategy && jtaValidationStatus ? <Badge variant="outline">JTA validation: {jtaValidationStatus}</Badge> : null}
+          {businessDnaStale ? <Badge variant="outline">Business DNA stale</Badge> : null}
+          {strategy && jtaStale ? <Badge variant="outline">Jump-to-Action stale</Badge> : null}
+        </div>
+
+        {dnaFallbackVisible ? (
+          <Alert className="border-sky-200 bg-sky-50/80 text-sky-950" data-testid="dna-fallback-banner">
+            <AlertTitle>Business DNA is a fallback draft</AlertTitle>
+            <AlertDescription className="space-y-2">
+              <p>
+                AI generation did not produce a usable Business DNA draft, so a heuristic template was saved instead.
+              </p>
+              {dnaFallbackDetails.fallbackReason ? (
+                <p data-testid="dna-fallback-reason">
+                  <span className="font-medium">Reason:</span> {dnaFallbackDetails.fallbackReason}
+                </p>
+              ) : null}
+              {dnaFallbackDetails.failureStage ? (
+                <p data-testid="dna-fallback-failure-stage">
+                  <span className="font-medium">Failure stage:</span> {dnaFallbackDetails.failureStage}
+                </p>
+              ) : null}
+              {dnaProviderAttemptsSummary ? (
+                <p className="font-mono text-xs break-words" data-testid="dna-fallback-provider-attempts">
+                  <span className="font-sans font-medium">Provider attempts:</span> {dnaProviderAttemptsSummary}
+                </p>
+              ) : null}
+              {dnaFallbackDetails.estimatedInputTokens != null ? (
+                <p className="font-mono text-xs" data-testid="dna-fallback-token-budget">
+                  <span className="font-sans font-medium">Token budget:</span>{" "}
+                  {dnaFallbackDetails.estimatedInputTokens} in + {dnaFallbackDetails.maxOutputTokens ?? "?"} out
+                  {dnaFallbackDetails.estimatedTotalTokens != null
+                    ? ` (${dnaFallbackDetails.estimatedTotalTokens} total)`
+                    : ""}
+                  {dnaFallbackDetails.compactionTier != null
+                    ? ` · compaction tier ${dnaFallbackDetails.compactionTier}`
+                    : ""}
+                </p>
+              ) : null}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {dnaValidationWarning ? (
+          <Alert className="border-amber-200 bg-amber-50/80 text-amber-950" data-testid="dna-validation-warning">
+            <AlertTitle>Business DNA needs review</AlertTitle>
+            <AlertDescription>
+              Validation flagged this draft for review before you move to Jump-to-Action.
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {jtaFallbackVisible ? (
+          <Alert className="border-sky-200 bg-sky-50/80 text-sky-950" data-testid="jta-fallback-banner">
+            <AlertTitle>Jump-to-Action is a fallback draft</AlertTitle>
+            <AlertDescription>
+              Fallback draft generated because AI generation failed or was unavailable.
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {strategy && jtaValidationWarning ? (
+          <Alert className="border-amber-200 bg-amber-50/80 text-amber-950" data-testid="jta-validation-warning">
+            <AlertTitle>Jump-to-Action needs review</AlertTitle>
+            <AlertDescription>
+              Validation flagged this draft for review before you move deeper into strategy editing.
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {strategyFoundationBlockedReason ? (
+          <Alert className="border-amber-200 bg-amber-50/80 text-amber-950" data-testid="strategy-foundation-blocked">
+            <AlertTitle>Downstream generation is still locked</AlertTitle>
+            <AlertDescription>{strategyFoundationBlockedReason}</AlertDescription>
+          </Alert>
+        ) : strategyFoundationReady ? (
+          <Alert className="border-emerald-200 bg-emerald-50/80 text-emerald-950" data-testid="strategy-foundation-ready">
+            <AlertTitle>Strategy foundations are approved</AlertTitle>
+            <AlertDescription>
+              The current SOW, Business DNA, and Jump-to-Action are all approved for this snapshot. You can continue into strategy editing and calendar generation.
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {!sowReady ? (
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-amber-900">
+              Approve SOW to generate final Business DNA and Jump-to-Action.
+            </p>
+            <a href="#sow" className="text-xs text-primary font-medium hover:underline inline-block">
+              Go to SOW details →
+            </a>
+          </div>
+        ) : !approvedSnapshot ? (
+          <p className="text-sm text-muted-foreground">
+            Approved SOW is saving. This page will unlock the next step as soon as the approved snapshot is visible.
+          </p>
+        ) : showGenerateBusinessDna ? (
+          <div className="space-y-3">
+            <p className="text-sm text-foreground">
+              The approved context snapshot is ready. Generate final Business DNA from the approved website, Instagram, and SOW inputs.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                onClick={() => void generateBusinessDna()}
+                disabled={isGeneratingBusinessDna}
+                className="gap-2"
+                data-testid="generate-business-dna-button"
+              >
+                <RefreshCw className={`size-4 ${isGeneratingBusinessDna ? "animate-spin" : ""}`} />
+                {isGeneratingBusinessDna
+                  ? "Generating Business DNA..."
+                  : businessDnaReady
+                    ? "Regenerate Business DNA"
+                    : "Generate Business DNA"}
+              </Button>
+            </div>
+          </div>
+        ) : businessDnaReady && !businessDnaStale && !dnaApproved ? (
+          <div className="space-y-3">
+            <p className="text-sm text-foreground">
+              Business DNA is ready. Approve it before generating Jump-to-Action for this snapshot.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                onClick={() => void approveBusinessDna()}
+                disabled={isApprovingBusinessDna || dnaValidationFailed}
+                className="gap-2"
+                data-testid="approve-business-dna-button"
+              >
+                {isApprovingBusinessDna ? "Approving Business DNA..." : "Approve Business DNA"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void generateBusinessDna()}
+                disabled={isGeneratingBusinessDna}
+                className="gap-2"
+                data-testid="regenerate-business-dna-button"
+              >
+                <RefreshCw className={`size-4 ${isGeneratingBusinessDna ? "animate-spin" : ""}`} />
+                {isGeneratingBusinessDna ? "Regenerating..." : "Regenerate Business DNA"}
+              </Button>
+            </div>
+            {dnaValidationFailed ? (
+              <p className="text-xs text-destructive">
+                This Business DNA draft failed validation and must be regenerated before approval.
+              </p>
+            ) : null}
+          </div>
+        ) : showGenerateJumpToAction ? (
+          <div className="space-y-3">
+            <p className="text-sm text-foreground">
+              {strategy && !jtaApproved
+                ? "Jump-to-Action needs an updated approved draft for this snapshot. Regenerate it from the approved Business DNA."
+                : "Business DNA is ready. Generate Jump-to-Action to create the first strategy draft for this approved snapshot."}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                onClick={() => void generateJumpToAction()}
+                disabled={isBootstrappingStrategy}
+                className="gap-2"
+                data-testid="generate-jump-to-action-button"
+              >
+                <RefreshCw className={`size-4 ${isBootstrappingStrategy ? "animate-spin" : ""}`} />
+                {isBootstrappingStrategy
+                  ? strategy
+                    ? "Regenerating Jump-to-Action..."
+                    : "Generating Jump-to-Action..."
+                  : strategy
+                    ? "Regenerate Jump-to-Action"
+                    : "Generate Jump-to-Action"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void generateBusinessDna()}
+                disabled={isGeneratingBusinessDna}
+                className="gap-2"
+                data-testid="regenerate-business-dna-button-approved"
+              >
+                <RefreshCw className={`size-4 ${isGeneratingBusinessDna ? "animate-spin" : ""}`} />
+                {isGeneratingBusinessDna ? "Regenerating DNA..." : "Regenerate Business DNA"}
+              </Button>
+            </div>
+          </div>
+        ) : strategy && !jtaStale && !jtaApproved ? (
+          <div className="space-y-3">
+            <p className="text-sm text-foreground">
+              Jump-to-Action is ready for review. Approve it before treating this draft as the current working strategy baseline.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                onClick={() => void approveJumpToAction()}
+                disabled={isApprovingJumpToAction || jtaValidationFailed}
+                className="gap-2"
+                data-testid="approve-jump-to-action-button"
+              >
+                {isApprovingJumpToAction ? "Approving Jump-to-Action..." : "Approve Jump-to-Action"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void generateJumpToAction()}
+                disabled={isBootstrappingStrategy}
+                className="gap-2"
+                data-testid="regenerate-jump-to-action-button"
+              >
+                <RefreshCw className={`size-4 ${isBootstrappingStrategy ? "animate-spin" : ""}`} />
+                {isBootstrappingStrategy ? "Regenerating..." : "Regenerate Jump-to-Action"}
+              </Button>
+            </div>
+            {jtaValidationFailed ? (
+              <p className="text-xs text-destructive">
+                This Jump-to-Action draft failed validation and must be regenerated before approval.
+              </p>
+            ) : null}
+          </div>
+        ) : strategy ? (
+          <div className="space-y-2">
+            <p className="text-sm text-emerald-800 font-medium">
+              {jtaApproved
+                ? "Jump-to-Action is approved. Review it below, then continue into strategy editing and calendar generation."
+                : "Jump-to-Action is ready. Review it below before continuing into strategy editing."}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {!jtaApproved ? (
+                <Button
+                  type="button"
+                  onClick={() => void approveJumpToAction()}
+                  disabled={isApprovingJumpToAction || jtaValidationFailed || jtaStale}
+                  className="gap-2"
+                  data-testid="approve-jump-to-action-button-with-strategy"
+                >
+                  {isApprovingJumpToAction ? "Approving Jump-to-Action..." : "Approve Jump-to-Action"}
+                </Button>
+              ) : null}
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void generateJumpToAction()}
+                disabled={isBootstrappingStrategy || !canGenerateJumpToAction}
+                className="gap-2"
+                data-testid="regenerate-jump-to-action-button-with-strategy"
+              >
+                <RefreshCw className={`size-4 ${isBootstrappingStrategy ? "animate-spin" : ""}`} />
+                {isBootstrappingStrategy ? "Regenerating JTA..." : "Regenerate Jump-to-Action"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void generateBusinessDna()}
+                disabled={isGeneratingBusinessDna}
+                className="gap-2"
+                data-testid="regenerate-business-dna-button-with-strategy"
+              >
+                <RefreshCw className={`size-4 ${isGeneratingBusinessDna ? "animate-spin" : ""}`} />
+                {isGeneratingBusinessDna ? "Regenerating DNA..." : "Regenerate Business DNA"}
+              </Button>
+            </div>
+            {strategyMeta?.strategySource === "fallback" ? (
+              <p className="text-xs text-muted-foreground">
+                This strategy currently reflects a fallback/template path.
+              </p>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            Approved context is available. Continue with the next visible workflow action for this client.
+          </p>
+        )}
+
+        {showDebugMeta ? (
+          <div className="rounded-md border border-dashed border-border/70 bg-background/60 p-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">
+              Debug metadata
+            </p>
+            <div className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+              <p>DNA provider: {dnaProvider ?? "unknown"}</p>
+              <p>DNA model: {dnaModel ?? "unknown"}</p>
+              <p>DNA generated: {dnaGeneratedAt ?? "unknown"}</p>
+              <p>DNA snapshot: {String(businessDnaArtifactMeta?.snapshotId ?? "unknown")}</p>
+              <p>DNA business type: {businessDnaArtifactMeta?.businessType?.primary ?? "unknown"}</p>
+              <p>DNA confidence: {businessDnaArtifactMeta?.businessType?.confidence ?? "unknown"}</p>
+              <p>JTA provider: {jtaProvider ?? "unknown"}</p>
+              <p>JTA model: {jtaModel ?? "unknown"}</p>
+              <p>JTA generated: {jtaGeneratedAt ?? "unknown"}</p>
+              <p>JTA snapshot: {String(strategyMeta?.snapshotId ?? "unknown")}</p>
+              <p>
+                DNA requested provider: {businessDnaArtifactMeta?.latestRun?.diagnostics?.requestedProvider ?? "default"}
+              </p>
+              <p>
+                DNA repair run: {businessDnaArtifactMeta?.latestRun?.diagnostics?.repairAttempted ? "yes" : "no"}
+              </p>
+              <p className="sm:col-span-2">
+                DNA provider chain:{" "}
+                {(businessDnaArtifactMeta?.latestRun?.diagnostics?.configuredProviderChain ?? [])
+                  .map((entry) => [entry.provider, entry.model].filter(Boolean).join("/"))
+                  .filter(Boolean)
+                  .join(" -> ") || "unknown"}
+              </p>
+              <p className="sm:col-span-2">
+                DNA attempts:{" "}
+                {(businessDnaArtifactMeta?.latestRun?.diagnostics?.providerAttempts ?? [])
+                  .map((entry) => {
+                    const base = [entry.provider, entry.model].filter(Boolean).join("/");
+                    const extra = entry.reason ? ` (${entry.reason})` : "";
+                    return `${base || "unknown"}:${entry.status ?? "unknown"}${extra}`;
+                  })
+                  .join(" | ") || "none recorded"}
+              </p>
+              <p className="sm:col-span-2">
+                DNA fallback reason: {businessDnaArtifactMeta?.latestRun?.diagnostics?.fallbackReason ?? "none"}
+              </p>
+              <p>JTA requested provider: {strategyMeta?.latestRun?.diagnostics?.requestedProvider ?? "default"}</p>
+              <p>JTA repair run: {strategyMeta?.latestRun?.diagnostics?.repairAttempted ? "yes" : "no"}</p>
+              <p className="sm:col-span-2">
+                JTA provider chain:{" "}
+                {(strategyMeta?.latestRun?.diagnostics?.configuredProviderChain ?? [])
+                  .map((entry) => [entry.provider, entry.model].filter(Boolean).join("/"))
+                  .filter(Boolean)
+                  .join(" -> ") || "unknown"}
+              </p>
+              <p className="sm:col-span-2">
+                JTA attempts:{" "}
+                {(strategyMeta?.latestRun?.diagnostics?.providerAttempts ?? [])
+                  .map((entry) => {
+                    const base = [entry.provider, entry.model].filter(Boolean).join("/");
+                    const extra = entry.reason ? ` (${entry.reason})` : "";
+                    return `${base || "unknown"}:${entry.status ?? "unknown"}${extra}`;
+                  })
+                  .join(" | ") || "none recorded"}
+              </p>
+              <p className="sm:col-span-2">
+                JTA fallback reason: {strategyMeta?.latestRun?.diagnostics?.fallbackReason ?? "none"}
+              </p>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </section>
+    );
+  }
+
   const sow = (client.sow ?? null) as unknown as Record<string, unknown>;
   const sowReady = isSowComplete(sow);
   const sowBlockers = getSowIncompleteReasons((client.sow ?? null) as SowLike);
@@ -431,6 +1321,32 @@ export default function Workspace() {
     ? getSectionApprovals(strategy.structuredStrategy as Record<string, unknown>)
     : {};
   const pendingSections = getPendingApprovalSections(strategyApprovals);
+  const strategyFoundationReady = Boolean(approvedSnapshot && dnaApproved && jtaApproved && !businessDnaStale && !jtaStale);
+  const calendarReady = Boolean(strategy && strategyFoundationReady && pendingSections.length === 0);
+  const strategyFoundationBlockedReason = !sowReady
+    ? "Approve the current SOW before generating Business DNA."
+    : !approvedSnapshot
+      ? "Approve the current SOW before generating Business DNA."
+      : !businessDnaReady
+        ? "Generate and approve the current Business DNA before generating Jump-to-Action."
+        : businessDnaStale
+          ? "Regenerate and approve the current Business DNA before generating Jump-to-Action."
+          : !dnaApproved
+            ? "Approve the current Business DNA before generating Jump-to-Action."
+            : !strategy
+              ? "Generate and approve the current Jump-to-Action before generating the full strategy or calendar."
+              : jtaStale
+                ? "Regenerate and approve the current Jump-to-Action before generating the full strategy or calendar."
+                : !jtaApproved
+                  ? "Approve the current Jump-to-Action before generating the full strategy or calendar."
+                  : null;
+  const calendarBlockedReason =
+    strategyFoundationBlockedReason ??
+    (!strategy
+      ? "Generate and approve the current Jump-to-Action before generating the content calendar."
+      : pendingSections.length > 0
+        ? "Approve strategy before generating the content calendar."
+        : null);
 
   function jumpToSowSection() {
     const section = document.getElementById("sow");
@@ -454,7 +1370,7 @@ export default function Workspace() {
       sow: compactSowForPreflight(data?.client?.sow ?? null),
       oneLineDescription: data?.client?.oneLineDescription ?? "",
     });
-    const payload = { templateType: template };
+    const payload = template ? { templateType: template } : {};
     const proceed = confirmPreflightLimit({
       context: "Strategy generation preflight",
       estimatedTokens: estimatedPromptTokens,
@@ -470,7 +1386,7 @@ export default function Workspace() {
   }
 
   async function generatePromptForGpt() {
-    if (!id || isPreparingPrompt || !sowReady) return;
+    if (!id || isPreparingPrompt || !sowReady || !strategyFoundationReady) return;
     const estimatedPromptTokens = estimateTokens({
       templateName: "strategy/v1-full",
       onboardingRaw: compactOnboardingForPreflight(data?.onboarding?.rawInput ?? null),
@@ -644,31 +1560,6 @@ export default function Workspace() {
     return getSectionApprovals(strategy.structuredStrategy as Record<string, unknown>);
   }
 
-  function approveSection(sectionKey: CanonicalSectionKey) {
-    if (!id || !strategy) return;
-    const nextApprovals = { ...getCurrentApprovals(), [sectionKey]: true };
-    const isFullyApproved = allSectionsApproved(nextApprovals);
-    update.mutate(
-      {
-        clientId: id,
-        data: {
-          structuredStrategy: {
-            ...(strategy.structuredStrategy as Record<string, unknown>),
-            __meta: {
-              ...(((strategy.structuredStrategy as Record<string, unknown>).__meta as Record<
-                string,
-                unknown
-              > | undefined) ?? {}),
-              sectionApprovals: nextApprovals,
-            },
-          },
-          status: isFullyApproved ? "approved" : "draft",
-        },
-      },
-      { onSuccess: () => toast({ title: `${CANONICAL_SECTION_LABELS[sectionKey]} approved` }) },
-    );
-  }
-
   function approveAllSections() {
     if (!id || !strategy) return;
     const nextApprovals = Object.fromEntries(
@@ -831,9 +1722,14 @@ export default function Workspace() {
                     Approved
                   </Badge>
                 ) : strategy ? (
-                  <Badge variant="secondary" className="bg-yellow-100 text-yellow-800 border-transparent hover:bg-yellow-100">
-                    Draft
-                  </Badge>
+                  <div className="flex items-center gap-2">
+                    <Badge variant="secondary" className="bg-yellow-100 text-yellow-800 border-transparent hover:bg-yellow-100">
+                      Draft
+                    </Badge>
+                    <span className="text-[11px] text-muted-foreground">
+                      Strategy artifact exists but is pending approval.
+                    </span>
+                  </div>
                 ) : (
                   <Badge variant="outline" className="text-muted-foreground border-muted-foreground/30">
                     Onboarded
@@ -847,7 +1743,7 @@ export default function Workspace() {
             <div className="flex items-center gap-2 flex-nowrap w-full sm:w-auto justify-end min-w-0">
               <Button
                 onClick={() => void handlePrimaryPromptAction()}
-                disabled={isPreparingPrompt || !sowReady}
+                disabled={isPreparingPrompt || !sowReady || !strategyFoundationReady}
                 size="sm"
                 className="shrink-0"
                 data-testid="header-generate-prompt-button"
@@ -887,12 +1783,21 @@ export default function Workspace() {
                   Complete SOW first →
                 </a>
               )}
+              {sowReady && !strategyFoundationReady && strategyFoundationBlockedReason ? (
+                <span className="text-xs text-amber-800 font-medium whitespace-nowrap shrink-0">
+                  {strategyFoundationBlockedReason}
+                </span>
+              ) : null}
             </div>
           )}
 
           {strategy && (
             <div className="flex items-center gap-2 flex-nowrap overflow-x-auto max-w-[100vw] sm:max-w-none min-w-0 pb-1 w-full lg:w-auto [scrollbar-width:thin]">
-              {strategyMeta?.strategySource === "fallback" ? (
+              {!calendarReady ? (
+                <p className="text-xs text-amber-900 font-medium max-w-[18rem] leading-snug shrink-0">
+                  {calendarBlockedReason ?? "Finish the current approvals before opening the calendar."}
+                </p>
+              ) : strategyMeta?.strategySource === "fallback" ? (
                 <p className="text-xs text-amber-900 font-medium max-w-[14rem] leading-snug shrink-0">
                   Strategy is a template — regenerate before calendar
                 </p>
@@ -904,15 +1809,22 @@ export default function Workspace() {
                 </Link>
               )}
               {strategy.status !== "approved" && (
-                <Button variant="outline" size="sm" onClick={approveAllSections} className="gap-2 shrink-0" data-testid="approve-strategy-button">
-                  <CheckCircle2 className="size-4" /> Approve strategy
-                </Button>
+                <div className="flex flex-col gap-1 shrink-0">
+                  <Button variant="outline" size="sm" onClick={approveAllSections} disabled={!strategyFoundationReady} className="gap-2 shrink-0" data-testid="approve-strategy-button">
+                    <CheckCircle2 className="size-4" /> Approve strategy
+                  </Button>
+                  {!strategyFoundationReady ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      Approve Jump-to-Action before approving strategy.
+                    </span>
+                  ) : null}
+                </div>
               )}
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => void handlePrimaryPromptAction()}
-                disabled={!sowReady || isPreparingPrompt}
+                disabled={!sowReady || isPreparingPrompt || !strategyFoundationReady}
                 className="gap-2 shrink-0"
                 data-testid="strategy-primary-prompt-button"
               >
@@ -973,6 +1885,11 @@ export default function Workspace() {
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-10">
         <RuntimeModeBanner />
+        {backgroundFetchError && (
+          <div className="mb-6 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            Workspace refresh failed temporarily. Showing the last loaded data. {backgroundFetchError}
+          </div>
+        )}
         {showPasteScaffold && (
           <section className="mb-6 rounded-xl border border-border bg-card/60 p-5 shadow-sm space-y-3">
             <div className="flex items-center justify-between gap-3">
@@ -1044,8 +1961,68 @@ export default function Workspace() {
             </AlertDescription>
           </Alert>
         )}
-        {onboarding && (
-          <div className="mb-8 rounded-xl border border-border bg-card/50 p-5 shadow-sm">
+        {onboarding && structuredInstagram && (
+          <div className="mb-8 rounded-xl border border-border bg-card/50 p-5 shadow-sm" data-testid="structured-instagram-summary">
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">
+              Instagram context
+            </p>
+            <p className="text-sm text-muted-foreground mb-3">
+              Structured Instagram intake is active for this client. Update it in the approved SOW form.
+            </p>
+            <div className="space-y-2 text-sm">
+              <p><span className="font-medium text-foreground">Handle:</span> {structuredInstagram.handle || "Not set"}</p>
+              <p><span className="font-medium text-foreground">Offer:</span> {structuredInstagram.offerSummary || "Not set"}</p>
+              {structuredInstagram.additionalInstagramNotes ? (
+                <div>
+                  <p className="font-medium text-foreground">Additional Instagram notes:</p>
+                  <p className="mt-1 whitespace-pre-wrap break-words text-muted-foreground">
+                    {structuredInstagram.additionalInstagramNotes}
+                  </p>
+                </div>
+              ) : null}
+              <div>
+                <p className="font-medium text-foreground">Topics:</p>
+                {structuredInstagramTopicPreview && structuredInstagramTopicPreview.items.length > 0 ? (
+                  <div className="mt-1 space-y-1">
+                    <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+                      {structuredInstagramTopicPreview.items.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                    {structuredInstagramTopicPreview.remaining > 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        and {structuredInstagramTopicPreview.remaining} more
+                      </p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground">Not set</p>
+                )}
+              </div>
+              <div>
+                <p className="font-medium text-foreground">Recent captions or themes:</p>
+                {structuredInstagramCaptionPreview && structuredInstagramCaptionPreview.items.length > 0 ? (
+                  <div className="mt-1 space-y-1">
+                    <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+                      {structuredInstagramCaptionPreview.items.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                    {structuredInstagramCaptionPreview.remaining > 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        and {structuredInstagramCaptionPreview.remaining} more
+                      </p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground">Not set</p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {onboarding && !structuredInstagram && (
+          <div className="mb-8 rounded-xl border border-border bg-card/50 p-5 shadow-sm" data-testid="legacy-instagram-notes">
             <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">
               Instagram positioning (optional)
             </p>
@@ -1076,8 +2053,8 @@ export default function Workspace() {
           <GeneratingStrategy />
         ) : !strategy ? (
           /* No strategy yet */
-          <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-10">
-            <section className="space-y-8">
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-10 min-w-0">
+            <section className="space-y-8 min-w-0">
               <div>
                 <p className="text-xs uppercase tracking-wider text-muted-foreground mb-3">
                   Onboarding profile
@@ -1103,55 +2080,51 @@ export default function Workspace() {
 
               <section
                 id="sow"
-                className="border border-border rounded-xl bg-card/40 p-6 shadow-sm scroll-mt-28"
+                className="border border-border rounded-xl bg-card/40 p-6 shadow-sm scroll-mt-28 min-w-0 overflow-hidden"
               >
                 <h2 className="font-serif text-2xl font-bold tracking-tight mb-1">SOW details</h2>
                 <p className="text-sm text-muted-foreground mb-6 max-w-2xl">
                   Match <strong>content mix</strong> to <strong>monthly post total</strong>, then <strong>approve &amp; save</strong> to unlock
                   strategy.
                 </p>
-                <SowForm clientId={id ?? ""} initial={sowForWorkspace as never} showSowPdfUpload={false} />
+                <SowForm
+                  clientId={id ?? ""}
+                  initial={sowForWorkspace as never}
+                  showSowPdfUpload={false}
+                  clientBasics={{
+                    name: client.name,
+                    website: client.website ?? undefined,
+                    instagramHandle: client.instagramHandle ?? undefined,
+                    oneLineDescription: client.oneLineDescription ?? undefined,
+                  }}
+                />
               </section>
+
+              {renderStrategySetupCard()}
 
               {onboarding && (
                 <BusinessDnaPanel
                   enrichedData={(onboarding.enrichedData as Record<string, unknown> | null | undefined) ?? null}
                   rawInput={onboarding.rawInput as Record<string, unknown> | null | undefined}
+                  sow={sowFromClient}
                   instagramSummaryNotesDraft={igNotesDraft}
+                  editable={Boolean(id && approvedSnapshot)}
+                  savingFieldPath={savingBusinessDnaFieldPath}
+                  onPatchField={(path, value) => saveBusinessDnaField(path, value)}
                 />
               )}
             </section>
 
-            <aside className="space-y-4 lg:sticky lg:top-28 self-start">
+            <aside className="space-y-4 lg:sticky lg:top-28 self-start min-w-0">
               <div className="border border-border rounded-xl bg-card p-6 shadow-sm">
                 <h3 className="font-serif text-lg font-semibold mb-2">Founder strategy flow</h3>
-                <p className="text-sm text-muted-foreground mb-4">Pick a strategy type, generate the ChatGPT prompt, then paste the JSON result back here.</p>
-                <div className="space-y-3 mb-5">
-                  <label className="text-xs uppercase tracking-wider text-muted-foreground">
-                    Strategy type
-                  </label>
-                  <Select
-                    value={template}
-                    onValueChange={(v) => setTemplate(v as TemplateChoice)}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="auto">Auto-select</SelectItem>
-                      <SelectItem value="brand_building">Brand Building</SelectItem>
-                      <SelectItem value="performance_marketing">Performance Marketing</SelectItem>
-                      <SelectItem value="personal_brand">Personal Brand</SelectItem>
-                      <SelectItem value="d2c_growth">D2C Growth</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+                <p className="text-sm text-muted-foreground mb-4">Optional manual GPT workflow for this client after the approved setup is in place.</p>
                 <Button
                   type="button"
                   variant="default"
                   onClick={() => void handlePrimaryPromptAction()}
                   className="w-full gap-2"
-                  disabled={isPreparingPrompt || !sowReady}
+                  disabled={isPreparingPrompt || !sowReady || !strategyFoundationReady}
                   data-testid="strategy-primary-prompt-button-empty"
                 >
                   <Copy className="size-4" /> {isPreparingPrompt ? "Preparing prompt..." : generatedPrompt ? "Copy for GPT" : "Generate Prompt"}
@@ -1195,26 +2168,90 @@ export default function Workspace() {
                     </ul>
                   </div>
                 )}
-                {sowReady && <p className="mt-3 text-xs text-emerald-800 font-medium">SOW complete — you can generate the prompt.</p>}
+                {sowReady && strategyFoundationReady ? (
+                  <p className="mt-3 text-xs text-emerald-800 font-medium">Strategy foundations are approved — you can generate the prompt.</p>
+                ) : sowReady && strategyFoundationBlockedReason ? (
+                  <p className="mt-3 text-xs text-amber-800 font-medium">{strategyFoundationBlockedReason}</p>
+                ) : null}
               </div>
             </aside>
           </div>
         ) : (
           /* Reading mode */
           <div className="space-y-12">
+            <section className="space-y-6">
+              <div>
+                <p className="text-xs uppercase tracking-wider text-muted-foreground mb-3">
+                  Onboarding profile
+                </p>
+                <h2 className="font-serif text-3xl tracking-tight text-foreground mb-2">
+                  {client.name}
+                </h2>
+                {client.oneLineDescription && (
+                  <p className="text-lg text-muted-foreground leading-relaxed font-serif italic">
+                    {client.oneLineDescription}
+                  </p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {client.website && (
+                  <InfoRow icon={<Globe className="size-4" />} label="Website" value={client.website} href={client.website} />
+                )}
+                {client.instagramHandle && (
+                  <InfoRow icon={<Instagram className="size-4" />} label="Instagram" value={client.instagramHandle} />
+                )}
+              </div>
+            </section>
+
             <section
               id="sow"
-              className="border border-border rounded-xl bg-card/40 p-6 shadow-sm scroll-mt-28"
+              className="border border-border rounded-xl bg-card/40 p-6 shadow-sm scroll-mt-28 min-w-0 overflow-hidden"
             >
               <h2 className="font-serif text-2xl font-bold tracking-tight mb-1">SOW details</h2>
               <p className="text-sm text-muted-foreground mb-6 max-w-2xl">
                 Calendar and execution pull from this plan: platforms, post totals, content mix, and tone.
               </p>
-              <SowForm clientId={id ?? ""} initial={sowForWorkspace as never} showSowPdfUpload={false} />
+              <SowForm
+                clientId={id ?? ""}
+                initial={sowForWorkspace as never}
+                showSowPdfUpload={false}
+                clientBasics={{
+                  name: client.name,
+                  website: client.website ?? undefined,
+                  instagramHandle: client.instagramHandle ?? undefined,
+                  oneLineDescription: client.oneLineDescription ?? undefined,
+                }}
+              />
             </section>
 
-            <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-12">
-              <article className="strategy-doc space-y-5">
+            {renderStrategySetupCard()}
+
+            {onboarding && (
+              <BusinessDnaPanel
+                enrichedData={(onboarding.enrichedData as Record<string, unknown> | null | undefined) ?? null}
+                rawInput={onboarding.rawInput as Record<string, unknown> | null | undefined}
+                sow={sowFromClient}
+                instagramSummaryNotesDraft={igNotesDraft}
+                editable={Boolean(id && approvedSnapshot)}
+                savingFieldPath={savingBusinessDnaFieldPath}
+                onPatchField={(path, value) => saveBusinessDnaField(path, value)}
+              />
+            )}
+
+            {sections && (
+              <div className="space-y-1">
+                <h2 className="font-serif text-2xl font-bold tracking-tight text-foreground">
+                  Jump-to-Action
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Review the approved Jump-to-Action strategy sections below.
+                </p>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-12 min-w-0">
+              <article className="strategy-doc space-y-5 min-w-0">
                 {sections &&
                   CANONICAL_STRATEGY_SECTIONS.map(({ key }) => {
                       const isEditing = editingSection === key;
@@ -1232,22 +2269,20 @@ export default function Workspace() {
                         >
                           <div className="flex items-start justify-between gap-3 flex-wrap">
                             <div>
-                              <h3 className="font-serif text-xl tracking-tight">
-                                {CANONICAL_SECTION_LABELS[key]}
-                              </h3>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <h3 className="font-serif text-xl tracking-tight">
+                                  {CANONICAL_SECTION_LABELS[key]}
+                                </h3>
+                                <Badge variant={isApproved ? "secondary" : "outline"}>
+                                  {isApproved ? "Reviewed" : "Needs review"}
+                                </Badge>
+                              </div>
                               <p className="text-xs text-muted-foreground mt-1">
                                 {SECTION_HINTS[key]}
                               </p>
                             </div>
                             {!isEditing && (
                               <div className="flex items-center gap-2">
-                                <Button
-                                  variant={isApproved ? "secondary" : "outline"}
-                                  size="sm"
-                                  onClick={() => approveSection(key)}
-                                >
-                                  {isApproved ? "Approved" : "Approve"}
-                                </Button>
                                 <Button
                                   variant="ghost"
                                   size="sm"
@@ -1303,6 +2338,9 @@ export default function Workspace() {
                             <div className="space-y-2">
                               {isRegenerating ? (
                                 <>
+                                  <p className="text-xs text-muted-foreground">
+                                    {`Regenerating ${CANONICAL_SECTION_LABELS[key]} section...`}
+                                  </p>
                                   <Skeleton className="h-4 w-full" />
                                   <Skeleton className="h-4 w-10/12" />
                                   <Skeleton className="h-4 w-9/12" />
@@ -1316,7 +2354,7 @@ export default function Workspace() {
                       );
                     })}
               </article>
-              <aside className="no-print self-start lg:sticky lg:top-28 space-y-3">
+              <aside className="no-print self-start lg:sticky lg:top-28 space-y-3 min-w-0">
                 <p className="text-xs uppercase tracking-wider text-muted-foreground">
                   Jump to section
                 </p>
@@ -1345,19 +2383,12 @@ export default function Workspace() {
                 </div>
                 {pendingSections.length > 0 && (
                   <p className="text-xs text-amber-700">
-                    Approve all strategy sections before generating the content calendar.
+                    Approve strategy before generating the content calendar.
                   </p>
                 )}
               </aside>
             </div>
 
-            {onboarding && (
-              <BusinessDnaPanel
-                enrichedData={(onboarding.enrichedData as Record<string, unknown> | null | undefined) ?? null}
-                rawInput={onboarding.rawInput as Record<string, unknown> | null | undefined}
-                instagramSummaryNotesDraft={igNotesDraft}
-              />
-            )}
           </div>
         )}
       </main>
@@ -1368,12 +2399,24 @@ export default function Workspace() {
 function compactOnboardingForPreflight(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== "object") return null;
   const input = raw as Record<string, unknown>;
+  const instagram = readStructuredInstagram(input.instagram);
   return {
     name: String(input.name ?? ""),
     websiteUrl: String(input.websiteUrl ?? ""),
     instagramHandle: String(input.instagramHandle ?? ""),
     oneLineDescription: String(input.oneLineDescription ?? "").slice(0, 300),
-    instagramSummaryNotes: String(input.instagramSummaryNotes ?? "").slice(0, 400),
+    ...(instagram
+      ? {
+          instagram: {
+            handle: instagram.handle,
+            bio: instagram.bio.slice(0, 240),
+            offerSummary: instagram.offerSummary.slice(0, 180),
+            recentCaptionSnippets: instagram.recentCaptionSnippets.slice(0, 4),
+            recurringTopics: instagram.recurringTopics.slice(0, 4),
+          },
+        }
+      : {}),
+    instagramSummaryNotes: (deriveInstagramSummaryNotes(instagram) || String(input.instagramSummaryNotes ?? "")).slice(0, 400),
   };
 }
 
@@ -1567,7 +2610,7 @@ function toStrategySections(
     if (value && typeof value === "object") return cleanStrategyText(formatStrategyObject(value as Record<string, unknown>));
     return cleanStrategyText(fallback);
   };
-  return {
+  return dedupeStrategySectionBodies({
     marketNarrative:
       canonical.marketNarrative ??
       toText(
@@ -1602,7 +2645,30 @@ function toStrategySections(
     assetRequirements:
       canonical.assetRequirements ??
       toText(structured.asset_requirements, sectionMap["asset requirements"] ?? ""),
-  };
+  });
+}
+
+function isRetryableClientQueryError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    return err.status >= 500;
+  }
+  return true;
+}
+
+function dedupeStrategySectionBodies(sections: StrategySections): StrategySections {
+  const seen = new Set<string>();
+  const next = { ...sections };
+  for (const { key } of CANONICAL_STRATEGY_SECTIONS) {
+    const value = String(next[key] ?? "").trim();
+    const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!normalized) continue;
+    if (seen.has(normalized)) {
+      next[key] = "";
+      continue;
+    }
+    seen.add(normalized);
+  }
+  return next;
 }
 
 function StrategyBody({ text }: { text: string }) {
@@ -1610,6 +2676,7 @@ function StrategyBody({ text }: { text: string }) {
   if (blocks.length === 0) {
     return <p className="text-sm text-muted-foreground italic">Add manual context to improve this section</p>;
   }
+  const hasSummaryAndBullets = blocks[0]?.kind === "paragraph" && blocks.some((block) => block.kind === "bullet");
   return (
     <div className="space-y-3">
       {blocks.map((block, index) => {
@@ -1631,7 +2698,9 @@ function StrategyBody({ text }: { text: string }) {
         }
         return (
           <p key={index} className="text-sm leading-relaxed text-foreground/90">
-            {block.text}
+            <span className={hasSummaryAndBullets && index === 0 ? "font-medium text-foreground" : ""}>
+              {block.text}
+            </span>
           </p>
         );
       })}
@@ -1644,12 +2713,23 @@ function buildStructuredStrategy(
   base: Record<string, unknown>,
   sectionApprovals: SectionApprovals,
 ): Record<string, unknown> {
+  const allReviewed = CANONICAL_STRATEGY_SECTIONS.every((section) => Boolean(sectionApprovals[section.key]));
+  const currentMeta = ((base.__meta as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+  const currentApproval = ((currentMeta.approval as ApprovalMeta | undefined) ?? undefined);
   return {
     ...base,
     canonicalSections: sections,
     __meta: {
-      ...((base.__meta as Record<string, unknown> | undefined) ?? {}),
+      ...currentMeta,
       sectionApprovals,
+      approval: allReviewed
+        ? currentApproval
+        : {
+            approved: false,
+            approvedAt: null,
+            approvedSnapshotId: currentApproval?.approvedSnapshotId,
+            approvalVersion: currentApproval?.approvalVersion,
+          } satisfies ApprovalMeta,
     },
   };
 }

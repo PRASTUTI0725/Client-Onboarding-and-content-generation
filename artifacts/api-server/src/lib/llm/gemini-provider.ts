@@ -68,6 +68,7 @@ export class GeminiProvider implements LLMProvider {
       });
     }
     const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+    params.onCompletionMeta?.({ finishReason: null, contentLength: text.length });
     const usage = json.usageMetadata;
     recordLatestAiUsage({
       provider: this.id,

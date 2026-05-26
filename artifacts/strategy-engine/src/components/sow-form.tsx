@@ -10,11 +10,20 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
+import { localApiFetch } from "@/lib/local-api";
 import { Plus, X, Save, Upload, FileText } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { cn } from "@/lib/utils";
 import { confirmPreflightLimit, estimateBytes, estimateTokens } from "@/lib/request-preflight";
+import {
+  buildInstagramValidationErrors,
+  countParsedItems,
+  looksLikeOptionalPlaceholder,
+  parseMultilineItems,
+} from "@/lib/instagram-intake";
+import { ResearchBriefImportBlock } from "@/components/research-brief-import-block";
+import type { ExistingClientValues, ResearchBriefApplyPayload, ResearchBriefImportMeta, ImportedResearchBrief } from "@workspace/research-brief";
 
 const PLATFORM_OPTIONS = ["Instagram", "LinkedIn", "Pinterest", "X", "YouTube"];
 const PILLAR_PRESETS = ["education", "thought_leadership", "social_proof", "behind_the_scenes", "promotion", "community"];
@@ -28,6 +37,35 @@ type SowParseMetaClient = {
 };
 
 type NormalizedSowSections = Record<string, string>;
+
+type StructuredInstagramInput = {
+  handle: string;
+  bio: string;
+  offerSummary: string;
+  recentCaptionSnippets: string[];
+  recurringTopics: string[];
+  additionalInstagramNotes?: string;
+  ctaPatterns?: string[];
+  proofSignals?: string[];
+  followerCount?: string;
+  category?: string;
+  visualStyleNotes?: string;
+};
+
+function hasStructuredInstagramContent(value: StructuredInstagramInput | null | undefined): boolean {
+  if (!value) return false;
+  const hasBio = value.bio.trim().length > 0;
+  const hasSupportingContent =
+    value.offerSummary.trim().length > 0 ||
+    value.recentCaptionSnippets.length > 0 ||
+    value.recurringTopics.length > 0;
+  return hasBio && hasSupportingContent;
+}
+
+function listToLines(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.map((item) => String(item ?? "").trim()).filter(Boolean).join("\n");
+}
 
 function buildLegacyScopeFields(strategyLaunch: string, contentCreation: string): string {
   return [strategyLaunch, contentCreation].map((s) => s.trim()).filter(Boolean).join("\n\n");
@@ -49,7 +87,7 @@ function AutoGrowNarrativeTextarea({ className, value, onChange, ...rest }: Text
       onChange={onChange}
       rows={1}
       className={cn(
-        "min-h-44 w-full max-h-[min(70vh,42rem)] text-base leading-relaxed max-w-none overflow-y-auto resize-y",
+        "min-h-44 min-w-0 w-full max-h-[min(70vh,42rem)] text-base leading-relaxed max-w-none overflow-y-auto resize-y",
         className,
       )}
       {...rest}
@@ -63,10 +101,17 @@ export type SowFormProps = {
   onSaved?: () => void;
   /** Only for create / first-time flows. Hide on client detail so founders review extracted text, not re-upload. */
   showSowPdfUpload?: boolean;
+  clientBasics?: {
+    name?: string;
+    website?: string;
+    instagramHandle?: string;
+    oneLineDescription?: string;
+  };
 };
 
-export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }: SowFormProps) {
+export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false, clientBasics }: SowFormProps) {
   const initialAny = (initial ?? null) as unknown as Record<string, unknown> | null;
+  const initialInstagram = ((initialAny?.instagram ?? null) as StructuredInstagramInput | null) ?? null;
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const [optimisticApproval, setOptimisticApproval] = useState<boolean | null>(null);
@@ -131,6 +176,9 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
   }>(null);
   const [showExtractedText, setShowExtractedText] = useState(false);
   const [parseFeedback, setParseFeedback] = useState<string>("");
+  const [pendingImportedResearchBrief, setPendingImportedResearchBrief] = useState<ImportedResearchBrief | null>(null);
+  const [pendingResearchBriefImportMeta, setPendingResearchBriefImportMeta] = useState<ResearchBriefImportMeta | null>(null);
+  const [pendingClientBasics, setPendingClientBasics] = useState<ResearchBriefApplyPayload["clientBasics"] | null>(null);
   const [industry, setIndustry] = useState(
     initialAny?.industry != null ? String(initialAny.industry) : "",
   );
@@ -154,6 +202,34 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
   const [excludedCommercial, setExcludedCommercial] = useState(
     initialAny?.excludedCommercial != null ? String(initialAny.excludedCommercial) : "",
   );
+  const [instagramHandle, setInstagramHandle] = useState(initialInstagram?.handle ?? "");
+  const [instagramBio, setInstagramBio] = useState(initialInstagram?.bio ?? "");
+  const [instagramOfferSummary, setInstagramOfferSummary] = useState(initialInstagram?.offerSummary ?? "");
+  const [instagramRecentCaptions, setInstagramRecentCaptions] = useState(
+    listToLines(initialInstagram?.recentCaptionSnippets),
+  );
+  const [instagramRecurringTopics, setInstagramRecurringTopics] = useState(
+    listToLines(initialInstagram?.recurringTopics),
+  );
+  const [instagramCtaPatterns, setInstagramCtaPatterns] = useState(listToLines(initialInstagram?.ctaPatterns));
+  const [instagramProofSignals, setInstagramProofSignals] = useState(listToLines(initialInstagram?.proofSignals));
+  const [instagramFollowerCount, setInstagramFollowerCount] = useState(initialInstagram?.followerCount ?? "");
+  const [instagramCategory, setInstagramCategory] = useState(initialInstagram?.category ?? "");
+  const [instagramVisualStyleNotes, setInstagramVisualStyleNotes] = useState(
+    initialInstagram?.visualStyleNotes ?? "",
+  );
+  const [additionalInstagramNotes, setAdditionalInstagramNotes] = useState(
+    initialInstagram?.additionalInstagramNotes ?? "",
+  );
+  const [showAdvancedInstagramDetails, setShowAdvancedInstagramDetails] = useState(
+    Boolean(
+      (initialInstagram?.ctaPatterns?.length ?? 0) > 0 ||
+        (initialInstagram?.proofSignals?.length ?? 0) > 0 ||
+        initialInstagram?.followerCount ||
+        initialInstagram?.category ||
+        initialInstagram?.visualStyleNotes,
+    ),
+  );
   const initialParseMeta = (initialAny?.parseMeta ?? null) as SowParseMetaClient | null;
   const [parseMetaState, setParseMetaState] = useState<SowParseMetaClient | null>(null);
   const displayParseMeta = parseMetaState ?? initialParseMeta;
@@ -173,6 +249,7 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
         s: (initial as unknown as Record<string, unknown> | null)?.scopeOfWork,
         sl: (initial as unknown as Record<string, unknown> | null)?.strategyLaunchPlanning,
         cc: (initial as unknown as Record<string, unknown> | null)?.contentCreation,
+        ig: (initial as unknown as Record<string, unknown> | null)?.instagram,
       }),
     [initial],
   );
@@ -188,7 +265,70 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
     else if (i.scopeOfWork != null) setScopeOfWorkText(String(i.scopeOfWork));
     if (i.contentCreation != null) setContentCreationText(String(i.contentCreation));
     if (i.excludedCommercial != null) setExcludedCommercial(String(i.excludedCommercial));
+    const instagram = ((i.instagram ?? null) as StructuredInstagramInput | null) ?? null;
+    setInstagramHandle(instagram?.handle ?? "");
+    setInstagramBio(instagram?.bio ?? "");
+    setInstagramOfferSummary(instagram?.offerSummary ?? "");
+    setInstagramRecentCaptions(listToLines(instagram?.recentCaptionSnippets));
+    setInstagramRecurringTopics(listToLines(instagram?.recurringTopics));
+    setInstagramCtaPatterns(listToLines(instagram?.ctaPatterns));
+    setInstagramProofSignals(listToLines(instagram?.proofSignals));
+    setInstagramFollowerCount(instagram?.followerCount ?? "");
+    setInstagramCategory(instagram?.category ?? "");
+    setInstagramVisualStyleNotes(instagram?.visualStyleNotes ?? "");
+    setAdditionalInstagramNotes(instagram?.additionalInstagramNotes ?? "");
+    setShowAdvancedInstagramDetails(
+      Boolean(
+        (instagram?.ctaPatterns?.length ?? 0) > 0 ||
+          (instagram?.proofSignals?.length ?? 0) > 0 ||
+          instagram?.followerCount ||
+          instagram?.category ||
+          instagram?.visualStyleNotes,
+      ),
+    );
   }, [initial, initialSig]);
+
+  const parsedInstagramRecentCaptions = useMemo(
+    () => parseMultilineItems(instagramRecentCaptions),
+    [instagramRecentCaptions],
+  );
+  const parsedInstagramRecurringTopics = useMemo(
+    () => parseMultilineItems(instagramRecurringTopics, { allowCommaFallback: true }),
+    [instagramRecurringTopics],
+  );
+  const parsedInstagramCtaPatterns = useMemo(
+    () => parseMultilineItems(instagramCtaPatterns),
+    [instagramCtaPatterns],
+  );
+  const parsedInstagramProofSignals = useMemo(
+    () => parseMultilineItems(instagramProofSignals),
+    [instagramProofSignals],
+  );
+  const instagramCaptionCount = countParsedItems(instagramRecentCaptions);
+  const instagramTopicCount = countParsedItems(instagramRecurringTopics, { allowCommaFallback: true });
+  const optionalInstagramWarnings = [
+    looksLikeOptionalPlaceholder(additionalInstagramNotes)
+      ? "Additional Instagram Notes looks like example or placeholder text and may be ignored later."
+      : "",
+    looksLikeOptionalPlaceholder(instagramCtaPatterns, [
+      "Link in bio to join\nDM me START for details\nComment YES if you want more",
+    ])
+      ? "CTA Patterns still matches the example text. Replace it with real client language or leave it empty."
+      : "",
+    looksLikeOptionalPlaceholder(instagramProofSignals, [
+      "Client testimonials in highlights\nBefore and after results\nFeatured in local media",
+    ])
+      ? "Proof / Trust Signals still matches the example text. Replace it with real proof or leave it empty."
+      : "",
+    looksLikeOptionalPlaceholder(instagramCategory, ["Fitness Coach / E-commerce / Bakery"])
+      ? "Profile Category still looks like the example placeholder. Replace it with the real profile category or leave it blank."
+      : "",
+    looksLikeOptionalPlaceholder(instagramVisualStyleNotes, [
+      "Light, minimal, beige tones; consistent grid layout; high-contrast reels thumbnails.",
+    ])
+      ? "Visual Style Notes still looks like the example placeholder. Replace it with real notes or leave it empty."
+      : "",
+  ].filter(Boolean);
 
   useEffect(() => {
     if (approvedFromServer) setOptimisticApproval(null);
@@ -301,6 +441,47 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
       });
       return;
     }
+    const instagram = {
+      handle: instagramHandle.trim(),
+      bio: instagramBio.trim(),
+      offerSummary: instagramOfferSummary.trim(),
+      recentCaptionSnippets: parsedInstagramRecentCaptions,
+      recurringTopics: parsedInstagramRecurringTopics,
+      ...(additionalInstagramNotes.trim()
+        ? { additionalInstagramNotes: additionalInstagramNotes.trim() }
+        : {}),
+      ...(parsedInstagramCtaPatterns.length > 0 ? { ctaPatterns: parsedInstagramCtaPatterns } : {}),
+      ...(parsedInstagramProofSignals.length > 0 ? { proofSignals: parsedInstagramProofSignals } : {}),
+      ...(instagramFollowerCount.trim() ? { followerCount: instagramFollowerCount.trim() } : {}),
+      ...(instagramCategory.trim() ? { category: instagramCategory.trim() } : {}),
+      ...(instagramVisualStyleNotes.trim() ? { visualStyleNotes: instagramVisualStyleNotes.trim() } : {}),
+    };
+    const hasExistingStructuredInstagram = hasStructuredInstagramContent(initialInstagram);
+    const isActivelyFillingInstagramBlock = Boolean(
+      instagram.handle ||
+        instagram.bio ||
+        instagram.offerSummary ||
+        instagram.recentCaptionSnippets.length > 0 ||
+        instagram.recurringTopics.length > 0,
+    );
+    const shouldRequireStructuredInstagram = hasExistingStructuredInstagram || isActivelyFillingInstagramBlock;
+    const instagramValidationErrors = shouldRequireStructuredInstagram
+      ? buildInstagramValidationErrors({
+          handle: instagram.handle,
+          bio: instagram.bio,
+          offerSummary: instagram.offerSummary,
+          recentCaptionCount: instagram.recentCaptionSnippets.length,
+          recurringTopicCount: instagram.recurringTopics.length,
+        })
+      : [];
+    if (instagramValidationErrors.length > 0) {
+      toast({
+        title: "Instagram context incomplete",
+        description: instagramValidationErrors.join(" "),
+        variant: "destructive",
+      });
+      return;
+    }
     const approved = true;
     const preservedPdf = initialAny?.pdfExtraction;
     const pMismatch = initialAny?.pdfMismatch as
@@ -361,6 +542,7 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
         contentMix,
         deliverables,
         toneByPlatform,
+        ...(shouldRequireStructuredInstagram ? { instagram } : {}),
         ...(pMismatch
           ? {
               pdfMismatch: {
@@ -370,6 +552,8 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
             }
           : {}),
         ...(preservedPdfSlim != null ? { pdfExtraction: preservedPdfSlim } : {}),
+        ...(pendingResearchBriefImportMeta ? { researchBriefImport: pendingResearchBriefImportMeta } : {}),
+        ...(pendingClientBasics ? { clientBasics: pendingClientBasics } : {}),
       },
     } as unknown as Parameters<typeof update.mutate>[0];
     const preflightPayload = {
@@ -381,6 +565,17 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
         strategyLaunchPlanning: sl.slice(0, 1200),
         contentCreation: cc.slice(0, 1200),
         deliverables: deliverables.slice(0, 8),
+        ...(shouldRequireStructuredInstagram
+          ? {
+              instagram: {
+                handle: instagram.handle,
+                bio: instagram.bio.slice(0, 500),
+                offerSummary: instagram.offerSummary.slice(0, 300),
+                recentCaptionSnippets: instagram.recentCaptionSnippets.slice(0, 6),
+                recurringTopics: instagram.recurringTopics.slice(0, 5),
+              },
+            }
+          : {}),
         platforms,
         monthlyPosts,
         contentMix,
@@ -407,7 +602,7 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
       setPdfParsing(true);
       const fd = new FormData();
       fd.append("file", pdfFile);
-      const res = await fetch(`/api/clients/${clientId}/sow/pdf-parse`, {
+      const res = await localApiFetch(`/api/clients/${clientId}/sow/pdf-parse`, {
         method: "POST",
         body: fd,
       });
@@ -537,6 +732,125 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
   const extractedSummarySections =
     (pdfResult?.suggestions.normalizedSections as NormalizedSowSections | undefined) ?? savedNormalizedSections;
   const summaryEntries = Object.entries(extractedSummarySections).filter(([, value]) => String(value ?? "").trim());
+
+  const importExistingValues = useMemo<ExistingClientValues>(
+    () => ({
+      clientName: clientBasics?.name ?? "",
+      website: clientBasics?.website ?? "",
+      instagramHandle: clientBasics?.instagramHandle ?? instagramHandle,
+      oneLineDescription: clientBasics?.oneLineDescription ?? "",
+      industry,
+      targetAudience,
+      understandingOfRequirements,
+      strategyLaunchPlanning: scopeOfWorkText,
+      contentCreation: contentCreationText,
+      deliverables,
+      instagram: {
+        handle: instagramHandle,
+        bio: instagramBio,
+        offerSummary: instagramOfferSummary,
+        recentCaptionSnippets: parsedInstagramRecentCaptions,
+        recurringTopics: parsedInstagramRecurringTopics,
+        ctaPatterns: parsedInstagramCtaPatterns,
+        proofSignals: parsedInstagramProofSignals,
+        followerCount: instagramFollowerCount,
+        category: instagramCategory,
+        visualStyleNotes: instagramVisualStyleNotes,
+        additionalInstagramNotes,
+      },
+    }),
+    [
+      clientBasics,
+      industry,
+      targetAudience,
+      understandingOfRequirements,
+      scopeOfWorkText,
+      contentCreationText,
+      deliverables,
+      instagramHandle,
+      instagramBio,
+      instagramOfferSummary,
+      parsedInstagramRecentCaptions,
+      parsedInstagramRecurringTopics,
+      parsedInstagramCtaPatterns,
+      parsedInstagramProofSignals,
+      instagramFollowerCount,
+      instagramCategory,
+      instagramVisualStyleNotes,
+      additionalInstagramNotes,
+    ],
+  );
+
+  async function handleResearchBriefImport(payload: ResearchBriefApplyPayload) {
+    if (payload.clientBasics) {
+      setPendingClientBasics((prev) => ({ ...prev, ...payload.clientBasics }));
+    }
+    if (payload.clientBasics?.instagramHandle) {
+      setInstagramHandle(payload.clientBasics.instagramHandle);
+    }
+    if (payload.sow?.industry) setIndustry(payload.sow.industry);
+    if (payload.sow?.targetAudience) setTargetAudience(payload.sow.targetAudience);
+    if (payload.sow?.understandingOfRequirements) setUnderstandingOfRequirements(payload.sow.understandingOfRequirements);
+    if (payload.sow?.strategyLaunchPlanning) setScopeOfWorkText(payload.sow.strategyLaunchPlanning);
+    if (payload.sow?.contentCreation) setContentCreationText(payload.sow.contentCreation);
+    if (payload.sow?.deliverables?.length) {
+      setDeliverables((prev) => Array.from(new Set([...prev, ...payload.sow!.deliverables!])));
+    }
+    if (payload.instagram?.handle) setInstagramHandle(payload.instagram.handle);
+    if (payload.instagram?.bio) setInstagramBio(payload.instagram.bio);
+    if (payload.instagram?.offerSummary) setInstagramOfferSummary(payload.instagram.offerSummary);
+    if (payload.instagram?.recentCaptionSnippets?.length) {
+      setInstagramRecentCaptions(payload.instagram.recentCaptionSnippets.join("\n"));
+    }
+    if (payload.instagram?.recurringTopics?.length) {
+      setInstagramRecurringTopics(payload.instagram.recurringTopics.join("\n"));
+    }
+    if (payload.instagram?.ctaPatterns?.length) {
+      setInstagramCtaPatterns(payload.instagram.ctaPatterns.join("\n"));
+      setShowAdvancedInstagramDetails(true);
+    }
+    if (payload.instagram?.proofSignals?.length) {
+      setInstagramProofSignals(payload.instagram.proofSignals.join("\n"));
+      setShowAdvancedInstagramDetails(true);
+    }
+    if (payload.instagram?.followerCount) {
+      setInstagramFollowerCount(payload.instagram.followerCount);
+      setShowAdvancedInstagramDetails(true);
+    }
+    if (payload.instagram?.category) {
+      setInstagramCategory(payload.instagram.category);
+      setShowAdvancedInstagramDetails(true);
+    }
+    if (payload.instagram?.visualStyleNotes) {
+      setInstagramVisualStyleNotes(payload.instagram.visualStyleNotes);
+      setShowAdvancedInstagramDetails(true);
+    }
+    if (payload.instagram?.additionalInstagramNotes) {
+      setAdditionalInstagramNotes(payload.instagram.additionalInstagramNotes);
+    }
+
+    setPendingImportedResearchBrief(payload.importedResearchBrief);
+    setPendingResearchBriefImportMeta(payload.researchBriefImportMeta);
+
+    try {
+      const res = await localApiFetch(`/api/clients/${clientId}/onboarding`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ importedResearchBrief: payload.importedResearchBrief }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(detail || `HTTP ${res.status}`);
+      }
+      queryClient.invalidateQueries({ queryKey: getGetClientQueryKey(clientId) });
+    } catch (err) {
+      toast({
+        title: "Imported to form; save pending",
+        description: `Research notes could not persist yet: ${String(err)}`,
+        variant: "destructive",
+      });
+    }
+  }
 
   return (
     <div className="space-y-8" data-sow-version="2">
@@ -705,6 +1019,13 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
       )}
 
       <SowBlock
+        title="Import Research Brief"
+        kicker="Paste or upload a standardized Markdown brief (.md / .txt). Review the preview before fields are filled — nothing overwrites existing values without confirmation."
+      >
+        <ResearchBriefImportBlock existing={importExistingValues} onConfirmImport={handleResearchBriefImport} />
+      </SowBlock>
+
+      <SowBlock
         title="Client industry"
         kicker="Paste the category, product type, and market context for this client."
       >
@@ -803,6 +1124,178 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
             <Button variant="outline" size="sm" onClick={addDeliverable} className="w-full sm:w-auto self-start" type="button">
               <Plus className="size-4" />
             </Button>
+          </div>
+        </div>
+      </SowBlock>
+
+      <SowBlock
+        title="Instagram Context"
+        kicker="Fill this carefully. This is the main source of truth about the client’s Instagram presence for v1 generation."
+      >
+        <div className="space-y-5">
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">Instagram Handle</p>
+            <p className="text-xs text-muted-foreground">Enter the exact Instagram handle with or without @.</p>
+            <Input
+              value={instagramHandle}
+              onChange={(e) => setInstagramHandle(e.target.value)}
+              placeholder="@yourbrand"
+              className="text-base h-11"
+              data-testid="sow-instagram-handle-input"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">Profile Bio</p>
+            <p className="text-xs text-muted-foreground">Paste the full bio exactly as shown, including CTA or link language.</p>
+            <Textarea
+              value={instagramBio}
+              onChange={(e) => setInstagramBio(e.target.value)}
+              placeholder="Paste the full bio text exactly as it appears on the profile."
+              className="min-h-24 text-base"
+              data-testid="sow-instagram-bio-input"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">What They Sell / Offer</p>
+            <p className="text-xs text-muted-foreground">In 1-3 sentences, describe the main service, product, or transformation promoted on Instagram.</p>
+            <Textarea
+              value={instagramOfferSummary}
+              onChange={(e) => setInstagramOfferSummary(e.target.value)}
+              placeholder="In 1-3 sentences, what does this business offer on Instagram?"
+              className="min-h-24 text-base"
+              data-testid="sow-instagram-offer-input"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">Recent Post Captions or Post Themes</p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">One idea per line</p>
+              <p className="text-xs font-medium text-muted-foreground">{instagramCaptionCount} / 4 minimum</p>
+            </div>
+            <Textarea
+              value={instagramRecentCaptions}
+              onChange={(e) => setInstagramRecentCaptions(e.target.value)}
+              placeholder={'New workshop this weekend - sign up link in bio\nBehind the scenes of our shoot for brand X\nTop 3 mistakes people make when starting yoga at home'}
+              className="min-h-32 text-base"
+              data-testid="sow-instagram-captions-input"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">Recurring Content Topics</p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">One topic per line</p>
+              <p className="text-xs font-medium text-muted-foreground">{instagramTopicCount} / 3 minimum</p>
+            </div>
+            <Textarea
+              value={instagramRecurringTopics}
+              onChange={(e) => setInstagramRecurringTopics(e.target.value)}
+              placeholder={'home workouts\nmeal prep ideas\nclient transformations'}
+              className="min-h-28 text-base"
+              data-testid="sow-instagram-topics-input"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">Additional Instagram Notes</p>
+            <p className="text-xs text-muted-foreground">Optional. Add anything else useful for strategy, including CTA ideas, proof signals, or private Instagram insights.</p>
+            <Textarea
+              value={additionalInstagramNotes}
+              onChange={(e) => setAdditionalInstagramNotes(e.target.value)}
+              placeholder="Optional: paste private Instagram insights, CTA notes, audience observations, proof cues, or anything helpful that does not fit the required fields."
+              className="min-h-24 text-base"
+              data-testid="sow-instagram-additional-notes-input"
+            />
+          </div>
+          {optionalInstagramWarnings.length > 0 ? (
+            <Alert className="border-amber-300 bg-amber-50/80 text-amber-950">
+              <AlertTitle>Optional Instagram notes may still contain placeholder text</AlertTitle>
+              <AlertDescription>
+                <ul className="list-disc space-y-1 pl-5">
+                  {optionalInstagramWarnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          ) : null}
+          <div className="rounded-xl border border-border/70 bg-muted/20 p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium text-foreground">Advanced Instagram details</p>
+                <p className="text-xs text-muted-foreground">
+                  Optional. Use this only if you have extra proof, CTA, category, or visual notes.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setShowAdvancedInstagramDetails((prev) => !prev)}
+                data-testid="toggle-instagram-advanced-details"
+              >
+                {showAdvancedInstagramDetails ? "Hide advanced details" : "Show advanced details"}
+              </Button>
+            </div>
+            {showAdvancedInstagramDetails ? (
+              <div className="mt-4 space-y-5">
+                <div className="space-y-1.5">
+                  <p className="text-sm font-medium text-foreground">CTA Patterns</p>
+                  <p className="text-xs text-muted-foreground">Optional. Add repeated calls to action, one per line.</p>
+                  <Textarea
+                    value={instagramCtaPatterns}
+                    onChange={(e) => setInstagramCtaPatterns(e.target.value)}
+                    placeholder={"Link in bio to join\nDM me START for details\nComment YES if you want more"}
+                    className="min-h-24 text-base"
+                    data-testid="sow-instagram-cta-input"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <p className="text-sm font-medium text-foreground">Proof / Trust Signals</p>
+                  <p className="text-xs text-muted-foreground">Optional. Add visible testimonials, results, media logos, or proof cues, one per line.</p>
+                  <Textarea
+                    value={instagramProofSignals}
+                    onChange={(e) => setInstagramProofSignals(e.target.value)}
+                    placeholder={"Client testimonials in highlights\nBefore and after results\nFeatured in local media"}
+                    className="min-h-24 text-base"
+                    data-testid="sow-instagram-proof-input"
+                  />
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <p className="text-sm font-medium text-foreground">Follower Count</p>
+                    <p className="text-xs text-muted-foreground">Optional. Enter it as shown, like 12.4K or 123K.</p>
+                    <Input
+                      value={instagramFollowerCount}
+                      onChange={(e) => setInstagramFollowerCount(e.target.value)}
+                      placeholder="12.4K"
+                      className="text-base h-11"
+                      data-testid="sow-instagram-followers-input"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-sm font-medium text-foreground">Profile Category</p>
+                    <p className="text-xs text-muted-foreground">Optional. Enter the profile category shown under the name.</p>
+                    <Input
+                      value={instagramCategory}
+                      onChange={(e) => setInstagramCategory(e.target.value)}
+                      placeholder="Fitness Coach / E-commerce / Bakery"
+                      className="text-base h-11"
+                      data-testid="sow-instagram-category-input"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <p className="text-sm font-medium text-foreground">Visual Style Notes</p>
+                  <p className="text-xs text-muted-foreground">Optional. Describe the overall vibe, colors, layout, or thumbnail style.</p>
+                  <Textarea
+                    value={instagramVisualStyleNotes}
+                    onChange={(e) => setInstagramVisualStyleNotes(e.target.value)}
+                    placeholder="Light, minimal, beige tones; consistent grid layout; high-contrast reels thumbnails."
+                    className="min-h-24 text-base"
+                    data-testid="sow-instagram-visual-input"
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       </SowBlock>
@@ -990,11 +1483,11 @@ export function SowForm({ clientId, initial, onSaved, showSowPdfUpload = false }
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 rounded-lg border border-border bg-muted/15 p-4">
           <div>
             {update.isPending && optimisticApproval ? (
-              <Badge className="bg-sky-600 hover:bg-sky-600 text-white border-0 text-sm">Saving approval...</Badge>
+              <Badge data-testid="sow-approval-status" className="bg-sky-600 hover:bg-sky-600 text-white border-0 text-sm">Saving approval...</Badge>
             ) : isApproved ? (
-              <Badge className="bg-emerald-600 hover:bg-emerald-600 text-white border-0 text-sm">Approved and saved</Badge>
+              <Badge data-testid="sow-approval-status" className="bg-emerald-600 hover:bg-emerald-600 text-white border-0 text-sm">Approved and saved</Badge>
             ) : (
-              <Badge variant="outline" className="text-amber-800 border-amber-300 bg-amber-50 text-sm">
+              <Badge data-testid="sow-approval-status" variant="outline" className="text-amber-800 border-amber-300 bg-amber-50 text-sm">
                 Not approved — save below when ready
               </Badge>
             )}
@@ -1044,7 +1537,7 @@ function SowBlock({
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-border/80 bg-card/30 p-5 sm:p-6 space-y-3 shadow-sm">
+    <div className="rounded-xl border border-border/80 bg-card/30 p-5 sm:p-6 space-y-3 shadow-sm min-w-0 overflow-hidden">
       <h3 className="text-lg sm:text-xl font-bold tracking-tight text-foreground">{title}</h3>
       {kicker && <p className="text-sm text-muted-foreground leading-relaxed -mt-1 mb-1">{kicker}</p>}
       {sourceHint ? (

@@ -29,9 +29,10 @@ export function AISettingsDialog() {
   const [open, setOpen] = useState(false);
   const { toast } = useToast();
   const [useRealAI, setUseRealAI] = useState(true);
-  const [provider, setProvider] = useState<AIProvider>("openrouter");
+  const [provider, setProvider] = useState<AIProvider>("groq");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
+  const [providerOverrideEnabled, setProviderOverrideEnabled] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -40,10 +41,17 @@ export function AISettingsDialog() {
     setProvider(settings.provider);
     setApiKey(settings.apiKey);
     setModel(settings.model);
+    setProviderOverrideEnabled(settings.providerOverrideEnabled === true);
   }, [open]);
 
   function save() {
-    writeAISettings({ useRealAI, provider, apiKey: apiKey.trim(), model: model.trim() });
+    writeAISettings({
+      useRealAI,
+      provider,
+      apiKey: apiKey.trim(),
+      model: model.trim(),
+      providerOverrideEnabled,
+    });
     toast({
       title: "AI settings saved",
       description: useRealAI
@@ -79,6 +87,15 @@ export function AISettingsDialog() {
           </label>
           <div className="space-y-1.5">
             <Label>Provider</Label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={providerOverrideEnabled}
+                onChange={(e) => setProviderOverrideEnabled(e.target.checked)}
+                className="size-4 accent-primary"
+              />
+              Explicitly override provider/model for requests
+            </label>
             <div className="flex flex-wrap gap-2">
               {PROVIDERS.map((p) => (
                 <Button
@@ -88,6 +105,7 @@ export function AISettingsDialog() {
                   size="sm"
                   onClick={() => setProvider(p)}
                   className="capitalize"
+                  disabled={!providerOverrideEnabled}
                 >
                   {p}
                 </Button>
@@ -112,6 +130,7 @@ export function AISettingsDialog() {
               value={model}
               onChange={(e) => setModel(e.target.value)}
               placeholder="e.g. sonar-pro, gpt-4o-mini"
+              disabled={!providerOverrideEnabled}
             />
           </div>
         </div>

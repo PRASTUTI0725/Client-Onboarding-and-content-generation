@@ -10,6 +10,7 @@ import { AISettingsDialog } from "@/components/ai-settings-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { RuntimeModeBanner } from "@/components/runtime-mode-banner";
 import { useToast } from "@/hooks/use-toast";
+import { localApiFetch } from "@/lib/local-api";
 
 export default function Dashboard() {
   const queryClient = useQueryClient();
@@ -19,7 +20,7 @@ export default function Dashboard() {
   const clientList = Array.isArray(clients) ? clients : [];
   const loadDemo = useMutation({
     mutationFn: async () => {
-      const res = await fetch("/api/clients/demo/seed", { method: "POST" });
+      const res = await localApiFetch("/api/clients/demo/seed", { method: "POST" });
       if (!res.ok) throw new Error(`Demo seed failed: ${res.status}`);
       return res.json() as Promise<{ added: number; message: string }>;
     },

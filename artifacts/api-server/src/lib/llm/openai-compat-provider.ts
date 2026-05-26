@@ -122,6 +122,15 @@ export class OpenAICompatProvider implements LLMProvider {
         totalTokens: usage?.total_tokens ?? null,
         rateLimits: extractRateLimits(this.id, response.headers),
       });
+      params.onCompletionMeta?.({ finishReason: fr ?? null, contentLength: text.length });
+      if (
+        (fr === "length" || fr === "max_tokens") &&
+        params.contextLabel?.toLowerCase().includes("business dna")
+      ) {
+        console.warn(
+          `[business_dna] provider_output_truncated provider=${this.id} model=${model} context=${params.contextLabel} finish_reason=${fr} content_len=${text.length} max_out=${params.maxOutputTokens}`,
+        );
+      }
       if (diag) {
         console.info(
           `[llm] openai_compat.create ok provider=${this.id} model=${model} ` +

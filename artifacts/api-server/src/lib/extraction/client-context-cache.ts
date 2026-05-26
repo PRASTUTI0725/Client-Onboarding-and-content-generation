@@ -9,6 +9,23 @@ type CacheEntry = {
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const contextCache = new Map<string, CacheEntry>();
 
+function normalizeWebsiteUrl(value: string | null | undefined): string {
+  const input = typeof value === "string" ? value.trim() : "";
+  if (!input) return "";
+  try {
+    const url = new URL(input);
+    return `${url.hostname.replace(/^www\./, "").toLowerCase()}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return input.toLowerCase();
+  }
+}
+
+function normalizeInstagramIdentity(value: string | null | undefined): string {
+  const input = typeof value === "string" ? value.trim() : "";
+  if (!input) return "";
+  return input.replace(/^https?:\/\/(www\.)?instagram\.com\//i, "").replace(/^@/, "").replace(/[/?#].*$/, "").toLowerCase();
+}
+
 export async function getClientContextWithCache(input: {
   clientId: string;
   websiteUrl?: string | null;
@@ -23,7 +40,12 @@ export async function getClientContextWithCache(input: {
   instagramMs: number;
 }> {
   const timeoutMs = Math.max(1500, input.timeoutMs ?? 6000);
-  const cached = contextCache.get(input.clientId);
+  const cacheKey = [
+    input.clientId,
+    normalizeWebsiteUrl(input.websiteUrl),
+    normalizeInstagramIdentity(input.instagramUrlOrHandle),
+  ].join("|");
+  const cached = contextCache.get(cacheKey);
   if (!input.forceRefresh && cached && cached.expiresAt > Date.now()) {
     return {
       websiteSummary: cached.websiteSummary,
@@ -47,7 +69,7 @@ export async function getClientContextWithCache(input: {
     websiteSummary: websiteResult.value,
     instagramSummary: instagramResult.value,
   };
-  contextCache.set(input.clientId, value);
+  contextCache.set(cacheKey, value);
 
   return {
     websiteSummary: websiteResult.value,

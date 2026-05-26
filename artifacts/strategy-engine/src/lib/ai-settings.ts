@@ -13,26 +13,28 @@ export type AISettings = {
   provider: AIProvider;
   apiKey: string;
   model: string;
+  providerOverrideEnabled?: boolean;
 };
 
 const STORAGE_KEY = "strategy-engine-ai-settings";
 
 export function readAISettings(): AISettings {
   if (typeof window === "undefined") {
-    return { useRealAI: true, provider: "openrouter", apiKey: "", model: "" };
+    return { useRealAI: true, provider: "groq", apiKey: "", model: "", providerOverrideEnabled: false };
   }
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { useRealAI: true, provider: "openrouter", apiKey: "", model: "" };
+    if (!raw) return { useRealAI: true, provider: "groq", apiKey: "", model: "", providerOverrideEnabled: false };
     const parsed = JSON.parse(raw) as Partial<AISettings>;
     return {
       useRealAI: parsed.useRealAI ?? true,
-      provider: parsed.provider ?? "openrouter",
+      provider: parsed.provider ?? "groq",
       apiKey: parsed.apiKey ?? "",
       model: parsed.model ?? "",
+      providerOverrideEnabled: parsed.providerOverrideEnabled === true,
     };
   } catch {
-    return { useRealAI: true, provider: "openrouter", apiKey: "", model: "" };
+    return { useRealAI: true, provider: "groq", apiKey: "", model: "", providerOverrideEnabled: false };
   }
 }
 
@@ -45,8 +47,8 @@ export function writeAISettings(next: AISettings) {
 export function buildAIHeaders(settings: AISettings): Record<string, string> {
   return {
     "x-use-real-ai": settings.useRealAI ? "true" : "false",
-    "x-ai-provider": settings.provider,
+    ...(settings.providerOverrideEnabled ? { "x-ai-provider": settings.provider } : {}),
     ...(settings.apiKey ? { "x-ai-api-key": settings.apiKey } : {}),
-    ...(settings.model ? { "x-ai-model": settings.model } : {}),
+    ...(settings.providerOverrideEnabled && settings.model ? { "x-ai-model": settings.model } : {}),
   };
 }

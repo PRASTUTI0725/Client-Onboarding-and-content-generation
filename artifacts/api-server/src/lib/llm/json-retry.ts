@@ -1,4 +1,54 @@
-import type { ChatMessage, LLMProvider } from "./types.js";
+import type { ChatCompletionMeta, ChatMessage, LLMProvider } from "./types.js";
+
+import { logBusinessDnaJsonFailure } from "../business-dna/json-log.js";
+import { setLastFailureStage } from "../runtime-mode.js";
+
+export class JsonStageFailureError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly contextLabel: string;
+  readonly retryRan: boolean;
+  readonly repairRan: boolean;
+  readonly finalReason: string;
+  readonly rawFirstHash: string;
+  readonly rawFirstPreview: string;
+  readonly rawRetryHash?: string;
+  readonly rawRetryPreview?: string;
+  readonly rawRepairHash?: string;
+  readonly rawRepairPreview?: string;
+  readonly errorCode = "invalid_json_after_retry";
+
+  constructor(input: {
+    provider: string;
+    model: string;
+    contextLabel: string;
+    retryRan: boolean;
+    repairRan: boolean;
+    finalReason: string;
+    rawFirst: string;
+    rawRetry?: string;
+    rawRepair?: string;
+  }) {
+    super(`Invalid JSON from LLM for ${input.contextLabel}: ${input.finalReason}`);
+    this.name = "JsonStageFailureError";
+    this.provider = input.provider;
+    this.model = input.model;
+    this.contextLabel = input.contextLabel;
+    this.retryRan = input.retryRan;
+    this.repairRan = input.repairRan;
+    this.finalReason = input.finalReason;
+    this.rawFirstHash = hashPreview(input.rawFirst || "");
+    this.rawFirstPreview = (input.rawFirst || "").slice(0, 600);
+    if (typeof input.rawRetry === "string") {
+      this.rawRetryHash = hashPreview(input.rawRetry);
+      this.rawRetryPreview = input.rawRetry.slice(0, 600);
+    }
+    if (typeof input.rawRepair === "string") {
+      this.rawRepairHash = hashPreview(input.rawRepair);
+      this.rawRepairPreview = input.rawRepair.slice(0, 600);
+    }
+  }
+}
 
 export async function getStrictJsonWithRetry<T>(
   provider: LLMProvider,
@@ -6,6 +56,8 @@ export async function getStrictJsonWithRetry<T>(
     messages: ChatMessage[];
     maxOutputTokens: number;
     contextLabel: string;
+    onRawResponse?: (raw: string, attempt: "first" | "retry" | "repair") => void;
+    onCompletionMeta?: (meta: ChatCompletionMeta, attempt: "first" | "retry" | "repair") => void;
   },
 ): Promise<T> {
   const startedAt = Date.now();
@@ -29,12 +81,32 @@ export async function getStrictJsonWithRetry<T>(
     return null;
   };
 
-  const first = await provider.chatCompletion({
-    messages: options.messages,
-    maxOutputTokens: options.maxOutputTokens,
-    responseFormat: "json_object",
-  });
+  const chatParams = (
+    messages: ChatMessage[],
+    attempt: "first" | "retry" | "repair",
+    contextLabel = options.contextLabel,
+  ) => {
+    let finishReason: string | null = null;
+    return {
+      request: {
+        messages,
+        maxOutputTokens: options.maxOutputTokens,
+        responseFormat: "json_object" as const,
+        contextLabel,
+        onCompletionMeta: (meta: ChatCompletionMeta) => {
+          finishReason = meta.finishReason ?? null;
+          options.onCompletionMeta?.(meta, attempt);
+        },
+      },
+      finishReason: () => finishReason,
+    };
+  };
+
+  const firstCall = chatParams(options.messages, "first");
+  const first = await provider.chatCompletion(firstCall.request);
+  options.onRawResponse?.(first || "", "first");
   const diag = process.env.LLM_DIAGNOSTICS === "1" || process.env.OPENAI_COMPAT_DEBUG === "1";
+  const providerInfo = provider.describe?.() ?? { provider: provider.id, model: "default" };
   if (diag) {
     const pv = (first || "").replace(/\s+/g, " ").trim().slice(0, 240);
     console.info(
@@ -46,9 +118,29 @@ export async function getStrictJsonWithRetry<T>(
     console.info(`[llm-observe] ${options.contextLabel} total_json_stage_ms=${Date.now() - startedAt}`);
     return parsedFirst;
   }
+  logBusinessDnaJsonFailure({
+    contextLabel: options.contextLabel,
+    attempt: "first",
+    raw: first || "",
+    finishReason: firstCall.finishReason(),
+  });
+  if (diag) {
+    console.warn(
+      `[llm-json] ${options.contextLabel} failed_generation attempt=first hash=${hashPreview(first || "")} preview=${(first || "").slice(0, 600)}`,
+    );
+  }
   const enableRetry = process.env.LLM_JSON_RETRY === "1";
   if (!enableRetry) {
-    throw new Error(`Invalid JSON from LLM for ${options.contextLabel} (retry disabled)`);
+    setLastFailureStage("json_parse_failed");
+    throw new JsonStageFailureError({
+      provider: providerInfo.provider,
+      model: providerInfo.model,
+      contextLabel: options.contextLabel,
+      retryRan: false,
+      repairRan: false,
+      finalReason: "retry disabled",
+      rawFirst: first || "",
+    });
   }
   {
     const firstErr = new Error("first parse failed");
@@ -59,8 +151,8 @@ export async function getStrictJsonWithRetry<T>(
       );
     }
     await sleep(800);
-    const retry = await provider.chatCompletion({
-      messages: [
+    const retryCall = chatParams(
+      [
         ...options.messages,
         {
           role: "assistant",
@@ -73,13 +165,77 @@ export async function getStrictJsonWithRetry<T>(
             "Retry now with ONE valid JSON object only. No markdown, no commentary, no trailing text.",
         },
       ],
-      maxOutputTokens: options.maxOutputTokens,
-      responseFormat: "json_object",
-    });
+      "retry",
+      `${options.contextLabel} retry`,
+    );
+    const retry = await provider.chatCompletion(retryCall.request);
+    options.onRawResponse?.(retry || "", "retry");
     const parsedRetry = tryParse(retry || "");
     if (parsedRetry != null) {
       console.info(`[llm-observe] ${options.contextLabel} total_json_stage_ms=${Date.now() - startedAt}`);
       return parsedRetry;
+    }
+    logBusinessDnaJsonFailure({
+      contextLabel: options.contextLabel,
+      attempt: "retry",
+      raw: retry || "",
+      finishReason: retryCall.finishReason(),
+    });
+    if (diag) {
+      console.warn(
+        `[llm-json] ${options.contextLabel} failed_generation attempt=retry hash=${hashPreview(retry || "")} preview=${(retry || "").slice(0, 600)}`,
+      );
+    }
+    const enableRepair = (process.env.LLM_JSON_REPAIR?.trim().toLowerCase() ?? "1");
+    if (enableRepair === "1" || enableRepair === "true" || enableRepair === "yes") {
+      const repairCall = chatParams(
+        [
+          {
+            role: "system",
+            content:
+              "You are a JSON repair assistant. Convert the provided malformed model output into one valid JSON object only. Preserve the original structure and intent. Do not add commentary or markdown.",
+          },
+          {
+            role: "user",
+            content:
+              `Repair this into one valid JSON object for ${options.contextLabel}. ` +
+              "If content is incomplete, salvage what is clearly present and keep the structure compact.\n\n" +
+              retry,
+          },
+        ],
+        "repair",
+        `${options.contextLabel} json repair`,
+      );
+      const repair = await provider.chatCompletion(repairCall.request);
+      options.onRawResponse?.(repair || "", "repair");
+      const parsedRepair = tryParse(repair || "");
+      if (parsedRepair != null) {
+        console.info(`[llm-observe] ${options.contextLabel} total_json_stage_ms=${Date.now() - startedAt}`);
+        return parsedRepair;
+      }
+      logBusinessDnaJsonFailure({
+        contextLabel: options.contextLabel,
+        attempt: "repair",
+        raw: repair || "",
+        finishReason: repairCall.finishReason(),
+      });
+      if (diag) {
+        console.warn(
+          `[llm-json] ${options.contextLabel} failed_generation attempt=repair hash=${hashPreview(repair || "")} preview=${(repair || "").slice(0, 600)}`,
+        );
+      }
+      setLastFailureStage("json_parse_failed");
+      throw new JsonStageFailureError({
+        provider: providerInfo.provider,
+        model: providerInfo.model,
+        contextLabel: options.contextLabel,
+        retryRan: true,
+        repairRan: true,
+        finalReason: "retry and repair failed",
+        rawFirst: first || "",
+        rawRetry: retry || "",
+        rawRepair: repair || "",
+      });
     }
     {
       const retryErr = new Error("retry parse failed");
@@ -91,9 +247,27 @@ export async function getStrictJsonWithRetry<T>(
             `retry_len=${(retry || "").length} retry_snip=${(retry || "").slice(0, 400)}`,
         );
       }
-      throw new Error(`Invalid JSON from LLM after retry for ${options.contextLabel}: ${reason}`);
+      setLastFailureStage("json_parse_failed");
+      throw new JsonStageFailureError({
+        provider: providerInfo.provider,
+        model: providerInfo.model,
+        contextLabel: options.contextLabel,
+        retryRan: true,
+        repairRan: false,
+        finalReason: reason,
+        rawFirst: first || "",
+        rawRetry: retry || "",
+      });
     }
   }
+}
+
+function hashPreview(value: string, length = 16): string {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(16).padStart(length, "0").slice(0, length);
 }
 
 function buildJsonParseAttempts(input: string): string[] {

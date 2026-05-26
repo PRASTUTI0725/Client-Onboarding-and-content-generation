@@ -1,4 +1,4 @@
-# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+﻿# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
 
 # compiled output
 dist
@@ -32,8 +32,6 @@ node_modules
 /connect.lock
 /coverage
 /libpeerconnection.log
-npm-debug.log
-yarn-error.log
 testem.log
 /typings
 
@@ -53,22 +51,37 @@ Thumbs.db
 .env.*
 **/.env
 **/.env.*
+!.env.example
+!**/.env.example
+
+# app-specific env files
+artifacts/api-server/.env.local
+artifacts/strategy-engine/.env.local
 
 # local logs and runtime artifacts
 *.log
 *.err.log
 *.out.log
 *.pid
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # local caches / temp
 .tmp-check/
+.tmp/
+tmp-*
+*.tmp
+*.temp
+.vite-temp/
+.turbo/
+
+# test outputs
 playwright-report/
 test-results/
 reports/
-
-# app-specific env files
-artifacts/api-server/.env.local
-artifacts/strategy-engine/.env.local
+coverage/
 
 # local generated verification artifacts
 artifacts/*.png
@@ -89,3 +102,18 @@ GEMINI.md
 artifacts/api-server/mcp-prov-result.json
 artifacts/fixtures/
 artifacts/rc-candidate/
+
+# local runtime / accidental junk
+.pgdata/
+.vercel/
+artifacts/strategy-engine/.vercel/
+$null
+G0DM0D3/
+
+# local-only smoke scripts and QA notes
+test-niyati.ps1
+artifacts/notes/
+
+# Cloudflare tunnel credentials
+.cloudflared/
+*.cloudflared.json

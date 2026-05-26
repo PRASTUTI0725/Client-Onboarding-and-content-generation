@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -8,6 +8,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
@@ -18,9 +19,25 @@ interface Props {
   totalPosts: number;
   onConfirm: (input: { month: string; startDate: string; goal: string; notes: string }) => void;
   isPending: boolean;
+  mode?: "generate" | "regenerate";
+  initialMonth?: string | null;
+  initialStartDate?: string | null;
+  initialGoal?: string | null;
+  initialNotes?: string | null;
 }
 
-export function GenerateMonthDialog({ open, onOpenChange, totalPosts, onConfirm, isPending }: Props) {
+export function GenerateMonthDialog({
+  open,
+  onOpenChange,
+  totalPosts,
+  onConfirm,
+  isPending,
+  mode = "generate",
+  initialMonth,
+  initialStartDate,
+  initialGoal,
+  initialNotes,
+}: Props) {
   const today = new Date();
   const defaultStart = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1))
     .toISOString()
@@ -35,21 +52,52 @@ export function GenerateMonthDialog({ open, onOpenChange, totalPosts, onConfirm,
   const [startDate, setStartDate] = useState(defaultStart);
   const [goal, setGoal] = useState("");
   const [notes, setNotes] = useState("");
+  const isRegenerate = mode === "regenerate";
+  const [overwriteConfirmed, setOverwriteConfirmed] = useState(!isRegenerate);
+
+  useEffect(() => {
+    if (!open) return;
+    setMonth(initialMonth || defaultMonth);
+    setStartDate(initialStartDate || defaultStart);
+    setGoal(initialGoal || "");
+    setNotes(initialNotes || "");
+    setOverwriteConfirmed(!isRegenerate);
+  }, [defaultMonth, defaultStart, initialGoal, initialMonth, initialNotes, initialStartDate, isRegenerate, open]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[calc(100vw-1.5rem)] max-w-lg sm:w-full">
         <DialogHeader>
           <DialogTitle className="font-serif text-2xl tracking-tight">
-            Plan the month
+            {isRegenerate ? "Regenerate calendar" : "Plan the month"}
           </DialogTitle>
           <DialogDescription>
-            We'll generate {totalPosts} posts across your active platforms, distributed by your SOW
-            and the goal below.
+            {isRegenerate
+              ? `This will replace the current calendar with ${totalPosts} posts generated from the approved SOW, Business DNA, and Jump-to-Action.`
+              : `We'll generate ${totalPosts} posts across your active platforms, distributed by your SOW and the goal below.`}
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-2">
+          {isRegenerate && (
+            <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-sm text-amber-950">
+              <p>
+                This will replace the current calendar for this month. Existing post edits, statuses, scheduled dates,
+                and comments may be overwritten.
+              </p>
+              <label className="flex items-start gap-3 rounded-md border border-amber-200 bg-white/70 px-3 py-2">
+                <Checkbox
+                  checked={overwriteConfirmed}
+                  onCheckedChange={(checked) => setOverwriteConfirmed(checked === true)}
+                  data-testid="confirm-overwrite-calendar-checkbox"
+                  className="mt-0.5 border-amber-500 data-[state=checked]:bg-amber-600"
+                />
+                <span className="leading-5">
+                  I understand the current calendar will be replaced.
+                </span>
+              </label>
+            </div>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="month">Month label</Label>
@@ -107,11 +155,11 @@ export function GenerateMonthDialog({ open, onOpenChange, totalPosts, onConfirm,
           </Button>
           <Button
             onClick={() => onConfirm({ month, startDate, goal, notes })}
-            disabled={isPending || !month || !startDate}
+            disabled={isPending || !month || !startDate || (isRegenerate && !overwriteConfirmed)}
             data-testid="confirm-generate-calendar-button"
             className="w-full sm:w-auto"
           >
-            {isPending ? "Generating..." : "Generate calendar"}
+            {isPending ? "Generating..." : isRegenerate ? "Replace current calendar" : "Generate calendar"}
           </Button>
         </DialogFooter>
       </DialogContent>

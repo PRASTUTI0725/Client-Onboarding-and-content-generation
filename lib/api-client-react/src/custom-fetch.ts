@@ -157,6 +157,25 @@ function truncate(text: string, maxLength = 300): string {
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
+function buildNetworkFailure(
+  cause: unknown,
+  requestInfo: { method: string; url: string },
+): Error {
+  const message =
+    cause instanceof Error && cause.message
+      ? cause.message
+      : typeof cause === "string"
+        ? cause
+        : "Failed to fetch";
+  const error = new Error(
+    `Network request failed for ${requestInfo.method} ${requestInfo.url}: ${message}`,
+  );
+  if (cause !== undefined) {
+    (error as Error & { cause?: unknown }).cause = cause;
+  }
+  return error;
+}
+
 function buildErrorMessage(response: Response, data: unknown): string {
   const prefix = `HTTP ${response.status} ${response.statusText}`;
 
@@ -373,7 +392,12 @@ export async function customFetch<T = unknown>(
 
   const requestInfo = { method, url: resolveUrl(input) };
 
-  const response = await fetch(input, { ...init, method, headers });
+  let response: Response;
+  try {
+    response = await fetch(input, { ...init, method, headers });
+  } catch (cause) {
+    throw buildNetworkFailure(cause, requestInfo);
+  }
 
   if (!response.ok) {
     const errorData = await parseErrorBody(response, method);

@@ -148,12 +148,25 @@ function makeSection(key: string, value: string | null | undefined) {
 }
 
 function dedupeSections(sections: Array<{ key: string; title: string; raw: string }>) {
-  const seen = new Set<string>();
+  const seen: string[] = [];
   const out: Array<{ key: string; title: string; raw: string }> = [];
   for (const section of sections) {
-    const normalized = section.raw.replace(/\s+/g, " ").trim().toLowerCase();
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
+    const normalized = section.raw
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ");
+    if (!normalized) continue;
+    if (
+      seen.some(
+        (existing) =>
+          existing === normalized ||
+          (normalized.length > 48 && (existing.includes(normalized) || normalized.includes(existing))),
+      )
+    ) {
+      continue;
+    }
+    seen.push(normalized);
     out.push(section);
   }
   return out;

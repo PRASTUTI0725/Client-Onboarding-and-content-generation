@@ -15,4 +15,6 @@ export interface GenerateCalendarInput {
   goal?: string;
   /** Free-text notes/constraints from the strategist for this month. */
   notes?: string;
+  /** When true, explicitly replace the existing calendar for this month. */
+  regenerate?: boolean;
 }

@@ -32,15 +32,15 @@ export function CalendarKpiCards({ platformSplit, distribution, formats }: Props
         />
       )}
       <KpiMetricCard
-        label="Pillar mix"
-        valueSuffix="%"
+        label="Bucket mix"
+        valueSuffix="posts"
         data={toChartData(distribution)}
         chart="donut"
         testId="kpi-pillar-mix"
       />
       <KpiMetricCard
         label="Format mix"
-        valueSuffix="%"
+        valueSuffix="posts"
         data={toChartData(formats)}
         chart="bar"
         testId="kpi-format-mix"

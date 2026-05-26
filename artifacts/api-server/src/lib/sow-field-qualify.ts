@@ -15,8 +15,35 @@ const LABEL_PATTERNS = [
 ];
 
 const JUNK_TARGET_WORDS = new Set(
-  (["optimization", "execution", "management", "scaling", "retargeting", "delivery", "setup", "onboarding", "compliance", "automation", "infrastructure", "refinement"] as const).map((s) => s.toLowerCase()),
+  ([
+    "optimization",
+    "execution",
+    "management",
+    "scaling",
+    "retargeting",
+    "delivery",
+    "setup",
+    "onboarding",
+    "compliance",
+    "automation",
+    "infrastructure",
+    "refinement",
+    "strategy",
+    "planning",
+    "content",
+    "reporting",
+    "performance",
+    "campaign",
+    "campaigns",
+    "calendar",
+    "creative",
+    "deliverables",
+  ] as const).map((s) => s.toLowerCase()),
 );
+
+function normalizeSignalText(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
 
 export function isRomanOrSectionHeadingLine(s: string): boolean {
   const t = s.trim();
@@ -28,12 +55,21 @@ export function isRomanOrSectionHeadingLine(s: string): boolean {
 
 export function isJunkAutofillIndustry(s: string): boolean {
   const t = s.trim();
+  const normalized = normalizeSignalText(t);
   if (t.length < 3) return true;
   if (ROMAN_HEADING_LINE.test(t)) return true;
   for (const p of LABEL_PATTERNS) {
     if (p.test(t)) return true;
   }
   if (/^based on your inputs:?\s*$/i.test(t)) return true;
+  if (
+    /^(strategy|content|performance|reporting|campaign|calendar|creative|management|optimization)(?:\s+(planning|management|execution|optimization|scope))?$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (JUNK_TARGET_WORDS.has(normalized)) return true;
   return false;
 }
 
@@ -41,11 +77,23 @@ export function isJunkAutofillTargetAudience(s: string): boolean {
   const t = s.trim();
   if (t.length < 4) return true;
   const lower = t.toLowerCase();
-  if (JUNK_TARGET_WORDS.has(lower)) return true;
+  const normalized = normalizeSignalText(t);
+  if (JUNK_TARGET_WORDS.has(lower) || JUNK_TARGET_WORDS.has(normalized)) return true;
   if (lower.split(/\s+/).length <= 1 && t.length < 20) {
-    if (JUNK_TARGET_WORDS.has(lower)) return true;
+    if (JUNK_TARGET_WORDS.has(lower) || JUNK_TARGET_WORDS.has(normalized)) return true;
   }
-  if (/^optimization$|^scaling$|^execution$|^engagement$|^automation$|^compliance$|^infrastructure$|^onboarding$|^refinement$|^retargeting$/i.test(t)) {
+  if (
+    /^(optimization|scaling|execution|engagement|automation|compliance|infrastructure|onboarding|refinement|retargeting|strategy|planning|content|reporting|performance|campaigns?|calendar|creative|deliverables?)$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /^(target\s+audience|audience|scope|deliverables?|content|content creation|strategy|launch planning|reporting|performance|campaigns?)$/i.test(
+      normalized,
+    )
+  ) {
     return true;
   }
   if (ROMAN_HEADING_LINE.test(t) && t.length < 100) return true;

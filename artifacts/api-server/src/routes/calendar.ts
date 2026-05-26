@@ -7,14 +7,19 @@ import {
   plannersTable,
   postsTable,
 } from "@workspace/db";
-import { eq, and, desc, asc, sql } from "drizzle-orm";
+import { eq, and, desc, asc } from "drizzle-orm";
 import { GenerateCalendarBody, UpdatePostBody } from "@workspace/api-zod";
-import { generateMonthlyPlan, type SowInput } from "../lib/planner/generate.js";
-import { randomUUID } from "node:crypto";
+import { buildCalendarBrief, generateMonthlyPlan, type SowInput } from "../lib/planner/generate.js";
+import {
+  getLastCalendarGenerationTrace,
+  type CalendarGenerationTrace,
+} from "../lib/planner/calendar-generation-trace.js";
+import { createHash, randomUUID } from "node:crypto";
 import { markAIFallbackUsed, markFallbackUsed } from "../lib/runtime-mode.js";
 import { isDbUnavailableError } from "../lib/db-unavailable.js";
 import {
   getRequestLLMProvider,
+  getProviderResolutionDiagnosticsForRequest,
   getNoUsableAiProviderUserMessage,
   isNoUsableAiProviderError,
   shouldUseRealAI,
@@ -33,10 +38,17 @@ import {
   type PublicAiFailure,
 } from "../lib/ai-failure.js";
 import { buildPromptBudgetStats } from "../lib/llm/prompt-budget.js";
-import { getMemoryClientForWorkflow, getMemoryStrategyForWorkflow } from "./clients.js";
+import { getMemoryClientForWorkflow, getMemoryOnboardingForWorkflow, getMemoryStrategyForWorkflow } from "./clients.js";
 import { isSowComplete } from "../lib/sow-completion.js";
 import { effectiveScopeOfWork } from "../lib/sow-canonical.js";
 import { buildBusinessDnaFromPublicSignals, type BusinessDna } from "../lib/business-dna.js";
+import {
+  getBusinessDnaRequirementError,
+  getBusinessDnaWorkflowState,
+  getJtaRequirementError,
+  getJtaWorkflowState,
+  readApprovedSnapshotRecord,
+} from "../lib/workflow-approval.js";
 import {
   getMcpConfigFromEnv,
   isMcpAvailable,
@@ -131,6 +143,32 @@ function buildMcpProvenance(meta: {
     toolName: meta.toolName ?? null,
     status: meta.status,
     timestamp: meta.timestamp,
+  };
+}
+
+function readApprovedSnapshot(sow: Record<string, unknown> | null | undefined) {
+  return readApprovedSnapshotRecord<Record<string, unknown>>(sow);
+}
+
+function buildRunMeta(input: {
+  clientId: string;
+  snapshotId: string | null;
+  taskType: "calendar_generate";
+  provider: string;
+  model: string;
+  fallbackUsed: boolean;
+  sourceContext: "approved_snapshot" | "draft";
+}) {
+  return {
+    clientId: input.clientId,
+    snapshotId: input.snapshotId,
+    runId: randomUUID(),
+    taskType: input.taskType,
+    provider: input.provider,
+    model: input.model,
+    fallbackUsed: input.fallbackUsed,
+    sourceContext: input.sourceContext,
+    timestamp: new Date().toISOString(),
   };
 }
 
@@ -237,6 +275,73 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       });
       return;
     }
+    const approvedSnapshot = readApprovedSnapshot(
+      (client.sow as Record<string, unknown> | null | undefined) ?? null,
+    );
+    if (!approvedSnapshot) {
+      res.status(400).json({ error: "Approve SOW to generate Business DNA, Jump-to-Action, and calendar content." });
+      return;
+    }
+    const [profile] = await db
+      .select()
+      .from(onboardingProfilesTable)
+      .where(eq(onboardingProfilesTable.clientId, clientId))
+      .orderBy(desc(onboardingProfilesTable.createdAt))
+      .limit(1);
+    if (!profile) {
+      res.status(400).json({ error: "No onboarding profile found" });
+      return;
+    }
+    const enrichedData = (profile.enrichedData as Record<string, unknown> | null | undefined) ?? {};
+    const businessDnaApprovalError = getBusinessDnaRequirementError(
+      getBusinessDnaWorkflowState(enrichedData, String(approvedSnapshot.id ?? "")),
+      "generating the content calendar",
+    );
+    if (businessDnaApprovalError) {
+      res.status(400).json({ error: businessDnaApprovalError });
+      return;
+    }
+    const today = new Date();
+    const monthAnchor = body.startDate
+      ? new Date(body.startDate + "T00:00:00Z")
+      : new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
+    const startDate = monthAnchor.toISOString().slice(0, 10);
+    const monthLabel =
+      body.month ||
+      monthAnchor.toLocaleDateString("en-US", {
+        month: "long",
+        year: "numeric",
+        timeZone: "UTC",
+      });
+    const [existingPlannerForMonth] = await db
+      .select()
+      .from(plannersTable)
+      .where(
+        and(
+          eq(plannersTable.clientId, clientId),
+          eq(plannersTable.month, monthLabel),
+        ),
+      )
+      .orderBy(desc(plannersTable.createdAt))
+      .limit(1);
+    const previousAttemptCount = Number(
+      ((existingPlannerForMonth?.metadata as Record<string, unknown> | null | undefined)?.generationAttemptCount ?? 0),
+    );
+    const isExplicitRegeneration = body.regenerate === true;
+    if (existingPlannerForMonth && !isExplicitRegeneration) {
+      res.status(409).json({
+        error: "A calendar already exists for this month. Use Regenerate calendar to replace it.",
+        code: "CALENDAR_EXISTS_REQUIRES_REGENERATE",
+      });
+      return;
+    }
+    if (previousAttemptCount >= 2 && !isExplicitRegeneration) {
+      res.status(429).json({
+        error: "Calendar generation limit reached for this month.",
+        maxAttempts: 2,
+      });
+      return;
+    }
     const [strategy] = await db
       .select()
       .from(strategiesTable)
@@ -244,7 +349,18 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       .orderBy(desc(strategiesTable.version))
       .limit(1);
     if (!strategy) {
-      res.status(400).json({ error: "Generate a strategy before the calendar." });
+      res.status(400).json({ error: "Generate and approve the current Jump-to-Action before generating the content calendar." });
+      return;
+    }
+    const jtaApprovalError = getJtaRequirementError(
+      getJtaWorkflowState(
+        (strategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? null,
+        String(approvedSnapshot.id ?? ""),
+      ),
+      "generating the content calendar",
+    );
+    if (jtaApprovalError) {
+      res.status(400).json({ error: jtaApprovalError });
       return;
     }
     const pendingSections = getPendingStrategySections(
@@ -270,7 +386,13 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
         structuredForSource,
         (client.sow as Record<string, unknown> | null | undefined) ?? null,
       );
-      const posts = imported.posts.map((post) => enrichPostForExecution(post));
+      const activePlatforms = Object.keys(normalizeCalendarPlatformCounts(
+        (client.sow as Record<string, unknown> | null | undefined) ?? null,
+        "Instagram",
+      ));
+      const posts = imported.posts.map((post) =>
+        attachPostSemanticMetadata(enrichPostForExecution(post, activePlatforms)),
+      );
       await db.delete(plannersTable).where(eq(plannersTable.clientId, clientId));
       const [savedPlanner] = await db
         .insert(plannersTable)
@@ -289,6 +411,9 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
             ...((imported.planner.metadata as Record<string, unknown> | null) ?? {}),
             calendarSource: "chatgpt_import",
             generationMode: "imported_deterministic",
+            generationAction: isExplicitRegeneration ? "regenerate" : "generate",
+            explicitRegeneration: isExplicitRegeneration,
+            generationAttemptCount: previousAttemptCount + 1,
             providerAttempted: false,
             calendarGeneratedAt: new Date().toISOString(),
           },
@@ -342,12 +467,20 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
 
     const useRealAICal = shouldUseRealAI(req);
     let resolvedCalendarLlm: LLMProvider | null = null;
+    const providerResolution = useRealAICal ? getProviderResolutionDiagnosticsForRequest(req) : null;
+    const forceReal = providerResolution?.forceReal === true;
+    let providerAttempts: Array<Record<string, unknown>> = [];
+    let providerActuallyAttempted = false;
+    let usedRealAI = false;
+    let usedFallbackTemplate = false;
+    let finalGenerationProvider: { provider: string; model: string } | null = null;
+    let finalRepairProvider: { provider: string; model: string } | null = null;
     if (useRealAICal) {
       try {
         resolvedCalendarLlm = getRequestLLMProvider(req);
         const d = resolvedCalendarLlm.describe?.() ?? { provider: resolvedCalendarLlm.id, model: "default" };
         req.log.info(
-          { provider: d.provider, model: d.model },
+          { provider: d.provider, model: d.model, providerResolution },
           "Calendar generate: LLM provider resolved (fail-fast before enrichment)",
         );
       } catch (e) {
@@ -359,45 +492,17 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       }
     }
 
-    const [profile] = await db
-      .select()
-      .from(onboardingProfilesTable)
-      .where(eq(onboardingProfilesTable.clientId, clientId))
-      .orderBy(desc(onboardingProfilesTable.createdAt))
-      .limit(1);
-
     let enriched = (profile?.enrichedData ?? {}) as Record<string, unknown>;
     let structured = strategy.structuredStrategy as Record<string, unknown>;
-    const sow = client.sow as SowInput;
+    const sow = (approvedSnapshot.sow as SowInput | undefined) ?? (client.sow as SowInput);
+    const strategyType =
+      String(
+        approvedSnapshot.templateType ??
+          (strategy as { templateType?: unknown }).templateType ??
+          ((structuredForSource.__meta as Record<string, unknown> | undefined)?.templateType as string | undefined) ??
+          "",
+      ).trim() || "brand_building";
 
-    const today = new Date();
-    const monthAnchor = body.startDate
-      ? new Date(body.startDate + "T00:00:00Z")
-      : new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
-    const startDate = monthAnchor.toISOString().slice(0, 10);
-    const monthLabel =
-      body.month ||
-      monthAnchor.toLocaleDateString("en-US", {
-        month: "long",
-        year: "numeric",
-        timeZone: "UTC",
-      });
-    const [{ count }] = await db
-      .select({ count: sql<number>`COUNT(*)::int` })
-      .from(plannersTable)
-      .where(
-        and(
-          eq(plannersTable.clientId, clientId),
-          eq(plannersTable.month, monthLabel),
-        ),
-      );
-    if (count >= 2) {
-      res.status(429).json({
-        error: "Calendar generation limit reached for this month.",
-        maxAttempts: 2,
-      });
-      return;
-    }
     const mcpConfig = getMcpConfigFromEnv();
     const mcpAvailable = isMcpAvailable(mcpConfig);
     const mcpInstagramHandle =
@@ -446,12 +551,14 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       | undefined;
     const currentBusinessDna = await buildBusinessDnaFromPublicSignals({
       name: client.name,
-      websiteUrl:
-        typeof rawIn?.websiteUrl === "string" ? rawIn.websiteUrl : client.website ?? "",
-      instagramHandle:
-        typeof rawIn?.instagramHandle === "string" ? rawIn.instagramHandle : client.instagramHandle ?? "",
+      websiteUrl: typeof approvedSnapshot.client === "object" ? String((approvedSnapshot.client as Record<string, unknown>).websiteUrl ?? "") : (typeof rawIn?.websiteUrl === "string" ? rawIn.websiteUrl : client.website ?? ""),
+      instagramHandle: typeof approvedSnapshot.client === "object" ? String((approvedSnapshot.client as Record<string, unknown>).instagramHandle ?? "") : (typeof rawIn?.instagramHandle === "string" ? rawIn.instagramHandle : client.instagramHandle ?? ""),
       oneLineDescription:
-        typeof rawIn?.oneLineDescription === "string" ? rawIn.oneLineDescription : client.oneLineDescription ?? null,
+        typeof approvedSnapshot.client === "object"
+          ? String((approvedSnapshot.client as Record<string, unknown>).oneLineDescription ?? "") || null
+          : typeof rawIn?.oneLineDescription === "string"
+            ? rawIn.oneLineDescription
+            : client.oneLineDescription ?? null,
       instagramSummaryNotes:
         typeof rawIn?.instagramSummaryNotes === "string" ? rawIn.instagramSummaryNotes : null,
       existing:
@@ -462,12 +569,10 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       enrichedProfile: enriched,
       mcpData: (enriched.mcp as Record<string, unknown> | null | undefined) ?? null,
       sowSections: {
-        understandingOfRequirements: String(
-          (client.sow as Record<string, unknown> | undefined)?.understandingOfRequirements ?? "",
-        ),
+        understandingOfRequirements: String(((sow as unknown as Record<string, unknown> | undefined))?.understandingOfRequirements ?? ""),
         scopeOfWork:
-          effectiveScopeOfWork(client.sow as Record<string, unknown> | null) ||
-          String((client.sow as Record<string, unknown> | undefined)?.scopeOfWork ?? ""),
+          effectiveScopeOfWork(sow as unknown as Record<string, unknown> | null) ||
+          String(((sow as unknown as Record<string, unknown> | undefined))?.scopeOfWork ?? ""),
       },
     });
     enriched = {
@@ -478,6 +583,8 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
     let generation: { planner: MemoryPlanner; posts: MemoryPost[] } | null = null;
     let calendarSource: "real" | "fallback" = "real";
     let calendarAiFailure: PublicAiFailure | null = null;
+    let calendarBudgetDiagnostics: Record<string, unknown> | null = null;
+    let calendarGenerationTrace: CalendarGenerationTrace | null = null;
     if (useRealAICal) {
       try {
         const provider = resolvedCalendarLlm!;
@@ -540,6 +647,70 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
             pillarPriorities?: string[];
             monthlyGoals?: string[];
           }) ?? {};
+        const calendarBrief = buildCalendarBrief({
+          brandName: client.name,
+          enriched,
+          structured,
+          sow,
+          brief: {
+            month: monthLabel,
+            startDate,
+            goal: body.goal ?? "",
+            notes: body.notes ?? "",
+          },
+          extraction: {
+            businessDna: currentBusinessDna,
+            websiteSummary,
+            instagramSummary,
+            strategySummary: strategySummaryBlock.strategy ?? null,
+            pillarPriorities: strategySummaryBlock.pillarPriorities ?? null,
+            monthlyGoals: strategySummaryBlock.monthlyGoals ?? null,
+            strategyType,
+          },
+        });
+        if (process.env.NODE_ENV !== "production") {
+          const sowSnippet = JSON.stringify({
+            platforms: sow.platforms,
+            monthlyPosts: sow.monthlyPosts,
+            contentMix: sow.contentMix,
+            deliverables: sow.deliverables,
+          }).slice(0, 300);
+          const businessDnaSnippet = JSON.stringify({
+            positioning: currentBusinessDna?.positioning?.valueProposition ?? null,
+            differentiators: currentBusinessDna?.positioning?.differentiators ?? [],
+            themes: currentBusinessDna?.contentStrategy?.themes ?? [],
+          }).slice(0, 300);
+          const jtaSnippet = JSON.stringify({
+            strategySummary: strategySummaryBlock.strategy ?? null,
+            pillarPriorities: strategySummaryBlock.pillarPriorities ?? null,
+            monthlyGoals: strategySummaryBlock.monthlyGoals ?? null,
+          }).slice(0, 300);
+          const briefAuditPayload = {
+            clientId,
+            clientName: client.name,
+            businessType: calendarBrief.client.businessType,
+            strategyType: calendarBrief.client.strategyType,
+            approvedSnapshotId: String(approvedSnapshot.id ?? ""),
+            calendarMonth: monthLabel,
+            sowSnippet,
+            businessDnaSnippet,
+            jtaSnippet,
+            activePlatforms: calendarBrief.requirements.platforms,
+            bucketCounts: calendarBrief.requirements.contentBuckets,
+            allowedThemes: calendarBrief.contentPillars.map((pillar) => pillar.angle ?? pillar.name).slice(0, 8),
+            productTruths: calendarBrief.client.productTruths,
+            planningContext: calendarBrief.planningContext,
+          };
+          const briefPreview = JSON.stringify(briefAuditPayload);
+          req.log.info(
+            {
+              ...briefAuditPayload,
+              calendarBriefHash: createHash("sha256").update(briefPreview).digest("hex").slice(0, 16),
+              calendarBriefPreview: briefPreview.slice(0, 500),
+            },
+            "Calendar brief audit",
+          );
+        }
         req.log.info(
           {
             calendarInstagramPublic: instagramFromFetch
@@ -555,13 +726,14 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           buildPromptBudgetStats(
             "calendar generation",
             [
-              client.name,
-              enriched,
-              strategySummaryBlock.strategy ?? "",
-              strategySummaryBlock.pillarPriorities ?? [],
-              strategySummaryBlock.monthlyGoals ?? [],
-              sow,
-              body,
+              calendarBrief.client,
+              calendarBrief.requirements,
+              calendarBrief.audience,
+              calendarBrief.brandVoice,
+              calendarBrief.contentPillars,
+              calendarBrief.platformStrategy,
+              calendarBrief.weeklyFlow,
+              calendarBrief.kpis,
             ],
             2000,
             1200,
@@ -569,26 +741,24 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           "Calendar prompt budget",
         );
         req.log.info({ requestSizeBytes }, "Calendar request payload telemetry");
-        const result = await generateMonthlyPlan(
-          client.name,
-          enriched,
-          structured,
-          sow,
-          {
-            month: monthLabel,
-            startDate,
-            goal: body.goal ?? "",
-            notes: body.notes ?? "",
-          },
-          provider,
-          {
-            websiteSummary,
-            instagramSummary,
-            strategySummary: strategySummaryBlock.strategy ?? null,
-            pillarPriorities: strategySummaryBlock.pillarPriorities ?? null,
-            monthlyGoals: strategySummaryBlock.monthlyGoals ?? null,
-          },
-        );
+        const result = await generateMonthlyPlan(calendarBrief, provider);
+        providerAttempts =
+          resolvedCalendarLlm && "getCumulativeAttemptDiagnostics" in resolvedCalendarLlm
+            ? ((resolvedCalendarLlm as unknown as { getCumulativeAttemptDiagnostics?: () => Array<Record<string, unknown>> }).getCumulativeAttemptDiagnostics?.() ?? [])
+            : resolvedCalendarLlm && "getLastAttemptDiagnostics" in resolvedCalendarLlm
+              ? ((resolvedCalendarLlm as unknown as { getLastAttemptDiagnostics?: () => Array<Record<string, unknown>> }).getLastAttemptDiagnostics?.() ?? [])
+              : [];
+        providerActuallyAttempted = providerAttempts.some((attempt) => {
+          const status = String((attempt.status as string | undefined) ?? "");
+          return status === "success" || status === "failed";
+        });
+        usedRealAI = providerActuallyAttempted;
+        finalGenerationProvider = provider.describe?.() ?? providerInfo;
+        finalRepairProvider =
+          (((result.planner.metadata as Record<string, unknown> | undefined)?.validationFlow as
+            | { repairProvider?: { provider: string; model: string } | null }
+            | undefined)?.repairProvider ??
+            null);
         generation = {
           planner: {
             id: "",
@@ -606,6 +776,7 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
             goal: body.goal ?? null,
             notes: body.notes ?? null,
             metadata: {
+              ...(result.planner.metadata ?? {}),
               mcp: buildMcpProvenance(mcpCalendar),
             },
             createdAt: new Date().toISOString(),
@@ -630,6 +801,7 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
             priority: p.priority,
             execution: p.execution,
             metadata: {
+              ...(p.metadata ?? {}),
               mcp: buildMcpProvenance(mcpCalendar),
             },
             status: "draft",
@@ -642,19 +814,99 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           {
             provider: providerInfo.provider,
             model: providerInfo.model,
+            forceReal,
+            providerAttempts,
             responseTimeMs: elapsedMs(startedAt),
           },
           "Calendar generation completed from real LLM output",
         );
       } catch (err) {
-        req.log.warn({ err }, "Real AI calendar generation failed, using demo planner");
-        const d = resolvedCalendarLlm?.describe?.() ?? { provider: "unknown", model: "default" };
+        providerAttempts =
+          resolvedCalendarLlm && "getCumulativeAttemptDiagnostics" in resolvedCalendarLlm
+            ? ((resolvedCalendarLlm as unknown as { getCumulativeAttemptDiagnostics?: () => Array<Record<string, unknown>> }).getCumulativeAttemptDiagnostics?.() ?? [])
+            : resolvedCalendarLlm && "getLastAttemptDiagnostics" in resolvedCalendarLlm
+              ? ((resolvedCalendarLlm as unknown as { getLastAttemptDiagnostics?: () => Array<Record<string, unknown>> }).getLastAttemptDiagnostics?.() ?? [])
+              : [];
+        providerActuallyAttempted = providerAttempts.some((attempt) => {
+          const status = String((attempt.status as string | undefined) ?? "");
+          return status === "success" || status === "failed";
+        });
+        req.log.warn({ err, forceReal, providerAttempts }, "Real AI calendar generation failed, using demo planner");
+        const lastAttempt = getLastProviderAttempt(providerAttempts);
+        const d = lastAttempt ?? resolvedCalendarLlm?.describe?.() ?? { provider: "unknown", model: "default" };
         calendarAiFailure = toPublicAiFailure(err, { providerId: d.provider, model: d.model });
-        calendarAiFailure.message = humanizeCalendarFailure(calendarAiFailure.message);
+        calendarGenerationTrace =
+          (err && typeof err === "object" && "calendarGenerationTrace" in err
+            ? (err as { calendarGenerationTrace?: CalendarGenerationTrace }).calendarGenerationTrace
+            : null) ?? getLastCalendarGenerationTrace();
+        calendarBudgetDiagnostics =
+          err && typeof err === "object" && "calendarBudgetDiagnostics" in err
+            ? ((err as { calendarBudgetDiagnostics?: Record<string, unknown> }).calendarBudgetDiagnostics ?? null)
+            : null;
+        if (!calendarAiFailure.estimatedInputTokens && calendarGenerationTrace?.plannerBudget) {
+          calendarAiFailure.estimatedInputTokens = calendarGenerationTrace.plannerBudget.estimatedInputTokens;
+          calendarAiFailure.maxInputTokens = calendarGenerationTrace.plannerBudget.maxInputTokens;
+          calendarAiFailure.estimatedOutputTokens = calendarGenerationTrace.plannerBudget.estimatedOutputTokens;
+          calendarAiFailure.compactionTier = calendarGenerationTrace.plannerBudget.compactionTier;
+          calendarAiFailure.promptSegments = calendarGenerationTrace.plannerBudget.promptSegments;
+        }
+        const lastTraceStage =
+          calendarGenerationTrace?.stagesAttempted[calendarGenerationTrace.stagesAttempted.length - 1];
+        if (lastTraceStage) {
+          calendarAiFailure.estimatedInputTokens =
+            calendarAiFailure.estimatedInputTokens ?? lastTraceStage.estimatedInputTokens;
+          calendarAiFailure.maxInputTokens = calendarAiFailure.maxInputTokens ?? lastTraceStage.maxInputTokens;
+          calendarAiFailure.estimatedOutputTokens =
+            calendarAiFailure.estimatedOutputTokens ?? lastTraceStage.estimatedOutputTokens;
+          calendarAiFailure.compactionTier =
+            calendarAiFailure.compactionTier ?? lastTraceStage.compactionTier;
+          calendarAiFailure.promptSegments =
+            calendarAiFailure.promptSegments ?? lastTraceStage.promptSegments;
+          calendarAiFailure.failedContextLabel =
+            calendarAiFailure.failedContextLabel ?? lastTraceStage.stage;
+        }
+        calendarAiFailure.message = humanizeCalendarFailure(calendarAiFailure);
+        req.log.warn(
+          {
+            err,
+            forceReal,
+            providerAttempts,
+            calendarGenerationTrace,
+            calendarBudgetDiagnostics,
+            calendarAiFailure,
+          },
+          "Calendar generation failed — compact trace diagnostics",
+        );
+        if (forceReal && !providerActuallyAttempted) {
+          res.status(503).json({
+            error:
+              "AI_FORCE_REAL blocked template fallback because no configured provider/model was actually called before the run failed. Check provider chain, keys, and diagnostics.",
+            code: "FORCE_REAL_NO_PROVIDER_ATTEMPT",
+            aiFailure: calendarAiFailure,
+            diagnostics: {
+              forceReal,
+              providerResolution,
+              providerAttempts,
+              providerAttempted: false,
+              usedRealAI: false,
+              usedFallbackTemplate: false,
+            },
+          });
+          return;
+        }
         markAIFallbackUsed();
         calendarSource = "fallback";
+        usedFallbackTemplate = true;
+        finalGenerationProvider = { provider: calendarAiFailure.providerId, model: calendarAiFailure.model };
+        finalRepairProvider = calendarAiFailure.validationDiagnostics?.repairProvider ?? null;
         req.log.warn(
-          { requestSizeBytes, responseTimeMs: elapsedMs(startedAt), fallbackReason: "provider_or_output_failure" },
+          {
+            requestSizeBytes,
+            responseTimeMs: elapsedMs(startedAt),
+            fallbackReason: "provider_or_output_failure",
+            forceReal,
+            providerAttempts,
+          },
           "Calendar fallback telemetry",
         );
       }
@@ -663,12 +915,24 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       calendarAiFailure = realAiDisabledFailure({ providerId: "demo", model: "deterministic" });
       markAIFallbackUsed();
       calendarSource = "fallback";
+      usedFallbackTemplate = true;
+      finalGenerationProvider = { provider: "demo", model: "deterministic" };
       req.log.info(
         { requestSizeBytes, responseTimeMs: elapsedMs(startedAt), fallbackReason: "real_ai_disabled" },
         "Calendar fallback telemetry",
       );
     }
-    const fallbackGenerated = generateDemoCalendarPayload(clientId, monthAnchor, monthLabel, body);
+    const fallbackInput = buildFallbackCalendarInput(sow as unknown as Record<string, unknown> | null, "Instagram");
+    const fallbackGenerated = generateDemoCalendarPayload(
+      clientId,
+      monthAnchor,
+      monthLabel,
+      body,
+      fallbackInput.totalPosts,
+      fallbackInput.defaultPlatform,
+      fallbackInput.platformSplit,
+      fallbackInput.contentCounts,
+    );
     fallbackGenerated.planner = {
       ...fallbackGenerated.planner,
       metadata: {
@@ -690,9 +954,12 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
       calendarSource = "fallback";
     }
     const planner = generation?.planner ?? fallbackGenerated.planner;
-    const posts = (generation?.posts.length ? generation.posts : fallbackGenerated.posts).map((post) =>
-      enrichPostForExecution(post),
-    );
+    const posts =
+      generation?.posts.length
+        ? generation.posts.map((post) => attachPostSemanticMetadata(post))
+        : fallbackGenerated.posts.map((post) =>
+            attachPostSemanticMetadata(enrichPostForExecution(post, Object.keys(fallbackInput.platformSplit))),
+          );
 
     if (posts.length === 0) {
       res.status(500).json({ error: "Generation returned no posts." });
@@ -703,11 +970,89 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
     await db.delete(plannersTable).where(eq(plannersTable.clientId, clientId));
 
     const baseMeta = ((planner as Record<string, unknown>).metadata ?? null) as Record<string, unknown> | null;
+    const providerMeta =
+      calendarSource === "fallback" && calendarAiFailure
+        ? { provider: calendarAiFailure.providerId, model: calendarAiFailure.model }
+        : resolvedCalendarLlm?.describe?.() ?? { provider: "demo", model: "deterministic" };
+    const runMeta = buildRunMeta({
+      clientId,
+      snapshotId: String(approvedSnapshot.id ?? ""),
+      taskType: "calendar_generate",
+      provider: providerMeta.provider,
+      model: providerMeta.model,
+      fallbackUsed: calendarSource === "fallback",
+      sourceContext: "approved_snapshot",
+    });
     const metaOut: Record<string, unknown> = { ...(baseMeta ?? {}) };
+    const failedProviderAttempts = providerAttempts.filter((attempt) => String((attempt.status as string | undefined) ?? "") === "failed");
+    const failoverTriggered =
+      providerAttempts.some((attempt) => String((attempt.failoverDecision as string | undefined) ?? "") === "next_provider") ||
+      providerAttempts.filter((attempt) => {
+        const status = String((attempt.status as string | undefined) ?? "");
+        return status === "failed" || status === "success";
+      }).length > 1;
+    const lastFailedAttempt = failedProviderAttempts[failedProviderAttempts.length - 1] ?? null;
     metaOut.calendarSource = calendarSource;
+    metaOut.generationMode = calendarSource === "real" ? "llm_generated" : "fallback_generated";
+    metaOut.generationProfile = "reliable_v1";
+    metaOut.forceReal = forceReal;
+    metaOut.budgetGuardEnabled =
+      ((baseMeta?.budgetGuardEnabled as boolean | undefined) ?? true) === true;
+    metaOut.budgetGuardBypassed =
+      ((baseMeta?.budgetGuardBypassed as boolean | undefined) ?? false) === true;
+    const traceForMeta = calendarGenerationTrace ?? getLastCalendarGenerationTrace();
+    metaOut.plannerBudget = traceForMeta?.plannerBudget ?? baseMeta?.plannerBudget ?? null;
+    metaOut.weeklyBriefHashes = traceForMeta?.weeklyBriefHashes ?? baseMeta?.weeklyBriefHashes ?? null;
+    metaOut.calendarPlan = traceForMeta?.calendarPlan ?? baseMeta?.calendarPlan ?? null;
+    metaOut.weekConcurrency = traceForMeta?.weekConcurrency ?? baseMeta?.weekConcurrency ?? null;
+    metaOut.weekStaggerMs = traceForMeta?.weekStaggerMs ?? null;
+    metaOut.calendarGenerationTrace = traceForMeta;
+    metaOut.codePath = traceForMeta?.codePath ?? null;
+    metaOut.strategyType = strategyType;
+    metaOut.generationAction = isExplicitRegeneration ? "regenerate" : "generate";
+    metaOut.explicitRegeneration = isExplicitRegeneration;
+    metaOut.providerAttempted = providerActuallyAttempted;
+    metaOut.providerResolution = providerResolution;
+    metaOut.providerAttempts = providerAttempts;
+    metaOut.failoverTriggered = failoverTriggered;
+    metaOut.terminalFailureReason = lastFailedAttempt ? String(lastFailedAttempt.reason ?? "") || null : null;
+    metaOut.lastProviderErrorClass = lastFailedAttempt ? String(lastFailedAttempt.errorClass ?? "") || null : null;
+    metaOut.usedRealAI = usedRealAI;
+    metaOut.usedFallbackTemplate = usedFallbackTemplate;
+    metaOut.finalGenerationProvider = finalGenerationProvider ?? providerMeta;
+    metaOut.finalRepairProvider = finalRepairProvider;
+    metaOut.generationAttemptCount = previousAttemptCount + 1;
     metaOut.calendarGeneratedAt = new Date().toISOString();
+    metaOut.latestRun = runMeta;
+    metaOut.snapshotId = String(approvedSnapshot.id ?? "");
+    metaOut.snapshotState = "fresh";
+    metaOut.sourceContext = "approved_snapshot";
     if (calendarSource === "fallback" && calendarAiFailure) {
       metaOut.calendarAiFailure = calendarAiFailure;
+      metaOut.calendarFallbackDiagnostics = buildCalendarFallbackDiagnostics({
+        calendarAiFailure,
+        calendarBudgetDiagnostics,
+        trace: traceForMeta,
+        providerResolution,
+        providerAttempts,
+        failoverTriggered,
+        terminalFailureReason: metaOut.terminalFailureReason,
+        lastProviderErrorClass: metaOut.lastProviderErrorClass,
+        forceReal,
+        budgetGuardEnabled: metaOut.budgetGuardEnabled,
+        budgetGuardBypassed: metaOut.budgetGuardBypassed,
+        usedRealAI,
+        usedFallbackTemplate,
+        requestedProvider: resolvedCalendarLlm?.id ?? null,
+        providerMeta,
+        requestSizeBytes,
+        expectedPlatformSplit: fallbackInput.platformSplit,
+        expectedTotalPosts: fallbackInput.totalPosts,
+      });
+      req.log.warn(
+        { calendarFallbackDiagnostics: metaOut.calendarFallbackDiagnostics },
+        "Calendar fallback diagnostics persisted",
+      );
     }
 
     const [savedPlanner] = await db
@@ -764,13 +1109,14 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
 
     req.log.info({ source: calendarSource }, "Calendar generation source selected");
     res.setHeader("x-calendar-source", calendarSource);
-    if (resolvedCalendarLlm) {
-      const info = resolvedCalendarLlm.describe?.() ?? { provider: "unknown", model: "default" };
+    const responseProvider =
+      calendarSource === "fallback" && calendarAiFailure
+        ? { provider: calendarAiFailure.providerId, model: calendarAiFailure.model }
+        : resolvedCalendarLlm?.describe?.() ?? null;
+    if (responseProvider) {
+      const info = responseProvider;
       res.setHeader("x-ai-provider", info.provider);
       res.setHeader("x-ai-model", info.model);
-      // NOTE: These headers reflect the ENTRY provider in the fallback chain,
-      // not necessarily the provider that won. Exact provider tracing requires
-      // propagating the winning provider from FallbackProvider.chatCompletion().
     }
     res.json({
       planner: serializePlanner(savedPlanner),
@@ -782,6 +1128,7 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
     if (isDbUnavailableError(err)) {
       markFallbackUsed();
       const memoryClient = getMemoryClientForWorkflow(clientId);
+      const memoryOnboarding = getMemoryOnboardingForWorkflow(clientId);
       const memoryStrategy = getMemoryStrategyForWorkflow(clientId);
       if (!memoryClient) {
         res.status(404).json({ error: "Client not found" });
@@ -794,8 +1141,40 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
         });
         return;
       }
+      const approvedSnapshot = readApprovedSnapshot(
+        (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+      );
+      if (!approvedSnapshot) {
+        res.status(400).json({ error: "Approve SOW to generate Business DNA, Jump-to-Action, and calendar content." });
+        return;
+      }
+      if (!memoryOnboarding) {
+        res.status(400).json({ error: "No onboarding profile found" });
+        return;
+      }
+      const memoryEnrichedData =
+        ((memoryOnboarding.enrichedData as Record<string, unknown> | null | undefined) ?? {});
+      const memoryBusinessDnaApprovalError = getBusinessDnaRequirementError(
+        getBusinessDnaWorkflowState(memoryEnrichedData, String(approvedSnapshot.id ?? "")),
+        "generating the content calendar",
+      );
+      if (memoryBusinessDnaApprovalError) {
+        res.status(400).json({ error: memoryBusinessDnaApprovalError });
+        return;
+      }
       if (!memoryStrategy) {
-        res.status(400).json({ error: "Generate a strategy before the calendar." });
+        res.status(400).json({ error: "Generate and approve the current Jump-to-Action before generating the content calendar." });
+        return;
+      }
+      const memoryJtaApprovalError = getJtaRequirementError(
+        getJtaWorkflowState(
+          (memoryStrategy.structuredStrategy as Record<string, unknown> | null | undefined) ?? null,
+          String(approvedSnapshot.id ?? ""),
+        ),
+        "generating the content calendar",
+      );
+      if (memoryJtaApprovalError) {
+        res.status(400).json({ error: memoryJtaApprovalError });
         return;
       }
       const pendingSections = getPendingStrategySections(
@@ -818,14 +1197,23 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           monthAnchorFromBody(body),
           body,
           memoryStructured,
+          (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
         );
-        imported.posts = imported.posts.map((post) => enrichPostForExecution(post));
+        const activePlatforms = Object.keys(normalizeCalendarPlatformCounts(
+          (memoryClient.sow as Record<string, unknown> | null | undefined) ?? null,
+          "Instagram",
+        ));
+        imported.posts = imported.posts.map((post) =>
+          attachPostSemanticMetadata(enrichPostForExecution(post, activePlatforms)),
+        );
         const plannerOut: MemoryPlanner = {
           ...imported.planner,
           metadata: {
             ...((imported.planner.metadata as Record<string, unknown> | null) ?? {}),
             calendarSource: "chatgpt_import",
             generationMode: "imported_deterministic",
+            generationAction: body.regenerate === true ? "regenerate" : "generate",
+            explicitRegeneration: body.regenerate === true,
             providerAttempted: false,
             calendarGeneratedAt: new Date().toISOString(),
           },
@@ -853,14 +1241,40 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
         });
       const attemptKey = `${clientId}:${monthLabel}`;
       const prevAttempts = memoryCalendarGenerationCounts.get(attemptKey) ?? 0;
-      if (prevAttempts >= 2) {
+      const isExplicitRegeneration = body.regenerate === true;
+      if (prevAttempts > 0 && !isExplicitRegeneration) {
+        res.status(409).json({
+          error: "A calendar already exists for this month. Use Regenerate calendar to replace it.",
+          code: "CALENDAR_EXISTS_REQUIRES_REGENERATE",
+        });
+        return;
+      }
+      if (prevAttempts >= 2 && !isExplicitRegeneration) {
         res.status(429).json({ error: "Calendar generation limit reached for this month.", maxAttempts: 2 });
         return;
       }
-      const generated = generateDemoCalendarPayload(clientId, monthAnchor, monthLabel, body);
-      generated.posts = generated.posts.map((post) => enrichPostForExecution(post));
+      const memoryFallbackInput = buildFallbackCalendarInput(
+        (approvedSnapshot.sow as Record<string, unknown> | null | undefined) ??
+          (memoryClient.sow as Record<string, unknown> | null | undefined) ??
+          null,
+        "Instagram",
+      );
+      const generated = generateDemoCalendarPayload(
+        clientId,
+        monthAnchor,
+        monthLabel,
+        body,
+        memoryFallbackInput.totalPosts,
+        memoryFallbackInput.defaultPlatform,
+        memoryFallbackInput.platformSplit,
+        memoryFallbackInput.contentCounts,
+      );
+      generated.posts = generated.posts.map((post) =>
+        attachPostSemanticMetadata(enrichPostForExecution(post, Object.keys(memoryFallbackInput.platformSplit))),
+      );
       let memD = { provider: "demo", model: "deterministic" };
-      if (shouldUseRealAI(req)) {
+      const memoryProviderAttempted = shouldUseRealAI(req);
+      if (memoryProviderAttempted) {
         try {
           const memProvider = getRequestLLMProvider(req);
           memD = memProvider.describe?.() ?? { provider: memProvider.id, model: "default" };
@@ -868,7 +1282,7 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
           memD = { provider: "unconfigured", model: "n/a" };
         }
       }
-      const memFailure = shouldUseRealAI(req)
+      const memFailure = memoryProviderAttempted
         ? toPublicAiFailure(new Error("DB unavailable; calendar used safe template path."), {
             providerId: memD.provider,
             model: memD.model,
@@ -880,14 +1294,49 @@ router.post("/clients/:clientId/calendar/generate", async (req, res) => {
         metadata: {
           ...((generated.planner.metadata as Record<string, unknown> | null) ?? {}),
           calendarSource: "fallback",
+          generationMode: "fallback_generated",
+          strategyType: approvedSnapshot.templateType ?? memoryStrategy.templateType ?? "brand_building",
+          generationAction: isExplicitRegeneration ? "regenerate" : "generate",
+          explicitRegeneration: isExplicitRegeneration,
+          providerAttempted: memoryProviderAttempted,
+          generationAttemptCount: prevAttempts + 1,
           calendarGeneratedAt: new Date().toISOString(),
           calendarAiFailure: memFailure,
+          calendarFallbackDiagnostics: {
+            fallbackReason: memFailure.code ?? "db_unavailable",
+            failureClass: memFailure.failureClass ?? null,
+            failureStage: memFailure.failureStage ?? null,
+            failureOrigin: memFailure.failureOrigin ?? null,
+            failedContextLabel: memFailure.failedContextLabel ?? null,
+            estimatedInputTokens: memFailure.estimatedInputTokens ?? null,
+            maxInputTokens: memFailure.maxInputTokens ?? null,
+            requestedProvider: memoryProviderAttempted ? memD.provider : null,
+            resolvedProvider: memFailure.providerId,
+            resolvedModel: memFailure.model,
+            requestSizeBytes,
+            expectedPlatformSplit: memoryFallbackInput.platformSplit,
+            expectedTotalPosts: memoryFallbackInput.totalPosts,
+          },
+          latestRun: buildRunMeta({
+            clientId,
+            snapshotId: String(approvedSnapshot.id ?? ""),
+            taskType: "calendar_generate",
+            provider: memFailure.providerId,
+            model: memFailure.model,
+            fallbackUsed: true,
+            sourceContext: "approved_snapshot",
+          }),
+          snapshotId: String(approvedSnapshot.id ?? ""),
+          snapshotState: "fresh",
+          sourceContext: "approved_snapshot",
         },
       };
       memoryPlanners.set(clientId, plannerOut);
       memoryPosts.set(clientId, generated.posts);
       memoryCalendarGenerationCounts.set(attemptKey, prevAttempts + 1);
       res.setHeader("x-calendar-source", "fallback");
+      res.setHeader("x-ai-provider", memFailure.providerId);
+      res.setHeader("x-ai-model", memFailure.model);
       res.json({
         planner: plannerOut,
         posts: generated.posts,
@@ -1046,7 +1495,130 @@ function serializePost(p: typeof postsTable.$inferSelect) {
 
 export default router;
 
-function humanizeCalendarFailure(message: string): string {
+function buildCalendarFallbackDiagnostics(input: {
+  calendarAiFailure: PublicAiFailure;
+  calendarBudgetDiagnostics: Record<string, unknown> | null;
+  trace: CalendarGenerationTrace | null;
+  providerResolution: unknown;
+  providerAttempts: Array<Record<string, unknown>>;
+  failoverTriggered: boolean;
+  terminalFailureReason: unknown;
+  lastProviderErrorClass: unknown;
+  forceReal: boolean;
+  budgetGuardEnabled: unknown;
+  budgetGuardBypassed: unknown;
+  usedRealAI: boolean;
+  usedFallbackTemplate: boolean;
+  requestedProvider: string | null;
+  providerMeta: { provider: string; model: string };
+  requestSizeBytes: number;
+  expectedPlatformSplit: Record<string, number>;
+  expectedTotalPosts: number;
+}) {
+  const lastStage = input.trace?.stagesAttempted[input.trace.stagesAttempted.length - 1];
+  const plannerBudget = input.trace?.plannerBudget ?? null;
+  const estimatedInputTokens =
+    input.calendarAiFailure.estimatedInputTokens ??
+    lastStage?.estimatedInputTokens ??
+    plannerBudget?.estimatedInputTokens ??
+    null;
+  const estimatedOutputTokens =
+    input.calendarAiFailure.estimatedOutputTokens ??
+    lastStage?.estimatedOutputTokens ??
+    null;
+  const maxInputTokens =
+    input.calendarAiFailure.maxInputTokens ?? lastStage?.maxInputTokens ?? plannerBudget?.maxInputTokens ?? null;
+  const estimatedTotalTokens =
+    estimatedInputTokens != null && estimatedOutputTokens != null
+      ? estimatedInputTokens + estimatedOutputTokens
+      : lastStage?.estimatedTotalTokens ?? plannerBudget?.estimatedTotalTokens ?? null;
+
+  return {
+    fallbackReason: input.calendarAiFailure.code ?? "provider_or_output_failure",
+    failureClass: input.calendarAiFailure.failureClass ?? null,
+    failureStage: input.calendarAiFailure.failureStage ?? null,
+    failureOrigin: input.calendarAiFailure.failureOrigin ?? null,
+    failedContextLabel:
+      input.calendarAiFailure.failedContextLabel ?? input.trace?.lastAttemptedStage ?? lastStage?.stage ?? null,
+    estimatedInputTokens,
+    maxInputTokens,
+    estimatedOutputTokens,
+    estimatedTotalTokens,
+    compactionTier:
+      input.calendarAiFailure.compactionTier ?? lastStage?.compactionTier ?? plannerBudget?.compactionTier ?? null,
+    promptSegments:
+      input.calendarAiFailure.promptSegments ??
+      lastStage?.promptSegments ??
+      plannerBudget?.promptSegments ??
+      null,
+    plannerBudget,
+    weeklyBriefHashes: input.trace?.weeklyBriefHashes ?? null,
+    weekConcurrency: input.trace?.weekConcurrency ?? null,
+    weekStaggerMs: input.trace?.weekStaggerMs ?? null,
+    calendarGenerationTrace: input.trace,
+    codePath: input.trace?.codePath ?? null,
+    lastAttemptedStage: input.trace?.lastAttemptedStage ?? null,
+    stagesAttempted: input.trace?.stagesAttempted ?? [],
+    failedWeekIndex: lastStage?.failedWeekIndex ?? null,
+    cumulativeEstimatedGroqTokens: lastStage?.cumulativeEstimatedGroqTokens ?? null,
+    delayMsApplied: lastStage?.delayMsApplied ?? null,
+    weekRetryCount: lastStage?.weekRetryCount ?? null,
+    beforeCompactionTokens: lastStage?.beforeCompactionTokens ?? null,
+    afterCompactionTokens: lastStage?.afterCompactionTokens ?? null,
+    calendarBudgetDiagnostics: input.calendarBudgetDiagnostics,
+    repairAttempted: input.calendarAiFailure.repairAttempted ?? false,
+    repairSucceeded: input.calendarAiFailure.repairSucceeded ?? false,
+    repairChanges: input.calendarAiFailure.repairChanges ?? [],
+    validationDiagnostics: input.calendarAiFailure.validationDiagnostics ?? null,
+    providerResolution: input.providerResolution,
+    providerAttempts: input.providerAttempts,
+    failoverTriggered: input.failoverTriggered,
+    terminalFailureReason: input.terminalFailureReason,
+    lastProviderErrorClass: input.lastProviderErrorClass,
+    forceReal: input.forceReal,
+    budgetGuardEnabled: input.budgetGuardEnabled,
+    budgetGuardBypassed: input.budgetGuardBypassed,
+    usedRealAI: input.usedRealAI,
+    usedFallbackTemplate: input.usedFallbackTemplate,
+    requestedProvider: input.requestedProvider,
+    resolvedProvider: input.calendarAiFailure.providerId ?? input.providerMeta.provider,
+    resolvedModel: input.calendarAiFailure.model ?? input.providerMeta.model,
+    requestSizeBytes: input.requestSizeBytes,
+    expectedPlatformSplit: input.expectedPlatformSplit,
+    expectedTotalPosts: input.expectedTotalPosts,
+  };
+}
+
+function getLastProviderAttempt(
+  attempts: Array<Record<string, unknown>>,
+): { provider: string; model: string } | null {
+  for (let index = attempts.length - 1; index >= 0; index -= 1) {
+    const attempt = attempts[index] ?? {};
+    const status = String((attempt.status as string | undefined) ?? "");
+    if (status === "success" || status === "failed" || status === "preflight_skip" || status === "circuit_skip") {
+      const provider = String((attempt.provider as string | undefined) ?? "").trim();
+      const model = String((attempt.model as string | undefined) ?? "").trim();
+      if (provider && model) return { provider, model };
+    }
+  }
+  return null;
+}
+
+function humanizeCalendarFailure(
+  failure: Pick<PublicAiFailure, "message" | "failureOrigin" | "failureClass"> | string,
+): string {
+  const message = typeof failure === "string" ? failure : failure.message;
+  const failureOrigin = typeof failure === "string" ? null : failure.failureOrigin ?? null;
+  const failureClass = typeof failure === "string" ? null : failure.failureClass ?? null;
+  if (failureOrigin === "local_budget_guard") {
+    return "Prompt exceeded the local calendar budget before the provider call. Using template fallback. Reduce calendar context size or use the compressed brief path.";
+  }
+  if (failureClass === "validation_failed" || failureOrigin === "validation_failed / bucket_mismatch") {
+    const bucketHighlights = extractBucketMismatchHighlights(message);
+    return bucketHighlights
+      ? `Calendar could not be validated because bucket totals do not match the SOW plan. Showing fallback. ${bucketHighlights}`
+      : "Calendar could not be validated because bucket totals do not match the SOW plan. Showing fallback.";
+  }
   const m = message.toLowerCase();
   if (m.includes("402") || m.includes("credits") || m.includes("can only afford")) {
     return "Prompt too large for current OpenRouter credits. Using template fallback. Upgrade credits or lower generation size.";
@@ -1055,6 +1627,14 @@ function humanizeCalendarFailure(message: string): string {
     return "Prompt too large for current provider limits. Using template fallback. Reduce prompt size or switch to a higher-limit model.";
   }
   return message;
+}
+
+function extractBucketMismatchHighlights(message: string): string {
+  const matches = [...message.matchAll(/bucket_([^;]+?) expected (\d+) got (\d+)/gi)];
+  if (matches.length === 0) return "";
+  return matches
+    .map((match) => `${match[1].trim()} expected ${match[2]} but got ${match[3]}.`)
+    .join(" ");
 }
 
 function monthAnchorFromBody(body: { startDate?: string; month?: string }): Date {
@@ -1267,20 +1847,28 @@ function generateDemoCalendarPayload(
   totalPosts = 16,
   defaultPlatform = "Instagram",
   platformSplit: Record<string, number> = { Instagram: totalPosts },
+  contentCounts?: Record<string, number>,
 ): { planner: MemoryPlanner; posts: MemoryPost[] } {
   const plannerId = randomUUID();
+  const pillarCounts = normalizeCalendarContentCounts(contentCounts, totalPosts);
+  const pillarAssignments = expandCountAssignments(pillarCounts);
+  const platformAssignments = expandPlatformAssignments(platformSplit);
+  const plannerPillars = Object.keys(pillarCounts).map((name, idx) => ({
+    name,
+    color: ["#2563EB", "#7C3AED", "#16A34A", "#EA580C", "#DC2626"][idx % 5] ?? "#2563EB",
+  }));
   const planner: MemoryPlanner = {
     id: plannerId,
     clientId,
-    distribution: { education: 40, thought_leadership: 30, social_proof: 20, promotion: 10 },
+    distribution: toPercentDistribution(pillarCounts),
     formats: { reel: 35, carousel: 30, static: 20, story: 15 },
     platformSplit,
-    angleBank: {
-      education: ["How it works breakdown", "Before/after process insight"],
-      thought_leadership: ["Operator POV on market trend"],
-      social_proof: ["Client result story"],
-      promotion: ["Offer clarity post"],
-    },
+    angleBank: Object.fromEntries(
+      Object.keys(pillarCounts).map((pillar) => [
+        pillar,
+        ["How it works breakdown", "Practical save-worthy idea"],
+      ]),
+    ),
     hookStyles: ["curiosity", "operator POV", "data-backed"],
     weeklyFlow: {
       week_1: "Awareness + positioning",
@@ -1288,12 +1876,7 @@ function generateDemoCalendarPayload(
       week_3: "Proof + conversion",
       week_4: "Offer + follow-up",
     },
-    pillars: [
-      { name: "education", color: "#2563EB" },
-      { name: "thought_leadership", color: "#7C3AED" },
-      { name: "social_proof", color: "#16A34A" },
-      { name: "promotion", color: "#EA580C" },
-    ],
+    pillars: plannerPillars.length > 0 ? plannerPillars : [{ name: "education", color: "#2563EB" }],
     kpis: { reach: "baseline growth", saves: "educational resonance", leads: "qualified DMs" },
     phases: [
       { name: "Week 1", focus: "Establish context" },
@@ -1311,21 +1894,24 @@ function generateDemoCalendarPayload(
     d.setUTCDate(d.getUTCDate() + i);
     const date = d.toISOString().slice(0, 10);
     const createdAt = new Date().toISOString();
+    const platform = platformAssignments[i] ?? defaultPlatform;
+    const pillar = pillarAssignments[i] ?? "education";
+    const format = defaultFallbackFormatForPlatform(platform, i);
     return {
       id: randomUUID(),
       clientId,
       plannerId,
       date,
-      platform: defaultPlatform,
-      pillar: ["education", "thought_leadership", "social_proof", "promotion"][i % 4] ?? "education",
+      platform,
+      pillar,
       angle: "Operator insight",
-      format: ["Reel", "Carousel", "Static", "Stories"][i % 4] ?? "Reel",
+      format,
       objective: "Drive qualified engagement",
       hook: `Post ${i + 1}: Concrete insight for ideal customers`,
       caption:
         "Template-based preview. Turn on real AI in settings and add provider keys (e.g. USE_REAL_AI) to generate live copy when the model is available.",
       hashtags: ["#strategy", "#content", "#growth"],
-      cta: "DM 'PLAN' for the checklist",
+      cta: defaultImportedCtaForPlatform(platform, "Save this for later and take the next step when ready."),
       strategicIntent: "Support monthly progression from awareness to conversion.",
       expectedMetric: "saves",
       expectedReason: "Educational framing increases save intent.",
@@ -1338,6 +1924,26 @@ function generateDemoCalendarPayload(
     };
   });
   return { planner, posts };
+}
+
+function buildFallbackCalendarInput(
+  sow: Record<string, unknown> | null,
+  fallbackPlatform: string,
+): {
+  platformSplit: Record<string, number>;
+  contentCounts: Record<string, number>;
+  totalPosts: number;
+  defaultPlatform: string;
+} {
+  const platformSplit = normalizeCalendarPlatformCounts(sow, fallbackPlatform);
+  const totalPosts = Object.values(platformSplit).reduce((sum, count) => sum + count, 0);
+  const defaultPlatform = Object.keys(platformSplit)[0] ?? fallbackPlatform;
+  return {
+    platformSplit,
+    contentCounts: normalizeCalendarContentMix(sow, totalPosts),
+    totalPosts,
+    defaultPlatform,
+  };
 }
 
 function normalizeCalendarPlatformCounts(
@@ -1358,6 +1964,82 @@ function normalizeCalendarPlatformCounts(
   return { [fallbackPlatform]: 16 };
 }
 
+function normalizeCalendarContentMix(
+  sow: Record<string, unknown> | null,
+  totalPosts: number,
+): Record<string, number> {
+  const rawContentMix =
+    sow && typeof sow.contentMix === "object" && sow.contentMix
+      ? (sow.contentMix as Record<string, unknown>)
+      : {};
+  const weights: Record<string, number> = {};
+  for (const [pillar, value] of Object.entries(rawContentMix)) {
+    const normalized = normalizeCalendarPillarName(pillar);
+    const count = Number(value) || 0;
+    if (count > 0) weights[normalized] = (weights[normalized] ?? 0) + count;
+  }
+  if (Object.keys(weights).length > 0) {
+    return allocateCountsByWeight(weights, totalPosts);
+  }
+  return allocateCountsByWeight(
+    { education: 4, thought_leadership: 4, social_proof: 4, promotion: 4 },
+    totalPosts,
+  );
+}
+
+function normalizeCalendarContentCounts(
+  contentCounts: Record<string, number> | undefined,
+  totalPosts: number,
+): Record<string, number> {
+  if (contentCounts && Object.keys(contentCounts).length > 0) {
+    return allocateCountsByWeight(contentCounts, totalPosts);
+  }
+  return normalizeCalendarContentMix(null, totalPosts);
+}
+
+function allocateCountsByWeight(weights: Record<string, number>, totalPosts: number): Record<string, number> {
+  const total = Math.max(0, Math.round(totalPosts));
+  const entries = Object.entries(weights)
+    .map(([key, value]) => [key, Math.max(0, Number(value) || 0)] as const)
+    .filter(([, value]) => value > 0);
+  if (total <= 0) return {};
+  if (entries.length === 0) return { education: total };
+  const weightTotal = entries.reduce((sum, [, value]) => sum + value, 0);
+  const provisional = entries.map(([key, value]) => {
+    const exact = (value / weightTotal) * total;
+    return { key, count: Math.floor(exact), remainder: exact - Math.floor(exact) };
+  });
+  let assigned = provisional.reduce((sum, item) => sum + item.count, 0);
+  for (const item of [...provisional].sort((a, b) => b.remainder - a.remainder || a.key.localeCompare(b.key))) {
+    if (assigned >= total) break;
+    item.count += 1;
+    assigned += 1;
+  }
+  return Object.fromEntries(provisional.filter((item) => item.count > 0).map((item) => [item.key, item.count]));
+}
+
+function normalizeCalendarPillarName(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "education";
+}
+
+function expandCountAssignments(counts: Record<string, number>): string[] {
+  return Object.entries(counts).flatMap(([key, count]) =>
+    Array.from({ length: Math.max(0, Math.round(count)) }, () => key),
+  );
+}
+
+function toPercentDistribution(counts: Record<string, number>): Record<string, number> {
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  if (total <= 0) return { education: 100 };
+  const raw = Object.fromEntries(
+    Object.entries(counts).map(([key, count]) => [key, Math.round((count / total) * 100)]),
+  );
+  const drift = 100 - Object.values(raw).reduce((sum, value) => sum + value, 0);
+  const firstKey = Object.keys(raw)[0];
+  if (firstKey && drift !== 0) raw[firstKey] = (raw[firstKey] ?? 0) + drift;
+  return raw;
+}
+
 function normalizeCalendarPlatformName(value: string): string {
   const raw = value.trim().toLowerCase();
   if (raw === "x" || raw.includes("twitter")) return "X";
@@ -1370,8 +2052,16 @@ function normalizeCalendarPlatformName(value: string): string {
 
 function expandPlatformAssignments(platformSplit: Record<string, number>): string[] {
   return Object.entries(platformSplit).flatMap(([platform, count]) =>
-    Array.from({ length: Math.max(0, count) }, () => platform),
+    Array.from({ length: Math.max(0, Math.round(count)) }, () => platform),
   );
+}
+
+function defaultFallbackFormatForPlatform(platform: string, index: number): string {
+  if (platform === "Pinterest") return index % 3 === 0 ? "Video pin" : "Static pin";
+  if (platform === "LinkedIn") return index % 2 === 0 ? "Text post" : "Carousel";
+  if (platform === "X") return index % 2 === 0 ? "Text post" : "Thread";
+  if (platform === "YouTube") return index % 2 === 0 ? "Short video" : "Community post";
+  return ["Reel", "Carousel", "Static", "Stories"][index % 4] ?? "Reel";
 }
 
 function normalizeImportedFormatForPlatform(format: string, platform: string): string {
@@ -1415,10 +2105,12 @@ function defaultImportedCtaForPlatform(platform: string, fallbackCta: string): s
 
 function enrichPostForExecution<T extends { format: string; platform: string; hook: string; cta: string; pillar: string; strategicIntent?: string; expectedReason?: string; execution?: Record<string, unknown> | null; caption?: string | null; hashtags?: string[] | null; priority?: string }>(
   post: T,
+  activePlatforms: string[] = [post.platform],
 ): T {
   const detail = buildPostDetailPayload({
     format: post.format,
     platform: post.platform,
+    activePlatforms,
     pillar: post.pillar,
     objective: (post as { objective?: string }).objective ?? "",
     hook: post.hook,
@@ -1435,6 +2127,35 @@ function enrichPostForExecution<T extends { format: string; platform: string; ho
     caption: detail.caption,
     hashtags: detail.hashtags,
     execution: detail.execution,
+  };
+}
+
+function attachPostSemanticMetadata<
+  T extends {
+    pillar: string;
+    angle?: string;
+    objective?: string;
+    hook?: string;
+    metadata?: Record<string, unknown> | null;
+  },
+>(post: T): T {
+  const currentMetadata =
+    post.metadata && typeof post.metadata === "object" && !Array.isArray(post.metadata)
+      ? (post.metadata as Record<string, unknown>)
+      : {};
+  const theme =
+    typeof currentMetadata.theme === "string" && currentMetadata.theme.trim()
+      ? currentMetadata.theme.trim()
+      : [post.angle, post.objective, post.hook]
+          .map((value) => (typeof value === "string" ? value.trim() : ""))
+          .find(Boolean) ?? `${post.pillar} theme`;
+  return {
+    ...post,
+    metadata: {
+      ...currentMetadata,
+      bucket: post.pillar,
+      theme,
+    },
   };
 }
 

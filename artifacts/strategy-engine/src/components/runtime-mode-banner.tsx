@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { localApiFetch } from "@/lib/local-api";
 
 type RuntimeHealth = {
   status: string;
@@ -20,7 +21,14 @@ type RuntimeHealth = {
     geminiKeyPresent?: boolean;
     openaiKeyPresent?: boolean;
   };
-  lastError?: { message?: string; code?: string; providerId?: string };
+  lastError?: {
+    message?: string;
+    code?: string;
+    providerId?: string;
+    failureClass?: string | null;
+    failureStage?: string | null;
+    failureOrigin?: string | null;
+  };
   aiUsage?: {
     provider?: string;
     model?: string;
@@ -45,7 +53,7 @@ type RuntimeHealth = {
 };
 
 async function getRuntimeHealth(): Promise<RuntimeHealth> {
-  const res = await fetch("/api/healthz");
+  const res = await localApiFetch("/api/healthz");
   if (!res.ok) {
     throw new Error(`Health check failed: ${res.status}`);
   }
@@ -87,6 +95,10 @@ export function RuntimeModeBanner({ suppressAiDiagnostics = false }: { suppressA
       ? "—"
       : "No server calls recorded yet. Values below are defaults from the server environment.");
 
+  const isValidationFailure =
+    data?.lastError?.failureClass === "validation_failed" ||
+    data?.lastError?.failureOrigin === "validation_failed / bucket_mismatch";
+
   return (
     <div className="space-y-2 mb-4">
       {showDb && (
@@ -112,8 +124,25 @@ export function RuntimeModeBanner({ suppressAiDiagnostics = false }: { suppressA
           className="rounded-lg border border-sky-300 bg-sky-50 px-4 py-2 text-sm text-sky-900"
           data-testid="ai-fallback-banner"
         >
-          We could not get a full response from the AI provider, so we are showing a <strong>safe template</strong>{" "}
-          instead. Check your key and model, then try again.
+          {isValidationFailure ? (
+            <>
+              The AI produced a calendar, but it failed validation against the SOW bucket plan, so we are showing a{" "}
+              <strong>safe template</strong> instead.
+            </>
+          ) : (
+            <>
+              We could not get a full response from the AI provider, so we are showing a <strong>safe template</strong>{" "}
+              instead.
+              {data?.lastError?.message ? (
+                <span className="mt-1 block text-xs font-mono break-words">
+                  {data.lastError.failureStage ? `${data.lastError.failureStage}: ` : ""}
+                  {data.lastError.message.slice(0, 240)}
+                </span>
+              ) : (
+                <span className="mt-1 block text-xs">Check provider keys/model in AI settings, then regenerate.</span>
+              )}
+            </>
+          )}
         </div>
       )}
       {showDebug && (
